@@ -35,10 +35,11 @@ if "[SEG]" not in tokenizer.get_vocab():
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16, 
-    low_cpu_mem_usage=True
+    low_cpu_mem_usage=True,
+    seg_token_idx=tokenizer.convert_tokens_to_ids("[SEG]")
 )
 
-# [근본 해결] 모델의 임베딩 크기를 확장된 토크나이저에 맞춤 (IndexError 방지)
+# 모델의 임베딩 크기를 확장된 토크나이저에 맞춤
 model.resize_token_embeddings(len(tokenizer))
 # [SEG] 토큰 인덱스 확정
 seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
