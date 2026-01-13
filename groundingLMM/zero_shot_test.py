@@ -19,7 +19,7 @@ if torch.cuda.is_available():
 
 print(f"[*] [1/5] GLaMM-FullScope 모델 및 토크나이저 로드 시작")
 
-# [핵심 수정] 토크나이저 로드 및 특수 토큰 설정
+# 토크나이저 로드
 tokenizer = AutoTokenizer.from_pretrained(
     model_path, 
     use_fast=False,
@@ -27,11 +27,14 @@ tokenizer = AutoTokenizer.from_pretrained(
     model_max_length=2048
 )
 
-# GLaMM의 특수 토큰 [SEG]가 단어장에 없는 경우 강제 추가
-if "[SEG]" not in tokenizer.get_vocab():
-    tokenizer.add_tokens(["[SEG]"], special_tokens=True)
+# GLaMM 전용 특수 토큰 등록
+special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"]
+tokenizer.add_tokens(special_tokens, special_tokens=True)
 
-# 5090 최적화: BF16 사용 및 로드
+# SentencePiece 엔진이 인식 가능한 실제 단어장 크기 기록
+base_vocab_size = tokenizer.sp_model.get_piece_size()
+
+# 모델 로드 (5090 최적화: BF16 사용)
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16, 
@@ -39,27 +42,26 @@ model = GLaMMForCausalLM.from_pretrained(
     seg_token_idx=tokenizer.convert_tokens_to_ids("[SEG]")
 )
 
-# 모델의 임베딩 크기를 확장된 토크나이저에 맞춤
+# 모델 임베딩 크기 조정 및 토큰 설정
 model.resize_token_embeddings(len(tokenizer))
-# [SEG] 토큰 인덱스 확정
 seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 model.config.seg_token_idx = seg_token_idx
 
 # 2. 모델 GPU 이동
 print("[*] [2/5] 모델 CUDA(GPU) 이동 완료")
 model.to("cuda")
-model.eval() # 추론 모드 명시
+model.eval()
 
 # 3. 데이터 전처리 
 print("[*] [3/5] 이미지 전처리 중")
 raw_image = Image.open(image_path).convert("RGB")
 
-# CLIP용 전처리 (Vision Tower용)
+# CLIP Vision Tower 전처리
 image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
 image_tensor = image_processor.preprocess(raw_image, return_tensors="pt")["pixel_values"]
 image_tensor = image_tensor.to("cuda", dtype=torch.bfloat16)
 
-# SAM용 텐서 (Segmentation용)
+# SAM Segmentation 전처리
 sam_image_res = raw_image.resize((1024, 1024))
 sam_image_tensor = torch.from_numpy(np.array(sam_image_res)).permute(2, 0, 1).float()
 sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).view(3,1,1)) / 
@@ -83,7 +85,6 @@ conv.append_message(conv.roles[0], "<image>\n" + prompt)
 conv.append_message(conv.roles[1], None)
 input_ids = tokenizer_image_token(conv.get_prompt(), tokenizer, -200, return_tensors='pt').unsqueeze(0).to("cuda")
 
-# 추론 실행
 with torch.inference_mode():
     output_ids, pred_masks = model.evaluate(
         global_enc_images=image_tensor,
@@ -97,25 +98,28 @@ with torch.inference_mode():
 # 5. 결과 텍스트 출력 및 이미지 시각화
 print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중...")
 
+# sp_model이 아는 범위(base_vocab_size)의 ID만 남겨서 IndexError 원천 차단
+safe_ids = [int(idx) for idx in output_ids[0] if int(idx) < base_vocab_size]
 
 try:
+    # 1. 일반 디코딩 시도
     response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
 except IndexError:
-    # 만약 여전히 인덱스 문제가 있다면 에러 토큰만 걸러내고 디코딩
-    print("일부 특수 토큰 디코딩 에러 발생")
-    clean_ids = [idx for idx in output_ids[0] if idx < len(tokenizer)]
-    response = tokenizer.decode(clean_ids, skip_special_tokens=True).strip()
+    # 2. 실패 시 필터링된 safe_ids로 디코딩
+    print("특수 토큰 해석을 위한 디코딩 실행")
+    response = tokenizer.decode(safe_ids, skip_special_tokens=True).strip()
+    # 추가된 특수 태그들이 텍스트에 남을 경우 제거
+    for tag in special_tokens:
+        response = response.replace(tag, "")
 
-print("\n" + "="*50)
-print("[GLaMM 환경 분석 리포트]")
-print("="*50)
+print("="*60)
 print(response)
-print("="*50 + "\n")
+print("="*60 + "\n")
 
+# 이미지 저장 로직
 if pred_masks is not None and len(pred_masks) > 0:
     vis_image = np.array(raw_image).astype(np.float32)
     
-    # 마스크 시각화: 식생 객체별로 다른 색상 부여
     for i, mask in enumerate(pred_masks[0]):
         mask_np = mask.nan_to_num(0.0).cpu().numpy() > 0.0
         if not np.any(mask_np): continue
@@ -126,6 +130,6 @@ if pred_masks is not None and len(pred_masks) > 0:
     
     final_image = Image.fromarray(vis_image.astype(np.uint8))
     final_image.save(output_image_path)
-    print(f"성공: 분석 리포트가 출력되었으며, 결과 이미지가 '{output_image_path}'로 저장되었습니다.")
+    print(f"분석 성공: 리포트 출력 및 '{output_image_path}' 저장 완료.")
 else:
-    print("분석 리포트는 생성되었으나, 세그멘테이션 마스크 추출에 실패했습니다.")
+    print("경고: 리포트는 생성되었으나 마스크 이미지 생성에 실패했습니다.")
