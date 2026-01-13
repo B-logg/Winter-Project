@@ -117,7 +117,7 @@ class ImageEncoderViT(nn.Module):
 
         dtype = x.dtype
         if dtype == torch.float16:  # prevent overflow
-            with torch.autocast(device_type="mps", dtype=torch.float32):
+            with torch.autocast(device_type=x.device.type, dtype=torch.float32):
                 x = self.neck(x.permute(0, 3, 1, 2))
             x = x.to(dtype)
         else:

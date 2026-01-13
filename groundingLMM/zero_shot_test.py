@@ -6,55 +6,65 @@ from transformers import AutoTokenizer, CLIPImageProcessor
 from model.GLaMM import GLaMMForCausalLM
 from model.llava.conversation import conv_templates
 from model.llava.mm_utils import tokenizer_image_token
-from torchao.quantization import int8_weight_only, quantize_
 
-# 1. 환경 설정 및 경로 (사용자님 경로 반영)
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
-model_path = "/Users/bosung/Desktop/GLaMM/groundingLMM/checkpoints/GLaMM-GCG"
-image_path = "/Users/bosung/Desktop/GLaMM/groundingLMM/test_image/test.png"
+# 1. 경로 및 환경 설정
+model_path = os.path.expanduser("~/Winter-Project/groundingLMM/checkpoints/GLaMM-FullScope")
+image_path = os.path.expanduser("~/Winter-Project/groundingLMM/test_image/test.png")
+output_image_path = "final_carbon_analysis_result.png"
 
-# 메모리 청소
+# GPU 메모리 초기화
 gc.collect()
-torch.mps.empty_cache()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
-print(f"[*] [1/5] GLaMM-GCG 모델 로드 중 (M4 Pro 최적화)...")
+print(f"[*] [1/5] GLaMM-FullScope 모델 로드 시작)")
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
 
-# 모델 로드 (low_cpu_mem_usage로 램 폭발 방지)
+# 5090 최적화: BF16 사용
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
-    torch_dtype=torch.float16, 
+    torch_dtype=torch.bfloat16, 
     low_cpu_mem_usage=True,
     seg_token_idx=tokenizer.convert_tokens_to_ids("[SEG]")
 )
 
-# 2. 8비트 양자화 및 GPU 전체 이동
-# LLM을 포함한 전체 모델을 8비트로 압축하여 16GB 램에 스왑 없이 올립니다.
-print("[*] [2/5] 전체 모델 8비트 압축 및 MPS(GPU) 이동 중...")
-quantize_(model, int8_weight_only()) # 모델 전체 압축
-model.to("mps") # 3시간 30분을 1분으로 줄이는 핵심
+# 2. 모델 GPU 이동
+print("[*] [2/5] 모델 CUDA(GPU) 이동 완료")
+model.to("cuda")
 gc.collect()
 
-# 3. 이미지 및 텐서 준비
-print("[*] [3/5] 비전 데이터 전처리...")
+# 3. 데이터 전처리 
+print("[*] [3/5] 이미지 전처리 중")
 raw_image = Image.open(image_path).convert("RGB")
+
+# CLIP용 전처리
 image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
-image_tensor = image_processor.preprocess(raw_image, return_tensors="pt")["pixel_values"].to("mps", dtype=torch.float16)
+image_tensor = image_processor.preprocess(raw_image, return_tensors="pt")["pixel_values"]
+image_tensor = image_tensor.to("cuda", dtype=torch.bfloat16)
 
-# SAM용 텐서 준비
-sam_image = raw_image.resize((512, 512))
-sam_image_tensor = torch.from_numpy(np.array(sam_image)).permute(2, 0, 1).float()
+# SAM용 텐서
+sam_image_res = raw_image.resize((1024, 1024))
+sam_image_tensor = torch.from_numpy(np.array(sam_image_res)).permute(2, 0, 1).float()
 sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).view(3,1,1)) / 
-                    torch.tensor([58.395, 57.12, 57.375]).view(3,1,1)).unsqueeze(0).to("mps", dtype=torch.float16)
-sam_image_tensor = F.interpolate(sam_image_tensor, size=(1024, 1024), mode='bilinear')
+                    torch.tensor([58.395, 57.12, 57.375]).view(3,1,1)).unsqueeze(0)
+sam_image_tensor = sam_image_tensor.to("cuda", dtype=torch.bfloat16)
 
-# 4. 고속 추론 (전체 GPU 연산)
-print("[*] [4/5] MPS 고속 추론 시작...")
+# 4. 복합 환경 분석 추론 (탄소 중립 및 식생 전문 프롬프트)
+print("[*] [4/5] RTX 5090 추론 엔진 가동 중...")
 conv = conv_templates["vicuna_v1"].copy()
-prompt = "Describe the image and segment objects with [SEG]."
+
+prompt = (
+    "Please perform an expert-level environmental assessment of this image:\n"
+    "1. Identify the level of drought or water stress in the soil and overall terrain.\n"
+    "2. Categorize the specific types of trees and vegetation present.\n"
+    "3. Use the [SEG] token to segment every tree and plant for area calculation.\n"
+    "4. Finally, evaluate the carbon sequestration efficiency based on the density and species of the vegetation, "
+    "and provide a structured ecological impact report."
+)
+
 conv.append_message(conv.roles[0], "<image>\n" + prompt)
 conv.append_message(conv.roles[1], None)
-input_ids = tokenizer_image_token(conv.get_prompt(), tokenizer, -200, return_tensors='pt').unsqueeze(0).to("mps")
+input_ids = tokenizer_image_token(conv.get_prompt(), tokenizer, -200, return_tensors='pt').unsqueeze(0).to("cuda")
 
 with torch.inference_mode():
     output_ids, pred_masks = model.evaluate(
@@ -63,22 +73,38 @@ with torch.inference_mode():
         input_ids=input_ids,
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]],
-        max_tokens_new=128
+        max_tokens_new=1024,
     )
 
-# 5. 결과 분석 및 저장
-print("[*] [5/5] 결과 분석 및 마스크 생성 확인")
+# 5. 결과 텍스트 출력 및 이미지 시각화
+print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중...")
 response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-print(f"모델 응답: {response}")
+
+print("\n" + "="*50)
+print("[GLaMM 환경 분석 리포트]")
+print("="*50)
+print(response)
+print("="*50 + "\n")
 
 if pred_masks is not None and len(pred_masks) > 0:
-    vis_image = np.array(raw_image)
-    for mask in pred_masks[0]:
-        # 마스크를 CPU로 옮겨 시각화
+    vis_image = np.array(raw_image).astype(np.float32)
+    
+    # 마스크 시각화 로직: 식생 객체별로 다른 색상 부여
+    for i, mask in enumerate(pred_masks[0]):
         mask_np = mask.nan_to_num(0.0).cpu().numpy() > 0.0
         if not np.any(mask_np): continue
-        vis_image[mask_np] = vis_image[mask_np] * 0.5 + np.random.randint(0,255,3) * 0.5
-    Image.fromarray(vis_image.astype(np.uint8)).save("glamm_fast_success.png")
-    print("성공! glamm_fast_success.png를 확인하세요.")
+        
+        # 랜덤 색상 생성 (객체 구분을 위해)
+        color = np.random.randint(0, 255, 3)
+        
+        # 반투명 오버레이 적용
+        for c in range(3):
+            vis_image[:, :, c] = np.where(mask_np, vis_image[:, :, c] * 0.5 + color[c] * 0.5, vis_image[:, :, c])
+    
+    # 결과 이미지 저장
+    final_image = Image.fromarray(vis_image.astype(np.uint8))
+    final_image.save(output_image_path)
+    print(f"성공: 분석 리포트가 위와 같이 출력되었으며,")
+    print(f"세그멘테이션 이미지가 '{output_image_path}'로 저장되었습니다.")
 else:
-    print("텍스트는 성공, 마스크는 비어있습니다. layers.py 수정 여부를 확인하세요.")
+    print("분석 리포트(텍스트)는 생성되었으나, 시각화 마스크(이미지) 추출에 실패했습니다.")
