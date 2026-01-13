@@ -16,7 +16,7 @@ output_image_path = "final_carbon_analysis_result.png"
 gc.collect()
 torch.cuda.empty_cache()
 
-print(f"[*] [1/5] 모델 및 토크나이저 로드 (RTX 5090 Blackwell 최적화)")
+print(f"[*] [1/5] 모델 및 토크나이저 로드")
 
 # 토크나이저 로드 및 특수 토큰 설정
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -24,7 +24,7 @@ special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"]
 tokenizer.add_tokens(special_tokens, special_tokens=True)
 sp_limit = tokenizer.sp_model.get_piece_size()
 
-# 모델 로드 (Bfloat16 정밀도 사용으로 VRAM 효율 극대화)
+# 모델 로드
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16, 
@@ -40,7 +40,7 @@ model.to("cuda")
 model.eval()
 
 # 3. 데이터 전처리
-print("[*] [3/5] 탄소 흡수원 이미지 전처리 (CLIP & SAM)")
+print("[*] [3/5] 탄소 흡수원 이미지 전처리")
 raw_image = Image.open(image_path).convert("RGB")
 
 # CLIP용 전처리
@@ -53,8 +53,8 @@ sam_image_tensor = torch.from_numpy(np.array(sam_image_res)).permute(2, 0, 1).fl
 sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).view(3,1,1)) / 
                     torch.tensor([58.395, 57.12, 57.375]).view(3,1,1)).unsqueeze(0).to("cuda", dtype=torch.bfloat16)
 
-# 4. 복합 환경 분석 추론 (상세 서술 유도 전략)
-print("[*] [4/5] RTX 5090 Blackwell 엔진 추론 가동 (상세 분석 모드)")
+# 4. 복합 환경 분석 추론
+print("[*] [4/5] 추론")
 conv = conv_templates["vicuna_v1"].copy()
 
 # 환경 분석 전문가용 프롬프트
@@ -68,7 +68,7 @@ prompt = (
 
 conv.append_message(conv.roles[0], "<image>\n" + prompt)
 
-# [중요] Prefilling: 모델이 대화를 끝내지 못하게 답변의 시작 부분을 강제로 지정합니다.
+# Prefilling: 모델이 대화를 끝내지 못하게 답변의 시작 부분을 강제로 지정합니다.
 forced_prefix = "Based on my expert ecological analysis of this scene, <p>"
 conv.append_message(conv.roles[1], forced_prefix)
 
@@ -91,14 +91,13 @@ with torch.inference_mode():
         max_tokens_new=1024,
     )
 
-# 5. 결과 분석 및 시각화 저장 (완전 수동 ID 매핑)
+# 5. 결과 분석 및 시각화 저장
 print("[*] [5/5] 결과 분석 및 이미지 시각화 중")
 
 # 질문 길이를 제외한 순수 생성 부분 추출
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-# 보성님 서버 고유 ID 매핑: [SEG]:32004, <p>:32005, </p>:32006
 special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>", 32007: "<grounding>"}
 
 raw_tokens = []
@@ -116,27 +115,21 @@ for tid in response_ids:
         tag = special_map.get(tid, f"[ID_{tid}]")
         raw_tokens.append(f" {tag} ")
         # 가독성 버전용 변환
-        if tag == "<p>": clean_tokens.append("\n\n[분석 항목] ")
-        elif tag == "[SEG]": clean_tokens.append(" [SEG] ")
-        elif tag == "</p>": clean_tokens.append("\n")
+        if tag == "<p>": clean_tokens.append("<p>")
+        elif tag == "[SEG]": clean_tokens.append("[SEG]")
+        elif tag == "</p>": clean_tokens.append("</p>")
 
-# 최종 리포트 조립 (강제 시작 문구 포함)
+# 최종 리포트 조립
 final_raw = forced_prefix + "".join(raw_tokens).strip()
 final_clean = forced_prefix.replace("<p>", "\n\n[분석 항목] ") + "".join(clean_tokens).replace("  ", " ").strip()
 
-print("\n" + "="*70)
-print("  [GLaMM RAW REPORT - 모든 토큰 보존]")
-print("-" * 70)
+print("="*70 + "\n")
 print(final_raw)
-print("="*70)
-
-print("\n" + "="*70)
-print("  [GLaMM CLEAN REPORT - 전문가용 리포트]")
-print("-" * 70)
+print("="*70 + "\n")
 print(final_clean)
 print("="*70 + "\n")
 
-# --- 시각화 저장 로직 ---
+# 시각화 저장 로직
 if pred_masks is not None and len(pred_masks) > 0:
     vis_image = np.array(raw_image).astype(np.float32)
     for i, mask in enumerate(pred_masks[0]):
@@ -147,6 +140,6 @@ if pred_masks is not None and len(pred_masks) > 0:
             vis_image[:, :, c] = np.where(mask_np, vis_image[:, :, c] * 0.5 + color[c] * 0.5, vis_image[:, :, c])
     
     Image.fromarray(vis_image.astype(np.uint8)).save(output_image_path)
-    print(f"✅ 분석 성공: 리포트 출력 및 '{output_image_path}' 저장 완료.")
+    print(f"분석 성공: 리포트 출력 및 '{output_image_path}' 저장 완료.")
 else:
-    print("❌ 마스크 생성 실패: 이미지에 식생이 뚜렷하지 않을 수 있습니다.")
+    print("마스크 생성 실패: 이미지에 식생이 뚜렷하지 않을 수 있습니다.")
