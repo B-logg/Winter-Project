@@ -31,10 +31,10 @@ tokenizer = AutoTokenizer.from_pretrained(
 special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"]
 tokenizer.add_tokens(special_tokens, special_tokens=True)
 
-# SentencePiece 엔진이 인식 가능한 실제 단어장 크기 기록
-base_vocab_size = tokenizer.sp_model.get_piece_size()
+# SentencePiece 엔진의 실제 한계치
+sp_limit = tokenizer.sp_model.get_piece_size()
 
-# 모델 로드 (5090 최적화: BF16 사용)
+# 모델 로드
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16, 
@@ -69,7 +69,7 @@ sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).
 sam_image_tensor = sam_image_tensor.to("cuda", dtype=torch.bfloat16)
 
 # 4. 복합 환경 분석 추론
-print("[*] [4/5] RTX 5090 추론 엔진 가동 중")
+print("[*] [4/5] 추론 중")
 conv = conv_templates["vicuna_v1"].copy()
 
 prompt = (
@@ -95,48 +95,67 @@ with torch.inference_mode():
         max_tokens_new=1024,
     )
 
-# 5. 결과 텍스트 출력 및 이미지 시각화
-print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중...")
+# 5. 결과 분석 및 시각화 저장
+print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중")
 
-# 5090이 내뱉은 숫자들(ID)을 리스트로 변환
-generated_ids = output_ids[0].cpu().tolist()
-decoded_tokens = []
+# 답변 부분만 슬라이싱
+input_token_len = input_ids.shape[1]
+response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-# SentencePiece 엔진의 실제 한계치
-sp_limit = tokenizer.sp_model.get_piece_size()
+# 특수 토큰 매핑 사전
+special_map = {
+    tokenizer.convert_tokens_to_ids("[SEG]"): "[SEG]",
+    tokenizer.convert_tokens_to_ids("<p>"): "<p>",
+    tokenizer.convert_tokens_to_ids("</p>"): "</p>",
+    tokenizer.convert_tokens_to_ids("<grounding>"): "<grounding>"
+}
 
-for tid in generated_ids:
-    # 1. 일반적인 단어 (사전 범위 내)
+raw_tokens = []    # 1. 특수 토큰 보존용
+clean_tokens = []  # 2. 가독성 최적화용
+
+for tid in response_ids:
     if tid < sp_limit:
         try:
-            token_text = tokenizer.sp_model.IdToPiece(int(tid))
-            # SentencePiece 특유의 '_' 공백 문자를 실제 공백으로 복구
-            decoded_tokens.append(token_text.replace(" ", " "))
+            token_text = tokenizer.sp_model.IdToPiece(int(tid)).replace(' ', ' ')
+            raw_tokens.append(token_text)
+            clean_tokens.append(token_text)
         except:
             continue
-    # 2. 특수 토큰 (사전 범위를 벗어난 GLaMM 전용 신호)
     else:
-        # 모델이 학습한 ID 번호에 맞춰 직접 글자로 매핑
-        if tid == tokenizer.convert_tokens_to_ids("<p>"):
-            decoded_tokens.append("\n[분석 항목] ")
-        elif tid == tokenizer.convert_tokens_to_ids("</p>"):
-            decoded_tokens.append("\n")
-        elif tid == tokenizer.convert_tokens_to_ids("[SEG]"):
-            decoded_tokens.append(" [객체 세그멘테이션 실행] ")
-        else:
-            # 기타 알 수 없는 ID는 그냥 번호로 표시 (에러 방지)
-            decoded_tokens.append(f" [Special_Token_{tid}] ")
+        tag = special_map.get(tid, f"[ID_{tid}]")
+        raw_tokens.append(f" {tag} ")
+        if tag == "<p>": clean_tokens.append("\n[분석] ")
+        elif tag == "</p>": clean_tokens.append("\n")
+        elif tag == "[SEG]": clean_tokens.append(" [식생 구역 확인] ")
 
-# 최종 리포트 텍스트 완성
-response = "".join(decoded_tokens).replace("  ", " ").strip()
+raw_response = "".join(raw_tokens).replace("<s>", "").replace("</s>", "").strip()
+clean_response = "".join(clean_tokens).replace("  ", " ").strip()
 
-print("\n" + "="*60)
-print("  [RTX 5090 기반 GLaMM AI 환경 분석 리포트]")
-print("="*60)
-if response:
-    print(response)
+print("="*65 + "\n")
+print(raw_response)
+print("="*65 + "\n")
+print(clean_response)
+print("="*65 + "\n")
+
+# 시각화 및 이미지 저장
+if pred_masks is not None and len(pred_masks) > 0:
+    vis_image = np.array(raw_image).astype(np.float32)
+    
+    # 마스크 시각화: 식생 객체별로 다른 색상 부여
+    for i, mask in enumerate(pred_masks[0]):
+        # 마스크 이진화 (0.0보다 큰 지점)
+        mask_np = mask.nan_to_num(0.0).cpu().numpy() > 0.0
+        if not np.any(mask_np): continue
+        
+        # 랜덤 색상 생성
+        color = np.random.randint(0, 255, 3)
+        
+        # 반투명 오버레이 적용 (원본 50% + 색상 50%)
+        for c in range(3):
+            vis_image[:, :, c] = np.where(mask_np, vis_image[:, :, c] * 0.5 + color[c] * 0.5, vis_image[:, :, c])
+    
+    final_image = Image.fromarray(vis_image.astype(np.uint8))
+    final_image.save(output_image_path)
+    print(f"분석 성공: 리포트 출력 및 '{output_image_path}' 저장 완료.")
 else:
-    print("텍스트 추출에 실패했지만, 이미지 생성 단계로 넘어갑니다.")
-print("="*60 + "\n")
-
-# 이후 이미지 저장 코드는 동일...
+    print("경고: 리포트는 생성되었으나 마스크 이미지 생성에 실패했습니다.")
