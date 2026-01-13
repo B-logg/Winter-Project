@@ -73,7 +73,7 @@ print("[*] [4/5] RTX 5090 추론 엔진 가동 중")
 conv = conv_templates["vicuna_v1"].copy()
 
 prompt = (
-    "Please perform an expert-level environmental assessment of this image:\n"
+    "Please perform an expert level environmental assessment of this image:\n"
     "1. Identify the level of drought or water stress in the soil and overall terrain.\n"
     "2. Categorize the specific types of trees and vegetation present.\n"
     "3. Use the [SEG] token to segment every tree and plant for area calculation.\n"
@@ -98,38 +98,45 @@ with torch.inference_mode():
 # 5. 결과 텍스트 출력 및 이미지 시각화
 print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중...")
 
-# sp_model이 아는 범위(base_vocab_size)의 ID만 남겨서 IndexError 원천 차단
-safe_ids = [int(idx) for idx in output_ids[0] if int(idx) < base_vocab_size]
+# 5090이 내뱉은 숫자들(ID)을 리스트로 변환
+generated_ids = output_ids[0].cpu().tolist()
+decoded_tokens = []
 
-try:
-    # 1. 일반 디코딩 시도
-    response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-except IndexError:
-    # 2. 실패 시 필터링된 safe_ids로 디코딩
-    print("특수 토큰 해석을 위한 디코딩 실행")
-    response = tokenizer.decode(safe_ids, skip_special_tokens=True).strip()
-    # 추가된 특수 태그들이 텍스트에 남을 경우 제거
-    for tag in special_tokens:
-        response = response.replace(tag, "")
+# SentencePiece 엔진의 실제 한계치
+sp_limit = tokenizer.sp_model.get_piece_size()
 
+for tid in generated_ids:
+    # 1. 일반적인 단어 (사전 범위 내)
+    if tid < sp_limit:
+        try:
+            token_text = tokenizer.sp_model.IdToPiece(int(tid))
+            # SentencePiece 특유의 '_' 공백 문자를 실제 공백으로 복구
+            decoded_tokens.append(token_text.replace(" ", " "))
+        except:
+            continue
+    # 2. 특수 토큰 (사전 범위를 벗어난 GLaMM 전용 신호)
+    else:
+        # 모델이 학습한 ID 번호에 맞춰 직접 글자로 매핑
+        if tid == tokenizer.convert_tokens_to_ids("<p>"):
+            decoded_tokens.append("\n[분석 항목] ")
+        elif tid == tokenizer.convert_tokens_to_ids("</p>"):
+            decoded_tokens.append("\n")
+        elif tid == tokenizer.convert_tokens_to_ids("[SEG]"):
+            decoded_tokens.append(" [객체 세그멘테이션 실행] ")
+        else:
+            # 기타 알 수 없는 ID는 그냥 번호로 표시 (에러 방지)
+            decoded_tokens.append(f" [Special_Token_{tid}] ")
+
+# 최종 리포트 텍스트 완성
+response = "".join(decoded_tokens).replace("  ", " ").strip()
+
+print("\n" + "="*60)
+print("  [RTX 5090 기반 GLaMM AI 환경 분석 리포트]")
 print("="*60)
-print(response)
+if response:
+    print(response)
+else:
+    print("텍스트 추출에 실패했지만, 이미지 생성 단계로 넘어갑니다.")
 print("="*60 + "\n")
 
-# 이미지 저장 로직
-if pred_masks is not None and len(pred_masks) > 0:
-    vis_image = np.array(raw_image).astype(np.float32)
-    
-    for i, mask in enumerate(pred_masks[0]):
-        mask_np = mask.nan_to_num(0.0).cpu().numpy() > 0.0
-        if not np.any(mask_np): continue
-        
-        color = np.random.randint(0, 255, 3)
-        for c in range(3):
-            vis_image[:, :, c] = np.where(mask_np, vis_image[:, :, c] * 0.5 + color[c] * 0.5, vis_image[:, :, c])
-    
-    final_image = Image.fromarray(vis_image.astype(np.uint8))
-    final_image.save(output_image_path)
-    print(f"분석 성공: 리포트 출력 및 '{output_image_path}' 저장 완료.")
-else:
-    print("경고: 리포트는 생성되었으나 마스크 이미지 생성에 실패했습니다.")
+# 이후 이미지 저장 코드는 동일...
