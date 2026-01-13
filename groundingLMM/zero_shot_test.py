@@ -18,7 +18,12 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
 print(f"[*] [1/5] GLaMM-FullScope 모델 로드 시작)")
-tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+tokenizer = AutoTokenizer.from_pretrained(
+    model_path, 
+    use_fast=False,
+    padding_side='right',
+    model_max_length=2048
+)
 
 # 5090 최적화: BF16 사용
 model = GLaMMForCausalLM.from_pretrained(
@@ -73,7 +78,7 @@ with torch.inference_mode():
         input_ids=input_ids,
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]],
-        max_tokens_new=2048,
+        max_tokens_new=1024,
     )
 
 # 5. 결과 텍스트 출력 및 이미지 시각화
