@@ -73,12 +73,11 @@ print("[*] [4/5] 추론 중")
 conv = conv_templates["vicuna_v1"].copy()
 
 prompt = (
-    "Please perform an expert level environmental assessment of this image:\n"
-    "1. Identify the level of drought or water stress in the soil and overall terrain.\n"
-    "2. Categorize the specific types of trees and vegetation present.\n"
-    "3. Use the [SEG] token to segment every tree and plant for area calculation.\n"
-    "4. Finally, evaluate the carbon sequestration efficiency based on the density and species of the vegetation, "
-    "and provide a structured ecological impact report."
+    "As an environmental expert, please provide a very detailed report for this scene.\n"
+    "Step 1: Write a long paragraph describing the terrain, soil moisture, and any visible drought indicators.\n"
+    "Step 2: List the specific species of trees and vegetation you can identify.\n"
+    "Step 3: Provide a detailed evaluation of carbon sequestration efficiency (Low/Medium/High) and why.\n"
+    "Step 4: Finally, output the [SEG] token for every tree and plant to visualize your analysis."
 )
 
 conv.append_message(conv.roles[0], "<image>\n" + prompt)
@@ -96,44 +95,45 @@ with torch.inference_mode():
     )
 
 # 5. 결과 분석 및 시각화 저장
-print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중")
+print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중...")
 
-# 답변 부분만 슬라이싱
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-# 특수 토큰 매핑 사전
 special_map = {
     tokenizer.convert_tokens_to_ids("[SEG]"): "[SEG]",
     tokenizer.convert_tokens_to_ids("<p>"): "<p>",
-    tokenizer.convert_tokens_to_ids("</p>"): "</p>",
-    tokenizer.convert_tokens_to_ids("<grounding>"): "<grounding>"
+    tokenizer.convert_tokens_to_ids("</p>"): "</p>"
 }
 
-raw_tokens = []    # 1. 특수 토큰 보존용
-clean_tokens = []  # 2. 가독성 최적화용
+raw_tokens = []
+clean_tokens = []
+sp_limit = tokenizer.sp_model.get_piece_size()
 
 for tid in response_ids:
     if tid < sp_limit:
         try:
-            token_text = tokenizer.sp_model.IdToPiece(int(tid)).replace(' ', ' ')
+            # [수정] 유니코드 공백 문자(\u2581)를 실제 공백으로 변환
+            token_text = tokenizer.sp_model.IdToPiece(int(tid)).replace('\u2581', ' ')
             raw_tokens.append(token_text)
             clean_tokens.append(token_text)
         except:
             continue
     else:
-        tag = special_map.get(tid, f"[ID_{tid}]")
-        raw_tokens.append(f" {tag} ")
-        if tag == "<p>": clean_tokens.append("\n[분석] ")
-        elif tag == "</p>": clean_tokens.append("\n")
-        elif tag == "[SEG]": clean_tokens.append(" [식생 구역 확인] ")
+        tag = special_map.get(tid, "")
+        if tag:
+            raw_tokens.append(f" {tag} ")
+            if tag == "<p>": clean_tokens.append(" <p>")
+            elif tag == "[SEG]": clean_tokens.append(" [SEG] ")
+            elif tag == "</p>": clean_tokens.append(" </p> ")
 
 raw_response = "".join(raw_tokens).replace("<s>", "").replace("</s>", "").strip()
 clean_response = "".join(clean_tokens).replace("  ", " ").strip()
 
-print("="*65 + "\n")
+
+print("=" * 65 + "\n")
 print(raw_response)
-print("="*65 + "\n")
+print("=" * 65 + "\n")
 print(clean_response)
 print("="*65 + "\n")
 
