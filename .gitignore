@@ -8,7 +8,8 @@ groundingLMM/checkpoints/
 *.png
 *.jpg
 *.jpeg
-groundingLMM/test_image/
+!groundingLMM/test_image/
+!groundingLMM/test_image/*
 
 # 파이썬 및 시스템 캐시
 __pycache__/
@@ -21,3 +22,4 @@ __pycache__/
 miniconda.exe
 .env
 venv/
+
