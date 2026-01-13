@@ -89,9 +89,6 @@ with torch.inference_mode():
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
         max_tokens_new=1024,
-        do_sample=True,      # 다양성 부여
-        temperature=0.7,     # 답변의 창의성 향상
-        top_p=0.9            # 논리적 정합성 유지
     )
 
 # 5. 결과 분석 및 시각화 저장 (완전 수동 ID 매핑)
