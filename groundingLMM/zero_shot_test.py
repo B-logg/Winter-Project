@@ -94,47 +94,56 @@ with torch.inference_mode():
         max_tokens_new=1024,
     )
 
-# 5. 결과 분석 및 시각화 저장
+# 5. 결과 분석 및 시각화 저장 (전수조사 버전)
 print("[*] [5/5] 추론 결과 분석 및 결과물 저장 중...")
 
+# 질문 길이를 제외한 순수 답변 ID 추출
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-special_map = {
-    tokenizer.convert_tokens_to_ids("[SEG]"): "[SEG]",
-    tokenizer.convert_tokens_to_ids("<p>"): "<p>",
-    tokenizer.convert_tokens_to_ids("</p>"): "</p>"
-}
+# [디버깅] 현재 시스템이 알고 있는 ID 번호 확인
+print(f"   > [디버깅] 내비게이션 번호표:")
+print(f"     - [SEG] ID: {tokenizer.convert_tokens_to_ids('[SEG]')}")
+print(f"     - <p> ID: {tokenizer.convert_tokens_to_ids('<p>')}")
+print(f"     - </p> ID: {tokenizer.convert_tokens_to_ids('</p>')}")
+print(f"     - <grounding> ID: {tokenizer.convert_tokens_to_ids('<grounding>')}")
 
-raw_tokens = []
-clean_tokens = []
+decoded_tokens = []
 sp_limit = tokenizer.sp_model.get_piece_size()
 
 for tid in response_ids:
-    if tid < sp_limit:
+    tid_val = int(tid)
+    # 1. 일반 텍스트 토큰 (사전 내 범위)
+    if tid_val < sp_limit:
         try:
-            # [수정] 유니코드 공백 문자(\u2581)를 실제 공백으로 변환
-            token_text = tokenizer.sp_model.IdToPiece(int(tid)).replace('\u2581', ' ')
-            raw_tokens.append(token_text)
-            clean_tokens.append(token_text)
+            token_text = tokenizer.sp_model.IdToPiece(tid_val).replace('\u2581', ' ')
+            decoded_tokens.append(token_text)
         except:
             continue
+    # 2. 특수 토큰 처리 (사전 외 범위)
     else:
-        tag = special_map.get(tid, "")
-        if tag:
-            raw_tokens.append(f" {tag} ")
-            if tag == "<p>": clean_tokens.append(" <p>")
-            elif tag == "[SEG]": clean_tokens.append(" [SEG] ")
-            elif tag == "</p>": clean_tokens.append(" </p> ")
+        # 현재 토크나이저에 등록된 이름을 가져옴
+        token_name = tokenizer.convert_ids_to_tokens(tid_val)
+        
+        if token_name == "[SEG]":
+            decoded_tokens.append(" [SEG] ")
+        elif token_name == "<p>":
+            decoded_tokens.append("\n<p> ")
+        elif token_name == "</p>":
+            decoded_tokens.append(" </p>\n")
+        elif token_name == "<grounding>":
+            decoded_tokens.append(" <grounding> ")
+        else:
+            # 예상치 못한 ID가 나왔을 경우 (예: <0x0A> 등)
+            decoded_tokens.append(f" [{token_name if token_name else tid_val}] ")
 
-raw_response = "".join(raw_tokens).replace("<s>", "").replace("</s>", "").strip()
-clean_response = "".join(clean_tokens).replace("  ", " ").strip()
+# 최종 리포트 완성
+response = "".join(decoded_tokens).replace("<s>", "").replace("</s>", "").strip()
 
-
-print("=" * 65 + "\n")
-print(raw_response)
-print("=" * 65 + "\n")
-print(clean_response)
+print("\n" + "="*65)
+print("  [GLaMM AI 정밀 분석 리포트 (태그 포함 버전)]")
+print("-" * 65)
+print(response)
 print("="*65 + "\n")
 
 # 시각화 및 이미지 저장
