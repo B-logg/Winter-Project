@@ -8,7 +8,7 @@ from model.llava.conversation import conv_templates
 from model.llava.mm_utils import tokenizer_image_token
 
 # 1. 경로 및 환경 설정
-model_path = os.path.expanduser("~/Winter-Project/groundingLMM/checkpoints/GLaMM-FullScope")
+model_path = os.path.expanduser("~/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
 image_path = os.path.expanduser("~/Winter-Project/groundingLMM/test_image/test.png")
 output_image_path = "final_carbon_analysis_result.png"
 
