@@ -1,4 +1,5 @@
 groundingLMM/checkpoints/
+datasets/checkpoints/
 **/checkpoints/
 *.pth
 *.bin
@@ -10,6 +11,13 @@ groundingLMM/checkpoints/
 *.jpeg
 !groundingLMM/test_image/
 !groundingLMM/test_image/*
+*.json
+!datasets/INaturalist/l1_prepare_data.json
+datasets/INaturalist/all_tree_ids.txt
+datasets/NEON/NEON_dataset
+
+L3_Final_Output/
+L3_Work_Dir/
 
 # 파이썬 및 시스템 캐시
 __pycache__/

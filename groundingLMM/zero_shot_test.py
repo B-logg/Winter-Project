@@ -7,6 +7,8 @@ from model.GLaMM import GLaMMForCausalLM
 from model.llava.conversation import conv_templates
 from model.llava.mm_utils import tokenizer_image_token
 
+# 165.246.141.105
+
 # 1. 경로 및 환경 설정
 model_path = os.path.expanduser("~/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
 image_path = os.path.expanduser("~/Winter-Project/groundingLMM/test_image/test.png")
@@ -16,7 +18,7 @@ output_image_path = "final_carbon_analysis_result.png"
 gc.collect()
 torch.cuda.empty_cache()
 
-print(f"[*] [1/5] 모델 및 토크나이저 로드")
+print(f"[1/5] 모델 및 토크나이저 로드")
 
 # 토크나이저 로드 및 특수 토큰 설정
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -35,12 +37,12 @@ model.resize_token_embeddings(len(tokenizer))
 model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
 # 2. 모델 GPU 이동
-print("[*] [2/5] 모델 CUDA(GPU) 이동 완료")
+print("[2/5] 모델 CUDA(GPU) 이동 완료")
 model.to("cuda")
 model.eval()
 
 # 3. 데이터 전처리
-print("[*] [3/5] 탄소 흡수원 이미지 전처리")
+print("[3/5] 탄소 흡수원 이미지 전처리")
 raw_image = Image.open(image_path).convert("RGB")
 
 # CLIP용 전처리
@@ -54,7 +56,7 @@ sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).
                     torch.tensor([58.395, 57.12, 57.375]).view(3,1,1)).unsqueeze(0).to("cuda", dtype=torch.bfloat16)
 
 # 4. 복합 환경 분석 추론
-print("[*] [4/5] 추론")
+print("[4/5] 추론")
 conv = conv_templates["vicuna_v1"].copy()
 
 # 환경 분석 전문가용 프롬프트
@@ -92,7 +94,7 @@ with torch.inference_mode():
     )
 
 # 5. 결과 분석 및 시각화 저장
-print("[*] [5/5] 결과 분석 및 이미지 시각화 중")
+print("[5/5] 결과 분석 및 이미지 시각화 중")
 
 # 질문 길이를 제외한 순수 생성 부분 추출
 input_token_len = input_ids.shape[1]
@@ -121,7 +123,7 @@ for tid in response_ids:
 
 # 최종 리포트 조립
 final_raw = forced_prefix + "".join(raw_tokens).strip()
-final_clean = forced_prefix.replace("<p>", "\n\n[분석 항목] ") + "".join(clean_tokens).replace("  ", " ").strip()
+final_clean = forced_prefix.replace("<p>", "\n") + "".join(clean_tokens).replace("  ", " ").strip()
 
 print("="*70 + "\n")
 print(final_raw)
@@ -140,6 +142,6 @@ if pred_masks is not None and len(pred_masks) > 0:
             vis_image[:, :, c] = np.where(mask_np, vis_image[:, :, c] * 0.5 + color[c] * 0.5, vis_image[:, :, c])
     
     Image.fromarray(vis_image.astype(np.uint8)).save(output_image_path)
-    print(f"분석 성공: 리포트 출력 및 '{output_image_path}' 저장 완료.")
+    print(f"텍스트 출력 및 '{output_image_path}' 저장 완료.")
 else:
-    print("마스크 생성 실패: 이미지에 식생이 뚜렷하지 않을 수 있습니다.")
+    print("마스크 생성 실패")
