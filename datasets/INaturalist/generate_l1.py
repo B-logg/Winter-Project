@@ -11,6 +11,8 @@ from segment_anything import sam_model_registry, SamPredictor
 from groundingdino.util.inference import load_model, load_image, predict, annotate
 from tqdm import tqdm
 
+
+
 GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
@@ -31,6 +33,11 @@ JSON_DIR = os.path.join(OUTPUT_DIR, "l1_train.json")
 # SAM ViT-H 가중치 경로
 CHECKPOINT_ROOT = os.path.dirname(CURRENT_DIR)
 CHECKPOINT_PATH = os.path.join(CHECKPOINT_ROOT, "checkpoints", "sam_vit_h_4b8939.pth")
+
+CONFIG_PATH = os.path.join(CHECKPOINT_ROOT, "checkpoints" , "GroundingDINO_SwinT_OGC.py")
+WEIGHTS_PATH = os.path.join(CHECKPOINT_ROOT, "checkpoints", "groundingdino_swint_ogc.pth")
+
+grounding_dino_model = load_model(CONFIG_PATH, WEIGHTS_PATH)
 
 # 결과 저장 디렉토리 생성
 os.makedirs(IMAGE_DIR, exist_ok=True)
