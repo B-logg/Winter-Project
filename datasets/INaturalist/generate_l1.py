@@ -251,7 +251,7 @@ def process_data():
             
             # 중간 저장 (50개 단위)
             if global_idx % 50 == 0:
-                with open(OUTPUT_DIR, "w", encoding="utf-8") as f:
+                with open(f"{OUTPUT_DIR}/result.json", "w", encoding="utf-8") as f:
                     json.dump(l1_dataset, f, ensure_ascii=False, indent=2)
 
     # 최종 저장
