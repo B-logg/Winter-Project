@@ -223,7 +223,7 @@ def process_data():
                 selected_question = random.choice(LEVEL1_QUESTIONS)
                 
                 # Gemini 호출
-                gemini_answer = get_gemini_answer(img_save_path, selected_question, tree_label)
+                gemini_answer = get_gemini_answer(selected_question, tree_label)
 
                 # JSON 데이터 구성
                 l1_entry = {
