@@ -255,7 +255,8 @@ def process_data():
                     json.dump(l1_dataset, f, ensure_ascii=False, indent=2)
 
     # 최종 저장
-    with open(OUTPUT_DIR, "w", encoding="utf-8") as f:
+    
+    with open(f"{OUTPUT_DIR}/result.json", "w", encoding="utf-8") as f:
         json.dump(l1_dataset, f, ensure_ascii=False, indent=2)
 
     print(f"완료! 총 {len(l1_dataset)}개의 데이터 생성.")
