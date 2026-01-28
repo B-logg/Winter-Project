@@ -31,34 +31,64 @@ def init_models():
 
 def download_neon_image(site, year, tile_id, save_dir):
     """
-    NEON API를 뒤져서 해당 tile_id를 가진 .tif 파일을 다운로드합니다.
+    NEON API를 통해 .tif 파일을 다운로드합니다.
+    site, year를 CSV에서 가져오는 대신 tile_id에서 직접 추출하여 안전성 확보
     """
     filename = f"{tile_id}.tif"
     save_path = os.path.join(save_dir, filename)
     
     if os.path.exists(save_path):
         return save_path
-    
-    url_site = f"https://data.neonscience.org/api/v0/data/{NEON_PRODUCT_ID}/{site}"
+
+    # tile_id 예시: "2022_GRSM_6_270000_3937000_image"
     try:
-        r = requests.get(url_site).json()
-        if 'error' in r: raise Exception(r['error'])
+        parts = tile_id.split('_')
+        safe_year = parts[0]   # "2022"
+        safe_site = parts[1]   # "GRSM"
+    except IndexError:
+        print(f"⚠️ Tile ID Parsing Failed: {tile_id}")
+        return None
+
+    # 디버깅용 URL 출력
+    url_site = f"https://data.neonscience.org/api/v0/data/{NEON_PRODUCT_ID}/{safe_site}"
+    # print(f"DEBUG: Checking API: {url_site}") 
+
+    try:
+        # 1. 해당 사이트의 데이터 가용성 확인
+        r = requests.get(url_site)
         
-        available_months = [m for m in r['data']['siteCodes'][0]['availableMonths'] if m.startswith(str(year))]
+        # API가 404나 400을 뱉으면 바로 중단
+        if r.status_code != 200:
+            print(f"API Error ({r.status_code}): {r.text} | URL: {url_site}")
+            return None
+            
+        r_json = r.json()
+        if 'error' in r_json: 
+            print(f"API Error Response: {r_json['error']}")
+            return None
+        
+        # 해당 연도의 데이터가 있는지 확인
+        available_months = [m for m in r_json['data']['siteCodes'][0]['availableMonths'] if m.startswith(str(safe_year))]
         
         if not available_months:
-            print(f"No data found for {site} in {year}")
+            print(f"No data found for {safe_site} in {safe_year}")
             return None
 
+        # 파일 URL 찾기
         file_url = None
-        for month in available_months:
-            url_files = f"https://data.neonscience.org/api/v0/data/{NEON_PRODUCT_ID}/{site}/{month}"
+        # 최신 데이터부터 찾기 위해 역순 정렬 (선택사항)
+        for month in sorted(available_months, reverse=True):
+            url_files = f"https://data.neonscience.org/api/v0/data/{NEON_PRODUCT_ID}/{safe_site}/{month}"
             r_files = requests.get(url_files).json()
             
+            # 'files' 키가 없는 경우 방어
+            if 'data' not in r_files or 'files' not in r_files['data']:
+                continue
+
             for file_info in r_files['data']['files']:
                 if file_info['name'] == filename:
                     file_url = file_info['url']
-                    print(f"Found URL in {month}: {file_url}")
+                    # print(f"Found URL in {month}")
                     break
             if file_url: break
         
@@ -67,18 +97,19 @@ def download_neon_image(site, year, tile_id, save_dir):
             return None
 
         # 3. 다운로드 수행
-        print(f"Downloading...")
+        # print(f"Downloading {filename}...")
         with requests.get(file_url, stream=True) as r:
             r.raise_for_status()
             with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
-        print("Download Complete.")
+        # print("Download Complete.")
         return save_path
 
     except Exception as e:
-        print(f"Download Error: {e}")
+        print(f"Download Exception: {e}")
         return None
+
 
 def get_pixel_coords(tif_path, utm_bbox):
     """
