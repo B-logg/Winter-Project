@@ -31,83 +31,84 @@ def init_models():
 
 def download_neon_image(site, year, tile_id, save_dir):
     """
-    NEON API를 통해 .tif 파일을 다운로드합니다.
-    site, year를 CSV에서 가져오는 대신 tile_id에서 직접 추출하여 안전성 확보
+    NEON API 구조 변경: Data API 대신 Product API로 가용 월(Month)을 먼저 조회합니다.
     """
     filename = f"{tile_id}.tif"
     save_path = os.path.join(save_dir, filename)
     
     if os.path.exists(save_path):
         return save_path
-
-    # tile_id 예시: "2022_GRSM_6_270000_3937000_image"
+    
+    # tile_id 파싱 (안전장치)
     try:
         parts = tile_id.split('_')
-        safe_year = parts[0]   # "2022"
-        safe_site = parts[1]   # "GRSM"
-    except IndexError:
-        print(f"⚠️ Tile ID Parsing Failed: {tile_id}")
+        safe_year = parts[0]
+        safe_site = parts[1]
+    except:
         return None
 
-    # 디버깅용 URL 출력
-    url_site = f"https://data.neonscience.org/api/v0/data/{NEON_PRODUCT_ID}/{safe_site}"
-    # print(f"DEBUG: Checking API: {url_site}") 
+    print(f"🔍 Searching NEON API for: {filename} ({safe_site}, {safe_year})...")
 
+    # [수정됨] 1. Product API를 통해 해당 사이트의 가용 월(Month) 조회
+    # Data API는 월(Month) 없이 호출하면 400 에러가 뜸!
+    product_url = f"https://data.neonscience.org/api/v0/products/{NEON_PRODUCT_ID}"
+    
     try:
-        # 1. 해당 사이트의 데이터 가용성 확인
-        r = requests.get(url_site)
-        
-        # API가 404나 400을 뱉으면 바로 중단
+        r = requests.get(product_url)
         if r.status_code != 200:
-            print(f"API Error ({r.status_code}): {r.text} | URL: {url_site}")
-            return None
-            
-        r_json = r.json()
-        if 'error' in r_json: 
-            print(f"API Error Response: {r_json['error']}")
+            print(f"❌ Product API Error: {r.status_code}")
             return None
         
-        # 해당 연도의 데이터가 있는지 확인
-        available_months = [m for m in r_json['data']['siteCodes'][0]['availableMonths'] if m.startswith(str(safe_year))]
+        data = r.json()
+        if 'data' not in data: return None
+
+        # 해당 사이트(BART 등) 정보 찾기
+        site_info = next((s for s in data['data']['siteCodes'] if s['siteCode'] == safe_site), None)
+        
+        if not site_info:
+            print(f"⚠️ Site {safe_site} not found in product {NEON_PRODUCT_ID}")
+            return None
+        
+        # 해당 연도(year)가 포함된 월만 필터링 (예: "2022-06")
+        available_months = [m for m in site_info['availableMonths'] if m.startswith(str(safe_year))]
         
         if not available_months:
-            print(f"No data found for {safe_site} in {safe_year}")
+            print(f"⚠️ No data found for {safe_site} in {safe_year}")
             return None
 
-        # 파일 URL 찾기
+        # 2. 각 월별 Data API를 조회하여 파일 URL 찾기
         file_url = None
-        # 최신 데이터부터 찾기 위해 역순 정렬 (선택사항)
         for month in sorted(available_months, reverse=True):
-            url_files = f"https://data.neonscience.org/api/v0/data/{NEON_PRODUCT_ID}/{safe_site}/{month}"
-            r_files = requests.get(url_files).json()
+            # 이제 정확한 월(YYYY-MM)을 알았으니 Data API 호출 가능
+            data_url = f"https://data.neonscience.org/api/v0/data/{NEON_PRODUCT_ID}/{safe_site}/{month}"
+            r_files = requests.get(data_url).json()
             
-            # 'files' 키가 없는 경우 방어
             if 'data' not in r_files or 'files' not in r_files['data']:
                 continue
 
             for file_info in r_files['data']['files']:
                 if file_info['name'] == filename:
                     file_url = file_info['url']
-                    # print(f"Found URL in {month}")
+                    print(f"✅ Found URL in {month}")
                     break
             if file_url: break
         
         if not file_url:
-            print(f"File not found in NEON database: {filename}")
+            print(f"⚠️ File not found in NEON database: {filename}")
             return None
 
         # 3. 다운로드 수행
-        # print(f"Downloading {filename}...")
+        print(f"⬇️ Downloading...")
         with requests.get(file_url, stream=True) as r:
             r.raise_for_status()
             with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
-        # print("Download Complete.")
+        print("✅ Download Complete.")
         return save_path
 
     except Exception as e:
-        print(f"Download Exception: {e}")
+        print(f"❌ Download Error: {e}")
         return None
 
 
