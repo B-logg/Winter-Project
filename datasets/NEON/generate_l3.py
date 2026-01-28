@@ -47,7 +47,6 @@ def download_neon_image(site, year, tile_id, save_dir):
     except:
         return None
 
-    print(f"🔍 Searching NEON API for: {filename} ({safe_site}, {safe_year})...")
 
     # 1. Product API를 통해 해당 사이트의 가용 월(Month) 조회
     # Data API는 월(Month) 없이 호출하면 400 에러가 뜸!
@@ -56,7 +55,6 @@ def download_neon_image(site, year, tile_id, save_dir):
     try:
         r = requests.get(product_url)
         if r.status_code != 200:
-            print(f"Product API Error: {r.status_code}")
             return None
         
         data = r.json()
@@ -66,14 +64,12 @@ def download_neon_image(site, year, tile_id, save_dir):
         site_info = next((s for s in data['data']['siteCodes'] if s['siteCode'] == safe_site), None)
         
         if not site_info:
-            print(f"Site {safe_site} not found in product {NEON_PRODUCT_ID}")
             return None
         
         # 해당 연도(year)가 포함된 월만 필터링 (예: "2022-06")
         available_months = [m for m in site_info['availableMonths'] if m.startswith(str(safe_year))]
         
         if not available_months:
-            print(f"No data found for {safe_site} in {safe_year}")
             return None
 
         # 2. 각 월별 Data API를 조회하여 파일 URL 찾기
@@ -89,22 +85,18 @@ def download_neon_image(site, year, tile_id, save_dir):
             for file_info in r_files['data']['files']:
                 if file_info['name'] == filename:
                     file_url = file_info['url']
-                    print(f"Found URL in {month}")
                     break
             if file_url: break
         
         if not file_url:
-            print(f"File not found in NEON database: {filename}")
             return None
 
         # 3. 다운로드 수행
-        print(f"⬇️ Downloading...")
         with requests.get(file_url, stream=True) as r:
             r.raise_for_status()
             with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
-        print("Download Complete.")
         return save_path
 
     except Exception as e:
@@ -155,7 +147,6 @@ def process_dataset(df, model, predictor):
     
     # 이미 Tile ID로 유니크하므로 groupby가 사실상 1개씩 처리함
     grouped = df.groupby('tile_id')
-    print(f"Processing {len(grouped)} tiles...")
 
     for idx, (tile_id, group) in enumerate(grouped):
         # 그룹에는 row가 1개만 있다고 가정 (prepare_neon 구조상)
@@ -208,6 +199,8 @@ def process_dataset(df, model, predictor):
                     
                     # tree_idx는 무조건 0 (wrapped_row에 1개만 넣었으므로)
                     l3_data = neon_l2_bridge(wrapped_row, tree_idx=0, custom_bbox=norm_box)
+
+                    l3_data['id'] = f"{tile_id}_{i}"
                     
                     # Gemini
                     response = model.generate_content([l3_data['prompt'], pil_img])
@@ -233,7 +226,6 @@ def process_dataset(df, model, predictor):
                         "bbox_normalized": norm_box 
                     }
                     l3_results.append(final_entry)
-                    print(f"  Saved Tree: {l3_data['id']}")
 
                 except Exception as e:
                     print(f"  Individual Tree Error: {e}")
@@ -245,7 +237,6 @@ def process_dataset(df, model, predictor):
         finally:
             if os.path.exists(tif_path):
                 os.remove(tif_path)
-                print(f"Deleted temp file: {tif_path}")
 
     with open(os.path.join(OUTPUT_PATH, "l3_dataset.json"), "w", encoding='utf-8') as f:
         json.dump(l3_results, f, indent=4, ensure_ascii=False)
@@ -255,9 +246,9 @@ if __name__ == "__main__":
     gemini, sam = init_models()
     df = pd.read_csv(INPUT_PATH)
     
-    # [테스트용] 5개 타일만 실행
+    # [테스트용] 1개 타일만 실행
     unique_tiles = df['tile_id'].unique()
-    sample_tiles = np.random.choice(unique_tiles, min(len(unique_tiles), 5), replace=False)
+    sample_tiles = np.random.choice(unique_tiles, min(len(unique_tiles), 1), replace=False)
     df = df[df['tile_id'].isin(sample_tiles)]
     
     process_dataset(df, gemini, sam)
