@@ -1,5 +1,5 @@
 # 한 이미지에 대해서 흩어져 있는 모든 정보를 CSV 형태로 모으는 코드
-# BART, GRSM, HARV 모두 한 CSV 파일로 병햡
+# BART, GRSM 모두 한 CSV 파일로 병햡
 
 import geopandas as gpd
 import pandas as pd
@@ -29,10 +29,10 @@ def estimate_dbh(height, area):
 
 base_path = "/Users/bosung/Desktop/NEON"
 output_path = "/Users/bosung/Desktop/GLaMM/datasets/NEON"
-sites = ['BART', 'GRSM', 'HARV']
-output_csv = os.path.join(output_path, "NEON_dataset")
+output_csv = os.path.join(output_path, "NEON_dataset.csv")
 
 all_data = []
+sites = ['BART', 'GRSM']
 
 for site in sites:
     site_path = os.path.join(base_path, site)
@@ -74,7 +74,7 @@ for site in sites:
             # 개별 나무 정보
             'bboxes': gdf.geometry.apply(lambda g: list(g.bounds)).tolist(), # 개별 나무 영역 좌표
             'individual_heights': gdf['height'].tolist(), # 개별 나무 높이
-            'individual_crown_area': calculated_areas.tolist(), # 개별 나무 수관 면적
+            'individual_crown_areas': calculated_areas.tolist(), # 개별 나무 수관 면적
             'individual_dbhs': dbhs, # 개별 나무 직경
             'individual_tree_types': tree_types # 개별 나무 판별(활엽수 vs 침엽수)
         }

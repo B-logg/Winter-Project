@@ -4,7 +4,8 @@ datasets/checkpoints/
 *.pth
 *.bin
 
-
+AI_Hub
+NEON_dataset.csv
 # 결과물 이미지 및 테스트용 이미지
 *.png
 *.jpg

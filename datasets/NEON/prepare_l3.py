@@ -1,20 +1,21 @@
 import numpy as np
 
 # generate_l3에 넣기 위한 전처리
-def neon_l2_bridge(row, tree_idx=0):
+def neon_l2_bridge(row, tree_idx=0, custom_bbox=None):
     
     site = row['site']
     tile_id = row['tile_id']
-    bbox = row['bboxes'][tree_idx]
+
+    # generate_l3에서 UTM 좌표를 정규화(0~1000)해서 넘겨줌 = custom_bbox
+    if custom_bbox is not None:
+        normalized_bbox = custom_bbox
+    else: # 정규화된 좌표가 없는 경우 .. 
+        raise ValueError(f"정규화된 좌표가 입력되지 않았습니다. Tile: {tile_id}, Tree: {tree_idx} ")
+    
     h = row['individual_heights'][tree_idx] # 나무 높이
     a = row['individual_crown_areas'][tree_idx] # 나무 수관면적
     d = row['individual_dbhs'][tree_idx] # 나무 직경(추론값)
     tree_type = row['individual_tree_types'][tree_idx] # 나무 종류(활엽수 vs 침엽수, 추론값)
-
-
-    # 이미지 크기 정규화 필요(0~1000)
-
-    normalized_bbox = [int(bbox[1]), int(bbox[0]), int(bbox[3]), int(bbox[2])]
 
     human_query = "이 구역 나무[SEG]의 탄소 흡수 효율과 생태학적 가치를 계산 근거와 함께 분석해 주세요."
 
@@ -59,7 +60,7 @@ def neon_l2_bridge(row, tree_idx=0):
     """
     return {
         "id": f"{tile_id}_{tree_idx}",
-        "image": f"{tile_id}.tif",
+        "image": f"{tile_id}.jpg",
         "human_query": human_query,
         "prompt": prompt,
         "landmark": f"Tree at {normalized_bbox}"
