@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio.windows import Window
 import torch
 import requests
 from PIL import Image
@@ -19,6 +20,8 @@ OUTPUT_PATH = os.path.join(CURRENT_DIR, "l3_dataset")
 SAM_CHECKPOINT = os.path.join(CURRENT_DIR, "checkpoints", "sam_hq_vit_l.pth")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 NEON_PRODUCT_ID = "DP3.30010.001"
+
+TILE_SIZE = 1024
 
 # Gemini API 설정 및 SAM 설정
 def init_models():
@@ -103,39 +106,57 @@ def download_neon_image(site, year, tile_id, save_dir):
         print(f"Download Error: {e}")
         return None
 
+# src: 전체 큰 이미지(GeoTIFF 파일 객체) - 좌표 변환을 위해 필요
+# window: 현재 잘라낸 타일의 위치와 크기 정보 - 전체 이미지에서 어디서 부터 어디까지 잘랐는지
+# row_dat: CSV에서 읽어온 데이터, 이 큰 이미지 안에 있는 모든 나무의 정보가 들어있음
+def filter_trees_in_tile(src, window, row_data):
+    # 1024x1024 타일(Window) 안에 '중심점'이 포함되는 나무만 필터링
 
-def get_pixel_coords(tif_path, utm_bbox):
-    """
-    GeoTIFF의 Transform 정보를 이용해 UTM 좌표 -> Pixel 좌표 변환
-    utm_bbox: [min_x, min_y, max_x, max_y] (지도 좌표)
-    returns: [min_x, min_y, max_x, max_y] (픽셀 좌표)
-    """
-    with rasterio.open(tif_path) as src:
-        # rasterio.index는 (row, col) = (y, x)를 반환함에 주의!
-        # min_x, max_y (Top-Left)
-        row_min, col_min = src.index(utm_bbox[0], utm_bbox[3]) 
-        # max_x, min_y (Bottom-Right)
-        row_max, col_max = src.index(utm_bbox[2], utm_bbox[1])
-        
-        h, w = src.shape
-        
-        # 음수 좌표 방지 및 이미지 크기 내로 클리핑
-        x1 = max(0, min(col_min, w))
-        y1 = max(0, min(row_min, h))
-        x2 = max(0, min(col_max, w))
-        y2 = max(0, min(row_max, h))
-        
-        # [min_x, min_y, max_x, max_y] 순서로 반환
-        return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)], w, h
+    # CSV 데이터 파싱(CSV 파일에 문자열 형태로 저장된 정보를 파이썬의 리스트 형태로 변환)
+    bboxes = eval(row_data['bboxes']) if isinstance(row_data['bboxes'], str) else row_data['bboxes']
+    heights = eval(row_data['individual_heights']) if isinstance(row_data['individual_heights'], str) else row_data['individual_heights']
+    areas = eval(row_data['individual_crown_areas']) if isinstance(row_data['individual_crown_areas'], str) else row_data['individual_crown_areas']
+    dbhs = eval(row_data['individual_dbhs']) if isinstance(row_data['individual_dbhs'], str) else row_data['individual_dbhs']
+    types = eval(row_data['individual_tree_types']) if isinstance(row_data['individual_tree_types'], str) else row_data['individual_tree_types']
     
-def normalize_bbox(px_bbox, w, h):
-    """ 픽셀 좌표 -> 0~1000 정규화 좌표"""
-    return [
-        int(px_bbox[1] / h * 1000), # y_min
-        int(px_bbox[0] / w * 1000), # x_min
-        int(px_bbox[3] / h * 1000), # y_max
-        int(px_bbox[2] / w * 1000)  # x_max
-    ]
+    # 윈도우 좌표 정보(현재 타일의 위치 정보 가져오기)
+    win_col_off = window.col_off # 타일의 시작 X점(전체 이미지 기준)
+    win_row_off = window.row_off # 타일의 시작 Y점(전체 이미지 기준)
+    win_w = window.width # 타일 가로 길이(1024)
+    win_h = window.height # 타일 세로 길이(1024)
+    
+    filtered_boxes = [] # SAM에 입력할 상대 좌표 박스들을 담을 리스트
+    filtered_stats = {'heights': [], 'areas': [], 'dbhs': [], 'types': []}
+    
+    for i, utm_box in enumerate(bboxes): # 전체 이미지에 있는 모든 나무를 하나씩 꺼내서 utm 박스 검사
+        # UTM -> 전체 이미지 픽셀 변환
+        row_tl, col_tl = src.index(utm_box[0], utm_box[3])
+        row_br, col_br = src.index(utm_box[2], utm_box[1])
+        
+        # 나무의 중심점(픽셀) 계산
+        center_row = (row_tl + row_br) / 2
+        center_col = (col_tl + col_br) / 2
+        
+        # 중심점이 현재 타일 안에 있는지 확인 (전체 이미지에 있는 나무들 중에 현재 계산하는 타일 안에 있는 나무인지 검사)
+        if (win_row_off <= center_row < win_row_off + win_h) and \
+           (win_col_off <= center_col < win_col_off + win_w):
+            
+            # 타일 내부 상대 좌표로 변환 (0~1024) - 타일 내부에 있는 나무라면 타일 내 상대 좌표로 변환
+            rel_x1 = max(0, col_tl - win_col_off)
+            rel_y1 = max(0, row_tl - win_row_off)
+            rel_x2 = min(win_w, col_br - win_col_off)
+            rel_y2 = min(win_h, row_br - win_row_off)
+            
+            # 유효한 박스인지 확인 - 경계에 걸려서 잘렸더니 박스가 1~2픽셀만 남은 경우 버림
+            if rel_x2 - rel_x1 > 2 and rel_y2 - rel_y1 > 2:
+                filtered_boxes.append([rel_x1, rel_y1, rel_x2, rel_y2])
+                filtered_stats['heights'].append(heights[i])
+                filtered_stats['areas'].append(areas[i])
+                filtered_stats['dbhs'].append(dbhs[i])
+                filtered_stats['types'].append(types[i])
+                
+    return np.array(filtered_boxes), filtered_stats
+
 
 def process_dataset(df, model, predictor):
     os.makedirs(os.path.join(OUTPUT_PATH, "images"), exist_ok=True)
@@ -144,99 +165,111 @@ def process_dataset(df, model, predictor):
     os.makedirs(temp_dir, exist_ok=True)
     
     l3_results = []
-    
-    # 이미 Tile ID로 유니크하므로 groupby가 사실상 1개씩 처리함
     grouped = df.groupby('tile_id')
+    print(f"Processing {len(grouped)} large images...")
 
     for idx, (tile_id, group) in enumerate(grouped):
-        # 그룹에는 row가 1개만 있다고 가정 (prepare_neon 구조상)
-        row = group.iloc[0] 
-        site = row['site']
-        year = row['year']
+        row = group.iloc[0]
+        site, year = row['site'], row['year']
         
         tif_path = download_neon_image(site, year, tile_id, temp_dir)
         if not tif_path: continue
 
         try:
             with rasterio.open(tif_path) as src:
-                img_array = src.read([1, 2, 3]) 
-                img_array = np.moveaxis(img_array, 0, -1)
-            
-            predictor.set_image(img_array)
-            pil_img = Image.fromarray(img_array)
-            
-            jpg_filename = f"{tile_id}.jpg"
-            pil_img.save(os.path.join(OUTPUT_PATH, "images", jpg_filename), quality=85)
+                h_img, w_img = src.shape
+                
+                # Grid Tiling Loop (1024단위로 순회)
+                tile_idx = 0
+                for row_off in range(0, h_img, TILE_SIZE):
+                    for col_off in range(0, w_img, TILE_SIZE):
+                        
+                        # 윈도우 생성 (이미지 끝부분 처리)
+                        width = min(TILE_SIZE, w_img - col_off)
+                        height = min(TILE_SIZE, h_img - row_off)
+                        window = Window(col_off, row_off, width, height)
+                        
+                        # 1. 이 타일 안에 있는 나무들 필터링
+                        boxes, stats = filter_trees_in_tile(src, window, row)
+                        
+                        tree_count = len(boxes)
+                        if tree_count == 0: continue # 나무 없으면 패스
+                        
+                        # 2. 이미지 로드 (해당 타일만) -> 패딩
+                        img_tile = src.read([1, 2, 3], window=window)
+                        img_tile = np.moveaxis(img_tile, 0, -1)
+                        
+                        if img_tile.shape[0] != TILE_SIZE or img_tile.shape[1] != TILE_SIZE:
+                            pad_h = TILE_SIZE - img_tile.shape[0]
+                            pad_w = TILE_SIZE - img_tile.shape[1]
+                            img_tile = np.pad(img_tile, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+                        
+                        # 이미지 저장
+                        tile_id_suffix = f"{tile_id}_tile{tile_idx}"
+                        l3_data = neon_l2_bridge(stats, tile_id_suffix=tile_id_suffix)
+                        
+                        tile_filename = l3_data['image']
+                        pil_tile = Image.fromarray(img_tile)
+                        pil_tile.save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=85)
+                        
+                        # 3. SAM 배치 추론 (한 번에 N개 마스크 생성)
+                        predictor.set_image(img_tile)
+                        masks, _, _ = predictor.predict(
+                            point_coords=None,
+                            point_labels=None,
+                            box=boxes, # ★ N개의 박스 배치 입력
+                            multimask_output=False
+                        )
+                        
+                        # 마스크 통합 (Segmentation Map)
+                        combined_mask = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+                        for m in masks:
+                            combined_mask = np.maximum(combined_mask, m[0].astype(np.uint8) * 255)
+                        
+                        mask_filename = f"mask_{tile_id_suffix}.png"
+                        cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), combined_mask)
 
-            bboxes_list = eval(row['bboxes']) if isinstance(row['bboxes'], str) else row['bboxes']
-            heights_list = eval(row['individual_heights']) if isinstance(row['individual_heights'], str) else row['individual_heights']
-            
-            areas_list = eval(row['individual_crown_areas']) if isinstance(row['individual_crown_areas'], str) else row['individual_crown_areas']
-            dbhs_list = eval(row['individual_dbhs']) if isinstance(row['individual_dbhs'], str) else row['individual_dbhs']
-            types_list = eval(row['individual_tree_types']) if isinstance(row['individual_tree_types'], str) else row['individual_tree_types']
+                        # 4. Gemini 추론
+                        response = model.generate_content([l3_data['prompt'], pil_tile])
+                        try:
+                            clean_text = response.text.replace('```json', '').replace('```', '').strip()
+                            res_json = json.loads(clean_text)
+                        except:
+                            res_json = {"dense_caption": response.text}
 
-            # 이미지 내의 나무 수만큼 반복
-            for i, utm_box in enumerate(bboxes_list):
-                try:
-                    # utm_box는 이제 [x, y, x, y] 숫자 4개임!
-                    px_box, w, h = get_pixel_coords(tif_path, utm_box)
-                    
-                    # 너무 작은 박스 스킵
-                    if (px_box[2] - px_box[0]) < 3 or (px_box[3] - px_box[1]) < 3: continue
+                        # 5. 데이터 저장
+                        l3_entry = {
+                            "id": tile_id_suffix,
+                            "image": tile_filename,
+                            "conversations": [
+                                {
+                                    "from": "human",
+                                    "value": l3_data['human_query']
+                                },
+                                {
+                                    "from": "gpt",
+                                    "value": res_json.get('dense_caption', "")
+                                }
+                            ],
+                            "mask_path": f"masks/{mask_filename}",
+                            "stats": {
+                                "tree_count": tree_count,
+                                "avg_height": np.mean(stats['heights']),
+                                "avg_dbh": np.mean(stats['dbhs'])
+                            }
+                        }
+                        l3_results.append(l3_entry)
+                        print(f" {tile_id_suffix}: {tree_count} trees processed.")
+                        
+                        tile_idx += 1
 
-                    norm_box = normalize_bbox(px_box, w, h)
-
-                    # Bridge용 데이터 포장 (단일 값을 리스트로 감싸서 전달)
-                    wrapped_row = {
-                        'site': site,
-                        'tile_id': tile_id,
-                        'bboxes': [utm_box], 
-                        'individual_heights': [heights_list[i]],
-                        'individual_crown_areas': [areas_list[i]], 
-                        'individual_dbhs': [dbhs_list[i]], 
-                        'individual_tree_types': [types_list[i]]
-                    }
-                    
-                    # tree_idx는 무조건 0 (wrapped_row에 1개만 넣었으므로)
-                    l3_data = neon_l2_bridge(wrapped_row, tree_idx=0, custom_bbox=norm_box)
-
-                    l3_data['id'] = f"{tile_id}_{i}"
-                    
-                    # Gemini
-                    response = model.generate_content([l3_data['prompt'], pil_img])
-                    clean_text = response.text.replace('```json', '').replace('```', '').strip()
-                    try: res_json = json.loads(clean_text)
-                    except: res_json = {"dense_caption": clean_text}
-
-                    # SAM-H
-                    input_box = np.array(px_box)
-                    masks, _, _ = predictor.predict(box=input_box[None, :], multimask_output=False)
-                    
-                    mask_filename = f"mask_{l3_data['id']}.png"
-                    cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), (masks[0] * 255).astype(np.uint8))
-
-                    final_entry = {
-                        "id": l3_data['id'],
-                        "image": jpg_filename,
-                        "conversations": [
-                            {"from": "human", "value": l3_data['human_query']},
-                            {"from": "gpt", "value": res_json.get('dense_caption', "")}
-                        ],
-                        "mask_path": f"masks/{mask_filename}",
-                        "bbox_normalized": norm_box 
-                    }
-                    l3_results.append(final_entry)
-
-                except Exception as e:
-                    print(f"  Individual Tree Error: {e}")
-                    continue
-        
         except Exception as e:
             print(f"Tile Error: {e}")
         
         finally:
             if os.path.exists(tif_path):
                 os.remove(tif_path)
+                print(f"Deleted temp TIF: {tif_path}")
 
     with open(os.path.join(OUTPUT_PATH, "l3_dataset.json"), "w", encoding='utf-8') as f:
         json.dump(l3_results, f, indent=4, ensure_ascii=False)
@@ -246,9 +279,9 @@ if __name__ == "__main__":
     gemini, sam = init_models()
     df = pd.read_csv(INPUT_PATH)
     
-    # [테스트용] 1개 타일만 실행
+    # [테스트] 3개의 대형 이미지만 샘플링
     unique_tiles = df['tile_id'].unique()
-    sample_tiles = np.random.choice(unique_tiles, min(len(unique_tiles), 1), replace=False)
+    sample_tiles = np.random.choice(unique_tiles, min(len(unique_tiles), 3), replace=False)
     df = df[df['tile_id'].isin(sample_tiles)]
     
     process_dataset(df, gemini, sam)
