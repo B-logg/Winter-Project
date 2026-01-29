@@ -215,21 +215,21 @@ def process_dataset(df, model, predictor):
                         
                         # 3. SAM 배치 추론 (한 번에 N개 마스크 생성)
                         predictor.set_image(img_tile)
-
+                        
                         all_masks = []
-
-                        for k in range(0, len(boxes), SAM_BATCH_SIZE):
-                            batch_boxes = boxes[k : k + SAM_BATCH_SIZE]
-                            
-                            batch_masks, _, _ = predictor.predict(
+                        
+                        # 박스를 하나씩 넣어서 안전하게 추론
+                        for box in boxes:
+                            # box: (4,) -> (1, 4) 형태로 차원 추가
+                            mask, _, _ = predictor.predict(
                                 point_coords=None,
                                 point_labels=None,
-                                box=batch_boxes, 
+                                box=box[None, :], 
                                 multimask_output=False
                             )
-                            all_masks.append(batch_masks)
+                            all_masks.append(mask)
                         
-                        # 쪼개서 나온 마스크들을 하나로 합침 (N, 1, H, W)
+                        # 결과 합치기 (N, 1, H, W)
                         if all_masks:
                             masks = np.concatenate(all_masks, axis=0)
                         else:
