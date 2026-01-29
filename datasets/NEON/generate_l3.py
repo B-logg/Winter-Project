@@ -8,13 +8,17 @@ from rasterio.windows import Window
 import torch
 import requests
 from PIL import Image
+from dotenv import load_dotenv
 import google.generativeai as genai
 from segment_anything_hq import sam_model_registry, SamPredictor
 
 from prepare_l3 import neon_l2_bridge
 
-GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) # 현재 경로(상대)
+env_path = os.path.join(CURRENT_DIR, ".env")
+load_dotenv(env_path)
+GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
+
 INPUT_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
 OUTPUT_PATH = os.path.join(CURRENT_DIR, "l3_dataset")
 SAM_CHECKPOINT = os.path.join(CURRENT_DIR, "checkpoints", "sam_hq_vit_l.pth")
