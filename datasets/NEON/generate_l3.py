@@ -22,6 +22,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 NEON_PRODUCT_ID = "DP3.30010.001"
 
 TILE_SIZE = 1024
+SAM_BATCH_SIZE = 64
 
 # Gemini API 설정 및 SAM 설정
 def init_models():
@@ -214,16 +215,30 @@ def process_dataset(df, model, predictor):
                         
                         # 3. SAM 배치 추론 (한 번에 N개 마스크 생성)
                         predictor.set_image(img_tile)
-                        masks, _, _ = predictor.predict(
-                            point_coords=None,
-                            point_labels=None,
-                            box=boxes, # ★ N개의 박스 배치 입력
-                            multimask_output=False
-                        )
+
+                        all_masks = []
+
+                        for k in range(0, len(boxes), SAM_BATCH_SIZE):
+                            batch_boxes = boxes[k : k + SAM_BATCH_SIZE]
+                            
+                            batch_masks, _, _ = predictor.predict(
+                                point_coords=None,
+                                point_labels=None,
+                                box=batch_boxes, 
+                                multimask_output=False
+                            )
+                            all_masks.append(batch_masks)
                         
-                        # 마스크 통합 (Segmentation Map)
+                        # 쪼개서 나온 마스크들을 하나로 합침 (N, 1, H, W)
+                        if all_masks:
+                            masks = np.concatenate(all_masks, axis=0)
+                        else:
+                            masks = np.zeros((0, 1, TILE_SIZE, TILE_SIZE))
+                        
+                        # Segmentation Map 생성 (합치기)
                         combined_mask = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
                         for m in masks:
+                            # m shape: (1, H, W)
                             combined_mask = np.maximum(combined_mask, m[0].astype(np.uint8) * 255)
                         
                         mask_filename = f"mask_{tile_id_suffix}.png"
