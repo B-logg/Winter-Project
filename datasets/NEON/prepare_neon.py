@@ -32,7 +32,7 @@ output_path = "/Users/bosung/Desktop/GLaMM/datasets/NEON"
 output_csv = os.path.join(output_path, "NEON_dataset.csv")
 
 all_data = []
-sites = ['BART', 'GRSM']
+sites = ['BART', 'GRSM', 'HARV']
 
 for site in sites:
     site_path = os.path.join(base_path, site)
