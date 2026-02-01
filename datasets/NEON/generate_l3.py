@@ -32,7 +32,7 @@ NEON_PRODUCT_ID = "DP3.30010.001"
 
 TILE_SIZE = 1024
 MIN_TREE_THRESHOLD = 3 
-TEST_TILE_LIMIT = 5 
+TEST_TILE_LIMIT = 1000 # 처리하는 타일 개수 (데이터셋: 이미지-텍스트 1000개 만들기)
 SAM_BATCH_SIZE = 32 
 
 def init_models():
@@ -349,7 +349,7 @@ if __name__ == "__main__":
     print(f"Merged Data Shape: {df_merged.shape}")
     
     unique_tiles = df_merged['tile_id'].unique()
-    sample_tiles = unique_tiles[:20] 
+    sample_tiles = unique_tiles[:1000] 
     df_final = df_merged[df_merged['tile_id'].isin(sample_tiles)]
     
     process_dataset(df_final, gemini, sam)
