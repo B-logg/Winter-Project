@@ -15,7 +15,6 @@ from segment_anything_hq import sam_model_registry, SamPredictor
 
 from prepare_l3 import neon_l2_bridge
 
-# ================= 1. 환경 설정 =================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(CURRENT_DIR, ".env"))
 GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
@@ -34,11 +33,10 @@ NEON_PRODUCT_ID = "DP3.30010.001"
 TILE_SIZE = 1024
 MIN_TREE_THRESHOLD = 3 
 TEST_TILE_LIMIT = 5 
-SAM_BATCH_SIZE = 32  # ★ [핵심] 한 번에 처리할 나무 개수 제한 (메모리 보호)
+SAM_BATCH_SIZE = 32 
 
-# ================= 2. 모델 및 유틸리티 =================
 def init_models():
-    print(f"🚀 Initializing Models on {device}...")
+    print(f"Initializing Models on {device}...")
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-1.5-pro')
     
@@ -168,7 +166,6 @@ def filter_trees_in_tile(src, window, row_data):
         except: continue
     return np.array(filtered_boxes), filtered_stats
 
-# ================= 4. 메인 파이프라인 =================
 def process_dataset(df, model, predictor):
     os.makedirs(os.path.join(OUTPUT_PATH, "images"), exist_ok=True)
     os.makedirs(os.path.join(OUTPUT_PATH, "masks"), exist_ok=True)
@@ -178,7 +175,7 @@ def process_dataset(df, model, predictor):
     grouped = df.groupby('tile_id')
     total_processed_count = 0
     
-    print(f"📦 Target: Process {TEST_TILE_LIMIT} valid tiles (Batch Size: {SAM_BATCH_SIZE}).")
+    print(f"Target: Process {TEST_TILE_LIMIT} valid tiles (Batch Size: {SAM_BATCH_SIZE}).")
 
     for idx, (tile_id, group) in enumerate(grouped):
         if total_processed_count >= TEST_TILE_LIMIT: break
@@ -191,7 +188,7 @@ def process_dataset(df, model, predictor):
         tif_path = download_neon_image(site, year, tile_id, temp_dir)
         t_dl = time.time() - t_start
         if not tif_path: continue
-        print(f"  📥 [Time] Download: {t_dl:.2f}s | {tile_id}")
+        print(f"[Time] Download: {t_dl:.2f}s | {tile_id}")
 
         try:
             with rasterio.open(tif_path) as src:
@@ -210,7 +207,7 @@ def process_dataset(df, model, predictor):
                             valid_tiles.append((window, boxes, stats))
                 
                 t_tiling = time.time() - t_start
-                print(f"  🔍 [Time] Filtering: {t_tiling:.2f}s | Found {len(valid_tiles)} tiles")
+                print(f"[Time] Filtering: {t_tiling:.2f}s | Found {len(valid_tiles)} tiles")
 
                 if len(valid_tiles) == 0: continue
 
@@ -218,12 +215,12 @@ def process_dataset(df, model, predictor):
                 for window, boxes, stats in valid_tiles:
                     try:
                         if total_processed_count >= TEST_TILE_LIMIT:
-                            print("🛑 Target Reached.")
+                            print("Target Reached.")
                             return
 
                         if len(stats['heights']) == 0: continue
 
-                        print(f"    --- Processing Tile... [Progress: {total_processed_count + 1}/{TEST_TILE_LIMIT}] ---")
+                        print(f"Processing Tile... [Progress: {total_processed_count + 1}/{TEST_TILE_LIMIT}]")
 
                         # 3. Image Prep
                         t_start = time.time()
@@ -256,11 +253,9 @@ def process_dataset(df, model, predictor):
                         pil_gemini = Image.fromarray(img_gemini)
                         Image.fromarray(img_tile).save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=95)
                         t_prep = time.time() - t_start
-                        print(f"      🖼️ [Time] Image Prep: {t_prep:.2f}s")
+                        print(f"[Time] Image Prep: {t_prep:.2f}s")
 
-                        # ==========================================================
-                        # ★ [핵심] SAM Mini-Batch Processing (메모리 폭발 방지)
-                        # ==========================================================
+    
                         t_start = time.time()
                         predictor.set_image(img_tile) # 임베딩 1회
 
@@ -268,7 +263,6 @@ def process_dataset(df, model, predictor):
                         input_boxes_all = torch.tensor(boxes, device=device)
                         transformed_boxes_all = predictor.transform.apply_boxes_torch(input_boxes_all, img_tile.shape[:2])
                         
-                        # CPU 상의 빈 마스크 (여기에 조각들을 합침)
                         combined_mask_cpu = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
 
                         # 배치 단위로 끊어서 실행
@@ -293,12 +287,12 @@ def process_dataset(df, model, predictor):
                                 # 메모리 즉시 해제
                                 del masks_tensor
                                 del batch_merged
-                                torch.cuda.empty_cache() # ★ 중요
+                                torch.cuda.empty_cache() 
                         
                         mask_filename = f"mask_{tile_id_suffix}.png"
                         cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), combined_mask_cpu)
                         t_sam = time.time() - t_start
-                        print(f"      🎭 [Time] SAM (Mini-Batch): {t_sam:.2f}s ({len(boxes)} trees)")
+                        print(f"[Time] SAM (Mini-Batch): {t_sam:.2f}s ({len(boxes)} trees)")
 
                         # 5. Gemini
                         t_start = time.time()
@@ -307,9 +301,11 @@ def process_dataset(df, model, predictor):
                             clean_text = response.text.replace('```json', '').replace('```', '').strip()
                             if clean_text.startswith('{'): res_json = json.loads(clean_text)
                             else: res_json = {"dense_caption": clean_text}
-                        except: res_json = {"dense_caption": "Error"}
+                        except Exception as e: 
+                            res_json = {"dense_caption": f"Error: {e}"}
+
                         t_gemini = time.time() - t_start
-                        print(f"      🤖 [Time] Gemini: {t_gemini:.2f}s")
+                        print(f"[Time] Gemini: {t_gemini:.2f}s")
 
                         l3_entry = {
                             "id": tile_id_suffix,
@@ -325,19 +321,19 @@ def process_dataset(df, model, predictor):
                         total_processed_count += 1
                         
                     except Exception as e:
-                        print(f"⚠️ Skipping Tile due to error: {e}")
+                        print(f"Skipping Tile due to error: {e}")
                         torch.cuda.empty_cache() # 에러 시에도 메모리 정리
                         continue
                     finally:
                          tile_idx += 1
 
         except Exception as e:
-            print(f"❌ Image Error: {e}")
+            print(f"Image Error: {e}")
             continue
         finally:
             if os.path.exists(tif_path): os.remove(tif_path)
 
-    print("🎉 Test Finished!")
+    print("Test Finished!")
 
 if __name__ == "__main__":
     gemini, sam = init_models()
@@ -345,12 +341,12 @@ if __name__ == "__main__":
     if not os.path.exists(ORIGINAL_CSV_PATH) or not os.path.exists(CARBON_CSV_PATH):
         raise FileNotFoundError("CSV Missing")
     
-    print("🔄 Merging...")
+    print("Merging...")
     df_org = pd.read_csv(ORIGINAL_CSV_PATH)
     df_carbon = pd.read_csv(CARBON_CSV_PATH)
     
     df_merged = pd.merge(df_org, df_carbon, on='tile_id', how='inner')
-    print(f"✅ Merged Data Shape: {df_merged.shape}")
+    print(f"Merged Data Shape: {df_merged.shape}")
     
     unique_tiles = df_merged['tile_id'].unique()
     sample_tiles = unique_tiles[:20] 
