@@ -19,6 +19,9 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(CURRENT_DIR, ".env"))
 GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
 
+if not GEMINI_API_KEY:
+    raise ValueError("API Key Missing")
+
 ORIGINAL_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
 CARBON_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset_with_carbon.csv")
 
@@ -29,9 +32,10 @@ NEON_PRODUCT_ID = "DP3.30010.001"
 
 TILE_SIZE = 1024
 MIN_TREE_THRESHOLD = 3 
-TEST_TILE_LIMIT = 5 # 테스트 타일 수
+TEST_TILE_LIMIT = 5 # 목표: 유효한 타일 5개
 
 def init_models():
+    print(f"🚀 Initializing Models on {device}...")
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-2.5-pro')
     
@@ -104,7 +108,19 @@ def save_single_entry(entry):
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 def filter_trees_in_tile(src, window, row_data):
+    # ★ [중요] stats 딕셔너리 초기화 (KeyError 방지)
+    filtered_stats = {
+        'heights': [], 
+        'areas': [], 
+        'dbhs': [], 
+        'carbon_annual': [], 
+        'carbon_stored': []
+    }
+    filtered_boxes = []
+
     def safe_parse(key):
+        if key not in row_data:
+            return []
         val = row_data[key]
         return eval(val) if isinstance(val, str) else val
 
@@ -115,18 +131,13 @@ def filter_trees_in_tile(src, window, row_data):
     carbon_annual = safe_parse('individual_carbon_annual')
     carbon_stored = safe_parse('individual_carbon_stored')
 
+    # 데이터가 없으면 빈 값 반환
+    if len(bboxes) == 0:
+        return np.array([]), filtered_stats
+
     win_col_off, win_row_off = window.col_off, window.row_off
     win_w, win_h = window.width, window.height
     
-    filtered_boxes = []
-    filtered_stats = {
-        'heights': [], 
-        'areas': [], 
-        'dbhs': [], 
-        'carbon_annual': [], 
-        'carbon_stored': []
-    }
-
     for i, utm_box in enumerate(bboxes):
         try:
             row_tl, col_tl = src.index(utm_box[0], utm_box[3])
@@ -158,28 +169,31 @@ def process_dataset(df, model, predictor):
     os.makedirs(temp_dir, exist_ok=True)
     
     grouped = df.groupby('tile_id')
-    total_processed_count = 0 # 처리된 타일 수 카운트
-    print(f"Processing {len(grouped)} images (Batch SAM Mode)...")
+    total_processed_count = 0
+    
+    print(f"Target: Process {TEST_TILE_LIMIT} valid tiles.")
 
     for idx, (tile_id, group) in enumerate(grouped):
-        if total_processed_count >= TEST_TILE_LIMIT: break
-        
+        # 목표 개수를 채웠으면 전체 루프 종료
+        if total_processed_count >= TEST_TILE_LIMIT:
+            break
+
         row = group.iloc[0]
         site, year = row['site'], row['year']
         
-        # [Timer 1] 다운로드
-        t_start = time.time() # 주석 처리
+        # [Timer] Download
+        t_start = time.time()
         tif_path = download_neon_image(site, year, tile_id, temp_dir)
-        t_dl = time.time() - t_start # 주석 처리
+        t_dl = time.time() - t_start
         if not tif_path: continue
-        print(f"[Time] Download: {t_dl:.2f}s | {tile_id}") # 주석 처리
+        print(f"  📥 [Time] Download: {t_dl:.2f}s | {tile_id}")
 
         try:
             with rasterio.open(tif_path) as src:
                 h_img, w_img = src.shape
                 
-                # [Timer 2] 타일링 및 필터링
-                t_start = time.time() # 주석 처리
+                # [Timer] Filtering
+                t_start = time.time()
                 valid_tiles = []
                 for row_off in range(0, h_img, TILE_SIZE):
                     for col_off in range(0, w_img, TILE_SIZE):
@@ -187,24 +201,33 @@ def process_dataset(df, model, predictor):
                         height = min(TILE_SIZE, h_img - row_off)
                         window = Window(col_off, row_off, width, height)
                         boxes, stats = filter_trees_in_tile(src, window, row)
+                        
+                        # 나무가 없으면 여기서 걸러짐 -> valid_tiles에 추가 안 됨
                         if len(boxes) >= MIN_TREE_THRESHOLD:
                             valid_tiles.append((window, boxes, stats))
                 
-                t_tiling = time.time() - t_start # 주석 처리
-                print(f"[Time] Filtering: {t_tiling:.2f}s") # 주석 처리
-                print(f"[{idx+1}/{len(grouped)}] {tile_id}: {len(valid_tiles)} tiles.")
+                t_tiling = time.time() - t_start
+                print(f"[Time] Filtering: {t_tiling:.2f}s | Found {len(valid_tiles)} valid tiles")
 
+                # 유효한 타일이 없으면 다음 이미지로 넘어감 (카운트 증가 안 함)
                 if len(valid_tiles) == 0:
                     continue
-                
+
                 tile_idx = 0
                 for window, boxes, stats in valid_tiles:
-                    if total_processed_count >= TEST_TILE_LIMIT: 
-                        print("Test Limit Reached. Stopping...") 
+                    # 루프 도중 목표 달성 시 즉시 종료
+                    if total_processed_count >= TEST_TILE_LIMIT:
+                        print("Target Reached. Stopping...")
                         return
-                    
-                    # [Timer 3] 이미지 로드 및 전처리
-                    t_start = time.time() # 주석 처리
+
+                    # 데이터 안전 체크
+                    if len(stats['heights']) == 0:
+                        continue
+
+                    print(f"Processing Tile... [Progress: {total_processed_count + 1}/{TEST_TILE_LIMIT}]")
+
+                    # [Timer] Image Prep
+                    t_start = time.time()
                     img_tile_raw = src.read([1, 2, 3], window=window)
                     img_tile_raw = np.moveaxis(img_tile_raw, 0, -1)
                     img_tile = normalize_image(img_tile_raw)
@@ -230,54 +253,37 @@ def process_dataset(df, model, predictor):
                     img_gemini = draw_bboxes_on_image(img_tile, boxes)
                     pil_gemini = Image.fromarray(img_gemini)
                     Image.fromarray(img_tile).save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=95)
-                    t_prep = time.time() - t_start # 주석 처리
-                    print(f"[Time] Image Prep: {t_prep:.2f}s") # 주석 처리
+                    t_prep = time.time() - t_start
+                    print(f"[Time] Image Prep: {t_prep:.2f}s")
 
-                    # SAM Batch 추론
-                    # [Timer 4] SAM Batch 추론
-                    t_start = time.time() # 주석 처리
-                    predictor.set_image(img_tile) # 이미지 임베딩
-                    
-                    # 1. 박스 좌표를 텐서로 변환
-                    input_boxes = torch.tensor(boxes, device=device) # (N, 4)
-                    
-                    # 2. SAM에 맞는 좌표계로 변환
+                    # [Timer] SAM Batch
+                    t_start = time.time()
+                    predictor.set_image(img_tile)
+                    input_boxes = torch.tensor(boxes, device=device)
                     transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, img_tile.shape[:2])
                     
-                    # 3. 한 번에 모든 박스 추론 (predict_torch 사용)
-                    # output masks shape: (N, 1, H, W) -> N개의 나무 마스크가 한 번에 나옴
                     masks_tensor, _, _ = predictor.predict_torch(
-                        point_coords=None,
-                        point_labels=None,
-                        boxes=transformed_boxes,
-                        multimask_output=False
+                        point_coords=None, point_labels=None,
+                        boxes=transformed_boxes, multimask_output=False
                     )
-                    
-                    # 4. GPU 상에서 마스크 병합 (Union)
-                    # torch.max(dim=0)을 쓰면 N개 중 하나라도 1이면 1이 됨 -> 겹쳐짐
-                    # merged_mask shape: (1, H, W)
                     merged_mask_tensor = torch.max(masks_tensor, dim=0)[0] 
-                    
-                    # 5. CPU로 가져와서 저장
                     final_mask = (merged_mask_tensor[0].cpu().numpy() > 0).astype(np.uint8) * 255
                     
                     mask_filename = f"mask_{tile_id_suffix}.png"
                     cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), final_mask)
-                    t_sam = time.time() - t_start # 주석 처리
-                    print(f"[Time] SAM (Batch): {t_sam:.2f}s ({len(boxes)} trees)") # 주석 처리
+                    t_sam = time.time() - t_start
+                    print(f"[Time] SAM (Batch): {t_sam:.2f}s ({len(boxes)} trees)")
 
-
-                    # [Timer 5] Gemini 추론
-                    t_start = time.time() # 주석 처리
+                    # [Timer] Gemini
+                    t_start = time.time()
                     try:
                         response = model.generate_content([l3_data['prompt'], pil_gemini])
                         clean_text = response.text.replace('```json', '').replace('```', '').strip()
                         if clean_text.startswith('{'): res_json = json.loads(clean_text)
                         else: res_json = {"dense_caption": clean_text}
                     except: res_json = {"dense_caption": "Error"}
-
-                    t_gemini = time.time() - t_start # 주석 처리
-                    print(f"[Time] Gemini: {t_gemini:.2f}s") # 주석 처리
+                    t_gemini = time.time() - t_start
+                    print(f"[Time] Gemini: {t_gemini:.2f}s")
 
                     l3_entry = {
                         "id": tile_id_suffix,
@@ -290,16 +296,16 @@ def process_dataset(df, model, predictor):
                         "stats": stats_summary 
                     }
                     save_single_entry(l3_entry)
-                    print(f"Saved: {tile_id_suffix} (Trees: {len(boxes)})")
-                    tile_idx += 1
+                    
+                    # 여기서 카운트 증가
                     total_processed_count += 1
+                    tile_idx += 1
 
         except Exception as e:
             print(f"Error: {e}")
         finally:
             if os.path.exists(tif_path): os.remove(tif_path)
 
-    print("All Done!")
 
 if __name__ == "__main__":
     gemini, sam = init_models()
@@ -307,13 +313,18 @@ if __name__ == "__main__":
     if not os.path.exists(ORIGINAL_CSV_PATH) or not os.path.exists(CARBON_CSV_PATH):
         raise FileNotFoundError("CSV Missing")
     
-    print("Merging...")
+    print("Merging")
     df_org = pd.read_csv(ORIGINAL_CSV_PATH)
     df_carbon = pd.read_csv(CARBON_CSV_PATH)
+    
     df_merged = pd.merge(df_org, df_carbon, on='tile_id', how='inner')
+    print(f"Merged Data Shape: {df_merged.shape}")
     
     unique_tiles = df_merged['tile_id'].unique()
-    sample_tiles = unique_tiles[:3] # 상위 3개 이미지만 로드
+    
+    # 샘플링 개수: 20개
+    sample_tiles = unique_tiles[:20] 
     df_final = df_merged[df_merged['tile_id'].isin(sample_tiles)]
     
     process_dataset(df_final, gemini, sam)
+    print("Done!")
