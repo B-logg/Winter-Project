@@ -193,11 +193,13 @@ def generate_l4_dataset():
     
     df_merged = pd.merge(df_org, df_carbon, on='tile_id', how='inner')
     
-    # [테스트 설정] 딱 10개만 슬라이싱
-    df_test = df_merged.iloc[:10]
+    # [테스트 설정] 딱 10개만 슬라이싱 / [실제 설정] 딱 1000개 슬라이싱
+    df_test = df_merged.iloc[:1000]
     
     l4_results = []
     print(f"Generating Expert Reports for {len(df_test)} tiles...")
+
+    save_interval = 50
     
     for idx, row in tqdm(df_test.iterrows(), total=len(df_test)):
         tile_id = row['tile_id']
@@ -224,7 +226,7 @@ def generate_l4_dataset():
                 "conversations": [
                     {
                         "from": "human", 
-                        "value": "제공된 산림 통계 데이터를 바탕으로 수종별 생육 특성과 탄소 흡수 효율을 상세 비교하는 보고서를 작성해줘."
+                        "value": "제공된 산림 통계 데이터를 바탕으로 수종별(침엽수 vs 활엽수) 생육 특성과 탄소 흡수 효율을 상세 비교하는 보고서를 작성해줘."
                     },
                     {
                         "from": "gpt", 
@@ -233,7 +235,12 @@ def generate_l4_dataset():
                 ]
             }
             l4_results.append(l4_entry)
-            time.sleep(1.5)
+
+            if (len(l4_results)) % save_interval == 0:
+                with open(OUTPUT_L4_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(l4_results, f, indent=4, ensure_ascii=False)
+
+            time.sleep(1.2) # API 쿨타임
             
         except Exception as e:
             print(f"Error processing {tile_id}: {e}")
@@ -242,7 +249,7 @@ def generate_l4_dataset():
     with open(OUTPUT_L4_PATH, 'w', encoding='utf-8') as f:
         json.dump(l4_results, f, indent=4, ensure_ascii=False)
         
-    print(f"Expert L4 Dataset (10 Samples) Created! Saved to {OUTPUT_L4_PATH}")
+    print(f"Expert L4 Dataset ({len(l4_results)} samples) Created! Saved to {OUTPUT_L4_PATH}")
 
 if __name__ == "__main__":
     generate_l4_dataset()
