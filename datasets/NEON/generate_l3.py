@@ -19,9 +19,6 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(CURRENT_DIR, ".env"))
 GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
 
-if not GEMINI_API_KEY:
-    raise ValueError("API Key Missing")
-
 ORIGINAL_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
 CARBON_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset_with_carbon.csv")
 
@@ -122,8 +119,14 @@ def filter_trees_in_tile(src, window, row_data):
     win_w, win_h = window.width, window.height
     
     filtered_boxes = []
-    filtered_stats = {'heights': [], 'areas': [], 'dbhs': [], 'carbon_annual': [], 'carbon_stored': []}
-    
+    filtered_stats = {
+        'heights': [], 
+        'areas': [], 
+        'dbhs': [], 
+        'carbon_annual': [], 
+        'carbon_stored': []
+    }
+
     for i, utm_box in enumerate(bboxes):
         try:
             row_tl, col_tl = src.index(utm_box[0], utm_box[3])
@@ -159,6 +162,8 @@ def process_dataset(df, model, predictor):
     print(f"Processing {len(grouped)} images (Batch SAM Mode)...")
 
     for idx, (tile_id, group) in enumerate(grouped):
+        if total_processed_count >= TEST_TILE_LIMIT: break
+        
         row = group.iloc[0]
         site, year = row['site'], row['year']
         
@@ -189,6 +194,9 @@ def process_dataset(df, model, predictor):
                 print(f"[Time] Filtering: {t_tiling:.2f}s") # 주석 처리
                 print(f"[{idx+1}/{len(grouped)}] {tile_id}: {len(valid_tiles)} tiles.")
 
+                if len(valid_tiles) == 0:
+                    continue
+                
                 tile_idx = 0
                 for window, boxes, stats in valid_tiles:
                     if total_processed_count >= TEST_TILE_LIMIT: 
