@@ -6,6 +6,7 @@ datasets/checkpoints/
 
 AI_Hub
 NEON_dataset.csv
+NEON_dataset_with_carbon.csv
 # 결과물 이미지 및 테스트용 이미지
 *.png
 *.jpg
