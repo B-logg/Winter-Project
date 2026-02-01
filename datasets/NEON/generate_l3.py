@@ -38,7 +38,7 @@ SAM_BATCH_SIZE = 32
 def init_models():
     print(f"Initializing Models on {device}...")
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-pro')
+    gemini_model = genai.GenerativeModel('gemini-2.5-pro')
     
     sam = sam_model_registry["vit_l"](checkpoint=SAM_CHECKPOINT)
     sam.to(device=device)
