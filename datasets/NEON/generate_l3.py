@@ -349,7 +349,7 @@ if __name__ == "__main__":
     print(f"Merged Data Shape: {df_merged.shape}")
     
     unique_tiles = df_merged['tile_id'].unique()
-    sample_tiles = unique_tiles[:1000] 
+    sample_tiles = unique_tiles[:100] 
     df_final = df_merged[df_merged['tile_id'].isin(sample_tiles)]
     
     process_dataset(df_final, gemini, sam)
