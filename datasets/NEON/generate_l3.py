@@ -23,7 +23,7 @@ if not GEMINI_API_KEY:
     raise ValueError("API Key Missing")
 
 ORIGINAL_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
-CARBON_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_carbon_data.csv")
+CARBON_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset_with_carbon.csv")
 
 OUTPUT_PATH = os.path.join(CURRENT_DIR, "l3_dataset")
 SAM_CHECKPOINT = os.path.join(CURRENT_DIR, "checkpoints", "sam_hq_vit_l.pth")
