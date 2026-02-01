@@ -15,6 +15,7 @@ from segment_anything_hq import sam_model_registry, SamPredictor
 
 from prepare_l3 import neon_l2_bridge
 
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(CURRENT_DIR, ".env"))
 GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
@@ -32,10 +33,11 @@ NEON_PRODUCT_ID = "DP3.30010.001"
 
 TILE_SIZE = 1024
 MIN_TREE_THRESHOLD = 3 
-TEST_TILE_LIMIT = 5 # 목표: 유효한 타일 5개
+TEST_TILE_LIMIT = 5 
+
 
 def init_models():
-    print(f"🚀 Initializing Models on {device}...")
+    print(f"Initializing Models on {device}...")
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-2.5-pro')
     
@@ -108,21 +110,19 @@ def save_single_entry(entry):
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 def filter_trees_in_tile(src, window, row_data):
-    # ★ [중요] stats 딕셔너리 초기화 (KeyError 방지)
     filtered_stats = {
-        'heights': [], 
-        'areas': [], 
-        'dbhs': [], 
-        'carbon_annual': [], 
-        'carbon_stored': []
+        'heights': [], 'areas': [], 'dbhs': [], 
+        'carbon_annual': [], 'carbon_stored': []
     }
     filtered_boxes = []
 
     def safe_parse(key):
-        if key not in row_data:
-            return []
+        if key not in row_data: return []
         val = row_data[key]
-        return eval(val) if isinstance(val, str) else val
+        try:
+            return eval(val) if isinstance(val, str) else val
+        except:
+            return []
 
     bboxes = safe_parse('bboxes')
     heights = safe_parse('individual_heights')
@@ -131,7 +131,6 @@ def filter_trees_in_tile(src, window, row_data):
     carbon_annual = safe_parse('individual_carbon_annual')
     carbon_stored = safe_parse('individual_carbon_stored')
 
-    # 데이터가 없으면 빈 값 반환
     if len(bboxes) == 0:
         return np.array([]), filtered_stats
 
@@ -162,6 +161,7 @@ def filter_trees_in_tile(src, window, row_data):
         except: continue
     return np.array(filtered_boxes), filtered_stats
 
+
 def process_dataset(df, model, predictor):
     os.makedirs(os.path.join(OUTPUT_PATH, "images"), exist_ok=True)
     os.makedirs(os.path.join(OUTPUT_PATH, "masks"), exist_ok=True)
@@ -171,28 +171,26 @@ def process_dataset(df, model, predictor):
     grouped = df.groupby('tile_id')
     total_processed_count = 0
     
-    print(f"Target: Process {TEST_TILE_LIMIT} valid tiles.")
+    print(f"Processing Limit: {TEST_TILE_LIMIT} tiles.")
 
     for idx, (tile_id, group) in enumerate(grouped):
-        # 목표 개수를 채웠으면 전체 루프 종료
-        if total_processed_count >= TEST_TILE_LIMIT:
-            break
+        if total_processed_count >= TEST_TILE_LIMIT: break
 
         row = group.iloc[0]
         site, year = row['site'], row['year']
         
-        # [Timer] Download
-        t_start = time.time()
-        tif_path = download_neon_image(site, year, tile_id, temp_dir)
-        t_dl = time.time() - t_start
-        if not tif_path: continue
-        print(f"  📥 [Time] Download: {t_dl:.2f}s | {tile_id}")
-
+        # 1. 이미지 다운로드
         try:
+            t_start = time.time()
+            tif_path = download_neon_image(site, year, tile_id, temp_dir)
+            t_dl = time.time() - t_start
+            if not tif_path: continue
+            print(f"[Time] Download: {t_dl:.2f}s | {tile_id}")
+            
             with rasterio.open(tif_path) as src:
                 h_img, w_img = src.shape
                 
-                # [Timer] Filtering
+                # 2. 타일링 및 필터링
                 t_start = time.time()
                 valid_tiles = []
                 for row_off in range(0, h_img, TILE_SIZE):
@@ -202,107 +200,111 @@ def process_dataset(df, model, predictor):
                         window = Window(col_off, row_off, width, height)
                         boxes, stats = filter_trees_in_tile(src, window, row)
                         
-                        # 나무가 없으면 여기서 걸러짐 -> valid_tiles에 추가 안 됨
                         if len(boxes) >= MIN_TREE_THRESHOLD:
                             valid_tiles.append((window, boxes, stats))
                 
                 t_tiling = time.time() - t_start
-                print(f"[Time] Filtering: {t_tiling:.2f}s | Found {len(valid_tiles)} valid tiles")
+                print(f"  🔍 [Time] Filtering: {t_tiling:.2f}s | Found {len(valid_tiles)} valid tiles")
 
-                # 유효한 타일이 없으면 다음 이미지로 넘어감 (카운트 증가 안 함)
                 if len(valid_tiles) == 0:
-                    continue
+                    continue 
 
                 tile_idx = 0
                 for window, boxes, stats in valid_tiles:
-                    # 루프 도중 목표 달성 시 즉시 종료
-                    if total_processed_count >= TEST_TILE_LIMIT:
-                        print("Target Reached. Stopping...")
-                        return
-
-                    # 데이터 안전 체크
-                    if len(stats['heights']) == 0:
-                        continue
-
-                    print(f"Processing Tile... [Progress: {total_processed_count + 1}/{TEST_TILE_LIMIT}]")
-
-                    # [Timer] Image Prep
-                    t_start = time.time()
-                    img_tile_raw = src.read([1, 2, 3], window=window)
-                    img_tile_raw = np.moveaxis(img_tile_raw, 0, -1)
-                    img_tile = normalize_image(img_tile_raw)
-                    
-                    if img_tile.shape[0] != TILE_SIZE or img_tile.shape[1] != TILE_SIZE:
-                        pad_h, pad_w = TILE_SIZE - img_tile.shape[0], TILE_SIZE - img_tile.shape[1]
-                        img_tile = np.pad(img_tile, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
-
-                    tile_id_suffix = f"{tile_id}_tile{tile_idx}"
-                    tile_filename = f"{tile_id_suffix}.jpg"
-                    
-                    stats_summary = {
-                        'tree_count': len(boxes),
-                        'avg_height': np.mean(stats['heights']),
-                        'avg_area': np.mean(stats['areas']),
-                        'avg_diameter': np.mean(stats['dbhs']),
-                        'sum_carbon_annual': np.sum(stats['carbon_annual']),
-                        'sum_carbon_stored': np.sum(stats['carbon_stored'])
-                    }
-                    l3_data = neon_l2_bridge(stats_summary, tile_id_suffix=tile_id_suffix)
-                    if not l3_data: continue
-
-                    img_gemini = draw_bboxes_on_image(img_tile, boxes)
-                    pil_gemini = Image.fromarray(img_gemini)
-                    Image.fromarray(img_tile).save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=95)
-                    t_prep = time.time() - t_start
-                    print(f"[Time] Image Prep: {t_prep:.2f}s")
-
-                    # [Timer] SAM Batch
-                    t_start = time.time()
-                    predictor.set_image(img_tile)
-                    input_boxes = torch.tensor(boxes, device=device)
-                    transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, img_tile.shape[:2])
-                    
-                    masks_tensor, _, _ = predictor.predict_torch(
-                        point_coords=None, point_labels=None,
-                        boxes=transformed_boxes, multimask_output=False
-                    )
-                    merged_mask_tensor = torch.max(masks_tensor, dim=0)[0] 
-                    final_mask = (merged_mask_tensor[0].cpu().numpy() > 0).astype(np.uint8) * 255
-                    
-                    mask_filename = f"mask_{tile_id_suffix}.png"
-                    cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), final_mask)
-                    t_sam = time.time() - t_start
-                    print(f"[Time] SAM (Batch): {t_sam:.2f}s ({len(boxes)} trees)")
-
-                    # [Timer] Gemini
-                    t_start = time.time()
                     try:
-                        response = model.generate_content([l3_data['prompt'], pil_gemini])
-                        clean_text = response.text.replace('```json', '').replace('```', '').strip()
-                        if clean_text.startswith('{'): res_json = json.loads(clean_text)
-                        else: res_json = {"dense_caption": clean_text}
-                    except: res_json = {"dense_caption": "Error"}
-                    t_gemini = time.time() - t_start
-                    print(f"[Time] Gemini: {t_gemini:.2f}s")
+                        if total_processed_count >= TEST_TILE_LIMIT:
+                            print("🛑 Target Reached.")
+                            return
 
-                    l3_entry = {
-                        "id": tile_id_suffix,
-                        "image": tile_filename,
-                        "conversations": [
-                            {"from": "human", "value": l3_data['human_query']},
-                            {"from": "gpt", "value": res_json.get('dense_caption', "")}
-                        ],
-                        "mask_path": f"masks/{mask_filename}",
-                        "stats": stats_summary 
-                    }
-                    save_single_entry(l3_entry)
+                        # 데이터 무결성 체크
+                        if 'heights' not in stats or len(stats['heights']) == 0:
+                            raise ValueError(f"Empty stats for tile {tile_idx}")
+
+                        print(f"Processing Tile... [Progress: {total_processed_count + 1}/{TEST_TILE_LIMIT}]")
+
+                        # [Timer] Image Prep
+                        t_start = time.time()
+                        img_tile_raw = src.read([1, 2, 3], window=window)
+                        img_tile_raw = np.moveaxis(img_tile_raw, 0, -1)
+                        img_tile = normalize_image(img_tile_raw)
+                        
+                        if img_tile.shape[0] != TILE_SIZE or img_tile.shape[1] != TILE_SIZE:
+                            pad_h, pad_w = TILE_SIZE - img_tile.shape[0], TILE_SIZE - img_tile.shape[1]
+                            img_tile = np.pad(img_tile, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
+
+                        tile_id_suffix = f"{tile_id}_tile{tile_idx}"
+                        tile_filename = f"{tile_id_suffix}.jpg"
+                        
+                        stats_summary = {
+                            'tree_count': len(boxes),
+                            'avg_height': np.mean(stats['heights']),
+                            'avg_area': np.mean(stats['areas']),
+                            'avg_diameter': np.mean(stats['dbhs']),
+                            'sum_carbon_annual': np.sum(stats['carbon_annual']),
+                            'sum_carbon_stored': np.sum(stats['carbon_stored'])
+                        }
+                        l3_data = neon_l2_bridge(stats_summary, tile_id_suffix=tile_id_suffix)
+                        if not l3_data: continue
+
+                        img_gemini = draw_bboxes_on_image(img_tile, boxes)
+                        pil_gemini = Image.fromarray(img_gemini)
+                        Image.fromarray(img_tile).save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=95)
+                        t_prep = time.time() - t_start
+                        print(f"      🖼️ [Time] Image Prep: {t_prep:.2f}s")
+
+                        # [Timer] SAM Batch
+                        t_start = time.time()
+                        predictor.set_image(img_tile)
+                        input_boxes = torch.tensor(boxes, device=device)
+                        transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, img_tile.shape[:2])
+                        
+                        masks_tensor, _, _ = predictor.predict_torch(
+                            point_coords=None, point_labels=None,
+                            boxes=transformed_boxes, multimask_output=False
+                        )
+                        merged_mask_tensor = torch.max(masks_tensor, dim=0)[0] 
+                        final_mask = (merged_mask_tensor[0].cpu().numpy() > 0).astype(np.uint8) * 255
+                        
+                        mask_filename = f"mask_{tile_id_suffix}.png"
+                        cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), final_mask)
+                        t_sam = time.time() - t_start
+                        print(f"      🎭 [Time] SAM (Batch): {t_sam:.2f}s ({len(boxes)} trees)")
+
+                        # [Timer] Gemini
+                        t_start = time.time()
+                        try:
+                            response = model.generate_content([l3_data['prompt'], pil_gemini])
+                            clean_text = response.text.replace('```json', '').replace('```', '').strip()
+                            if clean_text.startswith('{'): res_json = json.loads(clean_text)
+                            else: res_json = {"dense_caption": clean_text}
+                        except: res_json = {"dense_caption": "Error"}
+                        t_gemini = time.time() - t_start
+                        print(f"      🤖 [Time] Gemini: {t_gemini:.2f}s")
+
+                        l3_entry = {
+                            "id": tile_id_suffix,
+                            "image": tile_filename,
+                            "conversations": [
+                                {"from": "human", "value": l3_data['human_query']},
+                                {"from": "gpt", "value": res_json.get('dense_caption', "")}
+                            ],
+                            "mask_path": f"masks/{mask_filename}",
+                            "stats": stats_summary 
+                        }
+                        save_single_entry(l3_entry)
+                        
+                        total_processed_count += 1
+                        
+                    except Exception as e:
+                        print(f"Skipping Tile {tile_idx} due to error: {e}")
+                        continue
                     
-                    # 여기서 카운트 증가
-                    total_processed_count += 1
-                    tile_idx += 1
+                    finally:
+                         tile_idx += 1
 
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Image Error: {e}")
+            continue 
         finally:
             if os.path.exists(tif_path): os.remove(tif_path)
 
@@ -322,9 +324,8 @@ if __name__ == "__main__":
     
     unique_tiles = df_merged['tile_id'].unique()
     
-    # 샘플링 개수: 20개
-    sample_tiles = unique_tiles[:20] 
+
+    sample_tiles = unique_tiles[:10] 
     df_final = df_merged[df_merged['tile_id'].isin(sample_tiles)]
     
     process_dataset(df_final, gemini, sam)
-    print("Done!")
