@@ -35,11 +35,11 @@ TILE_SIZE = 1024
 MIN_TREE_THRESHOLD = 3 
 TEST_TILE_LIMIT = 5 
 
-
+# ================= 2. 모델 및 유틸리티 =================
 def init_models():
     print(f"Initializing Models on {device}...")
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.5-pro')
+    gemini_model = genai.GenerativeModel('gemini-1.5-pro')
     
     sam = sam_model_registry["vit_l"](checkpoint=SAM_CHECKPOINT)
     sam.to(device=device)
@@ -49,7 +49,12 @@ def init_models():
 def download_neon_image(site, year, tile_id, save_dir):
     filename = f"{tile_id}.tif"
     save_path = os.path.join(save_dir, filename)
-    if os.path.exists(save_path): return save_path
+    
+    if os.path.exists(save_path):
+        if os.path.getsize(save_path) < 1024 * 1024:
+            os.remove(save_path)
+        else:
+            return save_path
     
     try:
         parts = tile_id.split('_')
@@ -80,8 +85,15 @@ def download_neon_image(site, year, tile_id, save_dir):
             r.raise_for_status()
             with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
+        
+        # 다운로드 후 검증
+        if os.path.getsize(save_path) < 1000:
+            os.remove(save_path)
+            return None
         return save_path
-    except: return None
+    except: 
+        if os.path.exists(save_path): os.remove(save_path)
+        return None
 
 def normalize_image(img_array):
     img_min, img_max = img_array.min(), img_array.max()
@@ -119,10 +131,8 @@ def filter_trees_in_tile(src, window, row_data):
     def safe_parse(key):
         if key not in row_data: return []
         val = row_data[key]
-        try:
-            return eval(val) if isinstance(val, str) else val
-        except:
-            return []
+        try: return eval(val) if isinstance(val, str) else val
+        except: return []
 
     bboxes = safe_parse('bboxes')
     heights = safe_parse('individual_heights')
@@ -171,7 +181,6 @@ def process_dataset(df, model, predictor):
     grouped = df.groupby('tile_id')
     total_processed_count = 0
     
-    print(f"Processing Limit: {TEST_TILE_LIMIT} tiles.")
 
     for idx, (tile_id, group) in enumerate(grouped):
         if total_processed_count >= TEST_TILE_LIMIT: break
@@ -179,18 +188,18 @@ def process_dataset(df, model, predictor):
         row = group.iloc[0]
         site, year = row['site'], row['year']
         
-        # 1. 이미지 다운로드
+        # 1. 다운로드
+        t_start = time.time()
+        tif_path = download_neon_image(site, year, tile_id, temp_dir)
+        t_dl = time.time() - t_start
+        if not tif_path: continue
+        print(f"[Time] Download: {t_dl:.2f}s | {tile_id}")
+
         try:
-            t_start = time.time()
-            tif_path = download_neon_image(site, year, tile_id, temp_dir)
-            t_dl = time.time() - t_start
-            if not tif_path: continue
-            print(f"[Time] Download: {t_dl:.2f}s | {tile_id}")
-            
             with rasterio.open(tif_path) as src:
                 h_img, w_img = src.shape
                 
-                # 2. 타일링 및 필터링
+                # 2. 필터링
                 t_start = time.time()
                 valid_tiles = []
                 for row_off in range(0, h_img, TILE_SIZE):
@@ -204,25 +213,22 @@ def process_dataset(df, model, predictor):
                             valid_tiles.append((window, boxes, stats))
                 
                 t_tiling = time.time() - t_start
-                print(f"  🔍 [Time] Filtering: {t_tiling:.2f}s | Found {len(valid_tiles)} valid tiles")
+                print(f"[Time] Filtering: {t_tiling:.2f}s | Found {len(valid_tiles)} valid tiles")
 
-                if len(valid_tiles) == 0:
-                    continue 
+                if len(valid_tiles) == 0: continue
 
                 tile_idx = 0
                 for window, boxes, stats in valid_tiles:
                     try:
                         if total_processed_count >= TEST_TILE_LIMIT:
-                            print("🛑 Target Reached.")
+                            print("Target Reached.")
                             return
 
-                        # 데이터 무결성 체크
-                        if 'heights' not in stats or len(stats['heights']) == 0:
-                            raise ValueError(f"Empty stats for tile {tile_idx}")
+                        if len(stats['heights']) == 0: continue
 
                         print(f"Processing Tile... [Progress: {total_processed_count + 1}/{TEST_TILE_LIMIT}]")
 
-                        # [Timer] Image Prep
+                        # 3. 이미지 준비
                         t_start = time.time()
                         img_tile_raw = src.read([1, 2, 3], window=window)
                         img_tile_raw = np.moveaxis(img_tile_raw, 0, -1)
@@ -235,14 +241,19 @@ def process_dataset(df, model, predictor):
                         tile_id_suffix = f"{tile_id}_tile{tile_idx}"
                         tile_filename = f"{tile_id_suffix}.jpg"
                         
+                    
                         stats_summary = {
                             'tree_count': len(boxes),
                             'avg_height': np.mean(stats['heights']),
                             'avg_area': np.mean(stats['areas']),
                             'avg_diameter': np.mean(stats['dbhs']),
                             'sum_carbon_annual': np.sum(stats['carbon_annual']),
-                            'sum_carbon_stored': np.sum(stats['carbon_stored'])
+                            'sum_carbon_stored': np.sum(stats['carbon_stored']),
+                            'heights': stats['heights'],
+                            'areas': stats['areas'],
+                            'dbhs': stats['dbhs']
                         }
+                        
                         l3_data = neon_l2_bridge(stats_summary, tile_id_suffix=tile_id_suffix)
                         if not l3_data: continue
 
@@ -250,9 +261,9 @@ def process_dataset(df, model, predictor):
                         pil_gemini = Image.fromarray(img_gemini)
                         Image.fromarray(img_tile).save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=95)
                         t_prep = time.time() - t_start
-                        print(f"      🖼️ [Time] Image Prep: {t_prep:.2f}s")
+                        print(f"[Time] Image Prep: {t_prep:.2f}s")
 
-                        # [Timer] SAM Batch
+                        # 4. SAM Batch
                         t_start = time.time()
                         predictor.set_image(img_tile)
                         input_boxes = torch.tensor(boxes, device=device)
@@ -268,9 +279,9 @@ def process_dataset(df, model, predictor):
                         mask_filename = f"mask_{tile_id_suffix}.png"
                         cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), final_mask)
                         t_sam = time.time() - t_start
-                        print(f"      🎭 [Time] SAM (Batch): {t_sam:.2f}s ({len(boxes)} trees)")
+                        print(f"[Time] SAM (Batch): {t_sam:.2f}s ({len(boxes)} trees)")
 
-                        # [Timer] Gemini
+                        # 5. Gemini
                         t_start = time.time()
                         try:
                             response = model.generate_content([l3_data['prompt'], pil_gemini])
@@ -279,7 +290,7 @@ def process_dataset(df, model, predictor):
                             else: res_json = {"dense_caption": clean_text}
                         except: res_json = {"dense_caption": "Error"}
                         t_gemini = time.time() - t_start
-                        print(f"      🤖 [Time] Gemini: {t_gemini:.2f}s")
+                        print(f"[Time] Gemini: {t_gemini:.2f}s")
 
                         l3_entry = {
                             "id": tile_id_suffix,
@@ -298,16 +309,16 @@ def process_dataset(df, model, predictor):
                     except Exception as e:
                         print(f"Skipping Tile {tile_idx} due to error: {e}")
                         continue
-                    
                     finally:
                          tile_idx += 1
 
         except Exception as e:
             print(f"Image Error: {e}")
-            continue 
+            continue
         finally:
             if os.path.exists(tif_path): os.remove(tif_path)
 
+    print("Test Finished!")
 
 if __name__ == "__main__":
     gemini, sam = init_models()
@@ -315,7 +326,7 @@ if __name__ == "__main__":
     if not os.path.exists(ORIGINAL_CSV_PATH) or not os.path.exists(CARBON_CSV_PATH):
         raise FileNotFoundError("CSV Missing")
     
-    print("Merging")
+    print("Merging...")
     df_org = pd.read_csv(ORIGINAL_CSV_PATH)
     df_carbon = pd.read_csv(CARBON_CSV_PATH)
     
@@ -323,9 +334,7 @@ if __name__ == "__main__":
     print(f"Merged Data Shape: {df_merged.shape}")
     
     unique_tiles = df_merged['tile_id'].unique()
-    
-
-    sample_tiles = unique_tiles[:10] 
+    sample_tiles = unique_tiles[:20] 
     df_final = df_merged[df_merged['tile_id'].isin(sample_tiles)]
     
     process_dataset(df_final, gemini, sam)
