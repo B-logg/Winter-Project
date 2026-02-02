@@ -149,6 +149,7 @@ def generate_dynamic_qa(species_type, count):
     
     [질문(Question) 생성 규칙]
     - "{korean_name}"라는 단어를 포함하여 다양하게 질문하세요.
+    - {count} 정보를 질문에 넣지 마세요.
     - 예시: 
       - "이 이미지에서 {korean_name}를 찾아줘."
       - "{korean_name}는 어디에 있어?"
