@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from google import genai 
 from segment_anything_hq import sam_model_registry, SamPredictor
 
-# ================= 1. 환경 설정 =================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(CURRENT_DIR, ".env"))
 GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
@@ -24,7 +23,6 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 # 경로 설정
 CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
-# GRSM 전용 폴더 생성
 OUTPUT_PATH = os.path.join(CURRENT_DIR, "l1_dataset") 
 SAM_CHECKPOINT = os.path.join(CURRENT_DIR, "checkpoints", "sam_hq_vit_l.pth")
 
@@ -38,9 +36,8 @@ MIN_TREE_THRESHOLD = 3
 SAM_BATCH_SIZE = 64
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-TARGET_TILE_COUNT = 600
+TARGET_TILE_COUNT = 600 # 타일 600개 처리
 
-# ================= 2. 유틸리티 함수 =================
 
 def download_neon_image(site, year, tile_id, save_dir):
     filename = f"{tile_id}.tif"
@@ -69,7 +66,6 @@ def download_neon_image(site, year, tile_id, save_dir):
         
         if not file_url: return None
         
-        print(f"⬇️ Downloading GRSM Map: {filename}...")
         with requests.get(file_url, stream=True) as r:
             r.raise_for_status()
             with open(save_path, 'wb') as f:
@@ -85,7 +81,7 @@ def normalize_image(img_array):
 
 def get_species_category(species_name):
     species_name = species_name.lower()
-    conifer_keywords = ['pinus', 'abies', 'picea', 'tsuga', 'juniperus', 'larix', 'pseudotsuga', 'conifer']
+    conifer_keywords = ['conifer']
     if any(k in species_name for k in conifer_keywords): return "Conifer"
     return "Broadleaf"
 
@@ -129,13 +125,9 @@ def filter_trees_in_tile(src, window, row_data):
         
     return filtered_boxes, filtered_species
 
-# ================= 3. Gemini Q&A 생성 =================
-
 def generate_dynamic_qa(species_type, count):
-    # 입력된 영문 수종을 한글로 변환
     korean_name = "침엽수" if species_type == "Conifer" else "활엽수"
     
-    # ★ 사용자 요청대로 프롬프트 원문 유지
     prompt = f"""
     역할: Segmentation Masking 능력 강화를 위한 데이터셋 제작
     
@@ -172,8 +164,6 @@ def generate_dynamic_qa(species_type, count):
     """
     
     try:
-        # ★ [수정 4] 최신 라이브러리 문법 적용 (google-genai)
-        # client.models.generate_content 사용
         response = client.models.generate_content(
             model='gemini-2.0-flash', 
             contents=prompt
@@ -193,21 +183,16 @@ def generate_dynamic_qa(species_type, count):
             "answer": f"네, 이미지에 있는 {count}그루의 {korean_name} [SEG]를 표시했습니다."
         }
 
-# ================= 4. 메인 파이프라인 =================
-
 def process_grsm_dataset():
     if not os.path.exists(CSV_PATH): return
     df = pd.read_csv(CSV_PATH)
     
-    # ★ 핵심 변경: GRSM 사이트만 필터링 (속도 향상)
     df_grsm = df[df['site'] == 'GRSM']
-    print(f"🌲 GRSM Maps Found: {len(df_grsm)}")
+    print(f"GRSM Maps Found: {len(df_grsm)}")
     
     if len(df_grsm) == 0:
-        print("❌ GRSM data not found in CSV.")
         return
 
-    print(f"🚀 Initializing SAM on {device}...")
     sam = sam_model_registry["vit_l"](checkpoint=SAM_CHECKPOINT)
     sam.to(device=device)
     predictor = SamPredictor(sam)
@@ -219,16 +204,14 @@ def process_grsm_dataset():
     created_count = 0     
     l1_results = []
 
-    print(f"🧪 Target: Generate {TARGET_TILE_COUNT} GRSM tiles.")
+    print(f"Target: Generate {TARGET_TILE_COUNT} GRSM tiles.")
 
-    # GRSM 데이터만 순회
     for idx, row in tqdm(df_grsm.iterrows(), total=len(df_grsm), desc="Processing GRSM"):
         if created_count >= TARGET_TILE_COUNT: break
         
         tile_id = row['tile_id']
         site, year = row['site'], row['year']
         
-        # 다운로드 (GRSM 지도만 받으므로 빠름)
         tif_path = download_neon_image(site, year, tile_id, temp_dir)
         if not tif_path: continue
         
@@ -248,7 +231,6 @@ def process_grsm_dataset():
                         boxes, species_list = filter_trees_in_tile(src, window, row)
                         
                         if len(boxes) >= MIN_TREE_THRESHOLD:
-                            # ================= 데이터 생성 =================
                             
                             # 1. 이미지 저장
                             img_tile_raw = src.read([1, 2, 3], window=window)
@@ -290,7 +272,7 @@ def process_grsm_dataset():
                                 # 3. Gemini Q&A
                                 qa = generate_dynamic_qa(sp_name, len(target_boxes))
                                 
-                                # ★ [요청사항 반영] JSON 구조
+                               
                                 l1_entry = {
                                     "id": f"{tile_id}_tile{global_tile_count}_{sp_name}",
                                     "image": tile_filename,
@@ -310,7 +292,7 @@ def process_grsm_dataset():
                             
                             created_count += 1
                             global_tile_count += 1
-                            print(f"✅ Created Tile {created_count}/{TARGET_TILE_COUNT}")
+                            print(f"Created Tile {created_count}/{TARGET_TILE_COUNT}")
 
                             if len(l1_results) % 5 == 0:
                                 with open(os.path.join(OUTPUT_PATH, "l1_dataset.json"), 'w', encoding='utf-8') as f:
@@ -325,7 +307,7 @@ def process_grsm_dataset():
     with open(os.path.join(OUTPUT_PATH, "l1_dataset.json"), 'w', encoding='utf-8') as f:
         json.dump(l1_results, f, indent=4, ensure_ascii=False)
     
-    print(f"🎉 GRSM Generation Complete! {len(l1_results)} entries created.")
+    print(f"Complete! {len(l1_results)} entries created.")
 
 if __name__ == "__main__":
     process_grsm_dataset()
