@@ -38,8 +38,7 @@ MIN_TREE_THRESHOLD = 3
 SAM_BATCH_SIZE = 64
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ★ 테스트용: 5개만 만들고 종료 (나중에 숫자를 늘리거나 주석 처리하세요)
-TARGET_TILE_COUNT = 5 
+TARGET_TILE_COUNT = 600
 
 # ================= 2. 유틸리티 함수 =================
 
