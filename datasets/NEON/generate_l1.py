@@ -25,7 +25,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # 경로 설정
 CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
 # GRSM 전용 폴더 생성
-OUTPUT_PATH = os.path.join(CURRENT_DIR, "l1_dataset_grsm") 
+OUTPUT_PATH = os.path.join(CURRENT_DIR, "l1_dataset") 
 SAM_CHECKPOINT = os.path.join(CURRENT_DIR, "checkpoints", "sam_hq_vit_l.pth")
 
 os.makedirs(os.path.join(OUTPUT_PATH, "images"), exist_ok=True)
@@ -138,7 +138,7 @@ def generate_dynamic_qa(species_type, count):
     
     # ★ 사용자 요청대로 프롬프트 원문 유지
     prompt = f"""
-    역할: 시각 언어 모델(VLM) 학습용 데이터셋 생성기
+    역할: Segmentation Masking 능력 강화를 위한 데이터셋 제작
     
     상황: 
     - 사용자가 숲 항공 사진을 보고 특정 수종({korean_name})을 찾아달라고 요청합니다.
@@ -157,6 +157,7 @@ def generate_dynamic_qa(species_type, count):
       
     [답변(Answer) 생성 규칙]
     - 반드시 "{korean_name}"라는 단어 바로 뒤에 [SEG] 토큰을 붙여야 합니다.
+    - {count} 정보를 답변에 꼭 포함시키세요. (침엽수 or 활엽수가 몇 그루인지 나타내는 정보)
     - 예시 패턴:
       - "네, 이 {count}그루의 나무들은 {korean_name} [SEG]입니다."
       - "요청하신 {count}그루의 {korean_name} [SEG]를 찾았습니다."
