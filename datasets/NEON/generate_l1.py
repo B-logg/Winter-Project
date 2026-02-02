@@ -1,6 +1,5 @@
 import json
 import os
-import time
 import requests
 import numpy as np
 import pandas as pd
@@ -11,8 +10,6 @@ import cv2
 from PIL import Image
 from tqdm import tqdm
 from dotenv import load_dotenv
-
-# ★ [수정 1] 최신 라이브러리 사용
 from google import genai 
 from segment_anything_hq import sam_model_registry, SamPredictor
 
@@ -23,12 +20,12 @@ GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
 
 if not GEMINI_API_KEY: raise ValueError("API Key Missing")
 
-# ★ [수정 2] 최신 Client 초기화
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # 경로 설정
 CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
-OUTPUT_PATH = os.path.join(CURRENT_DIR, "l1_dataset_neon_test") # 테스트용 폴더 분리
+# GRSM 전용 폴더 생성
+OUTPUT_PATH = os.path.join(CURRENT_DIR, "l1_dataset_grsm") 
 SAM_CHECKPOINT = os.path.join(CURRENT_DIR, "checkpoints", "sam_hq_vit_l.pth")
 
 os.makedirs(os.path.join(OUTPUT_PATH, "images"), exist_ok=True)
@@ -41,9 +38,8 @@ MIN_TREE_THRESHOLD = 3
 SAM_BATCH_SIZE = 64
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ★ [수정 3] 테스트를 위한 설정
-START_TILE_COUNT = 1000  # L3 데이터(1~1000)는 건너뜀
-TARGET_TILE_COUNT = 5    # ★ 딱 5장만 만들고 종료 (테스트용)
+# ★ 테스트용: 5개만 만들고 종료 (나중에 숫자를 늘리거나 주석 처리하세요)
+TARGET_TILE_COUNT = 5 
 
 # ================= 2. 유틸리티 함수 =================
 
@@ -74,7 +70,7 @@ def download_neon_image(site, year, tile_id, save_dir):
         
         if not file_url: return None
         
-        print(f"⬇️ Downloading Map: {filename}...")
+        print(f"⬇️ Downloading GRSM Map: {filename}...")
         with requests.get(file_url, stream=True) as r:
             r.raise_for_status()
             with open(save_path, 'wb') as f:
@@ -134,7 +130,7 @@ def filter_trees_in_tile(src, window, row_data):
         
     return filtered_boxes, filtered_species
 
-# ================= 3. Gemini Q&A 생성 (사용자 요청 프롬프트 적용) =================
+# ================= 3. Gemini Q&A 생성 =================
 
 def generate_dynamic_qa(species_type, count):
     # 입력된 영문 수종을 한글로 변환
@@ -198,10 +194,18 @@ def generate_dynamic_qa(species_type, count):
 
 # ================= 4. 메인 파이프라인 =================
 
-def process_l1_dataset():
+def process_grsm_dataset():
     if not os.path.exists(CSV_PATH): return
     df = pd.read_csv(CSV_PATH)
     
+    # ★ 핵심 변경: GRSM 사이트만 필터링 (속도 향상)
+    df_grsm = df[df['site'] == 'GRSM']
+    print(f"🌲 GRSM Maps Found: {len(df_grsm)}")
+    
+    if len(df_grsm) == 0:
+        print("❌ GRSM data not found in CSV.")
+        return
+
     print(f"🚀 Initializing SAM on {device}...")
     sam = sam_model_registry["vit_l"](checkpoint=SAM_CHECKPOINT)
     sam.to(device=device)
@@ -214,16 +218,16 @@ def process_l1_dataset():
     created_count = 0     
     l1_results = []
 
-    print(f"🧪 TEST MODE: Skipping first {START_TILE_COUNT} tiles -> Generating ONLY {TARGET_TILE_COUNT} tiles.")
+    print(f"🧪 Target: Generate {TARGET_TILE_COUNT} GRSM tiles.")
 
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Scanning Maps"):
-        if created_count >= TARGET_TILE_COUNT: 
-            print("✅ Target limit reached. Stopping...")
-            break
+    # GRSM 데이터만 순회
+    for idx, row in tqdm(df_grsm.iterrows(), total=len(df_grsm), desc="Processing GRSM"):
+        if created_count >= TARGET_TILE_COUNT: break
         
         tile_id = row['tile_id']
         site, year = row['site'], row['year']
         
+        # 다운로드 (GRSM 지도만 받으므로 빠름)
         tif_path = download_neon_image(site, year, tile_id, temp_dir)
         if not tif_path: continue
         
@@ -231,83 +235,85 @@ def process_l1_dataset():
             with rasterio.open(tif_path) as src:
                 h_img, w_img = src.shape
                 
-                # 타일링
-                valid_windows = []
+                # 타일링 루프
                 for row_off in range(0, h_img, TILE_SIZE):
                     for col_off in range(0, w_img, TILE_SIZE):
+                        if created_count >= TARGET_TILE_COUNT: break
+                        
                         width = min(TILE_SIZE, w_img - col_off)
                         height = min(TILE_SIZE, h_img - row_off)
                         window = Window(col_off, row_off, width, height)
+                        
                         boxes, species_list = filter_trees_in_tile(src, window, row)
                         
                         if len(boxes) >= MIN_TREE_THRESHOLD:
-                            global_tile_count += 1
-                            if global_tile_count <= START_TILE_COUNT:
-                                continue
+                            # ================= 데이터 생성 =================
                             
-                            valid_windows.append((window, boxes, species_list))
+                            # 1. 이미지 저장
+                            img_tile_raw = src.read([1, 2, 3], window=window)
+                            img_tile_raw = np.moveaxis(img_tile_raw, 0, -1)
+                            img_tile = normalize_image(img_tile_raw)
+                            
+                            # 패딩
+                            if img_tile.shape[0] != TILE_SIZE or img_tile.shape[1] != TILE_SIZE:
+                                img_tile = np.pad(img_tile, ((0, TILE_SIZE - img_tile.shape[0]), (0, TILE_SIZE - img_tile.shape[1]), (0, 0)))
+                            
+                            tile_filename = f"{tile_id}_tile{global_tile_count}.jpg"
+                            Image.fromarray(img_tile).save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=95)
+                            
+                            # 2. SAM 마스크 생성
+                            predictor.set_image(img_tile)
+                            
+                            species_groups = {"Conifer": [], "Broadleaf": []}
+                            for box, sp in zip(boxes, species_list): species_groups[sp].append(box)
+                            
+                            # 수종별로 데이터 생성
+                            for sp_name, target_boxes in species_groups.items():
+                                if not target_boxes: continue
+                                
+                                input_boxes = torch.tensor(target_boxes, device=device)
+                                transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, img_tile.shape[:2])
+                                combined_mask = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+                                
+                                for i in range(0, len(target_boxes), SAM_BATCH_SIZE):
+                                    batch = transformed_boxes[i:i+SAM_BATCH_SIZE]
+                                    if len(batch) > 0:
+                                        masks, _, _ = predictor.predict_torch(point_coords=None, point_labels=None, boxes=batch, multimask_output=False)
+                                        merged = torch.max(masks, dim=0)[0]
+                                        combined_mask = np.maximum(combined_mask, (merged[0].cpu().numpy() > 0).astype(np.uint8) * 255)
+                                        del masks, merged; torch.cuda.empty_cache()
+                                
+                                mask_filename = f"mask_{tile_id}_tile{global_tile_count}_{sp_name}.png"
+                                cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), combined_mask)
+                                
+                                # 3. Gemini Q&A
+                                qa = generate_dynamic_qa(sp_name, len(target_boxes))
+                                
+                                # ★ [요청사항 반영] JSON 구조
+                                l1_entry = {
+                                    "id": f"{tile_id}_tile{global_tile_count}_{sp_name}",
+                                    "image": tile_filename,
+                                    "conversations": [
+                                        {
+                                            "from": "human", 
+                                            "value": f"{qa['question']}\n<image>"
+                                        },
+                                        {
+                                            "from": "gpt", 
+                                            "value": qa['answer']
+                                        }
+                                    ],
+                                    "mask_path": f"masks/{mask_filename}"
+                                }
+                                l1_results.append(l1_entry)
+                            
+                            created_count += 1
+                            global_tile_count += 1
+                            print(f"✅ Created Tile {created_count}/{TARGET_TILE_COUNT}")
 
-                if global_tile_count <= START_TILE_COUNT:
-                    print(f"⏭️ Skipped Map {tile_id} (Processed so far: {global_tile_count})")
-                    continue
-                
-                print(f"✨ Found {len(valid_windows)} new valid tiles! Generating Data...")
-
-                for window, boxes, species_list in valid_windows:
-                    if created_count >= TARGET_TILE_COUNT: break
-
-                    # 1. 이미지 저장
-                    img_tile_raw = src.read([1, 2, 3], window=window)
-                    img_tile_raw = np.moveaxis(img_tile_raw, 0, -1)
-                    img_tile = normalize_image(img_tile_raw)
-                    
-                    if img_tile.shape[0] != TILE_SIZE or img_tile.shape[1] != TILE_SIZE:
-                        img_tile = np.pad(img_tile, ((0, TILE_SIZE - img_tile.shape[0]), (0, TILE_SIZE - img_tile.shape[1]), (0, 0)))
-                    
-                    tile_filename = f"{tile_id}_tile{global_tile_count}.jpg"
-                    Image.fromarray(img_tile).save(os.path.join(OUTPUT_PATH, "images", tile_filename), quality=95)
-                    
-                    # 2. SAM & Gemini
-                    predictor.set_image(img_tile)
-                    
-                    species_groups = {"Conifer": [], "Broadleaf": []}
-                    for box, sp in zip(boxes, species_list): species_groups[sp].append(box)
-                    
-                    for sp_name, target_boxes in species_groups.items():
-                        if not target_boxes: continue
-                        
-                        # SAM Mask
-                        input_boxes = torch.tensor(target_boxes, device=device)
-                        transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, img_tile.shape[:2])
-                        combined_mask = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
-                        
-                        for i in range(0, len(target_boxes), SAM_BATCH_SIZE):
-                            batch = transformed_boxes[i:i+SAM_BATCH_SIZE]
-                            if len(batch) > 0:
-                                masks, _, _ = predictor.predict_torch(point_coords=None, point_labels=None, boxes=batch, multimask_output=False)
-                                merged = torch.max(masks, dim=0)[0]
-                                combined_mask = np.maximum(combined_mask, (merged[0].cpu().numpy() > 0).astype(np.uint8) * 255)
-                                del masks, merged; torch.cuda.empty_cache()
-                        
-                        mask_filename = f"mask_{tile_id}_tile{global_tile_count}_{sp_name}.png"
-                        cv2.imwrite(os.path.join(OUTPUT_PATH, "masks", mask_filename), combined_mask)
-                        
-                        # Gemini Call (사용자 정의 함수 사용)
-                        qa = generate_dynamic_qa(sp_name, len(target_boxes))
-                        
-                        l1_results.append({
-                            "id": f"{tile_id}_tile{global_tile_count}_{sp_name}",
-                            "image": tile_filename,
-                            "mask_path": f"masks/{mask_filename}",
-                            "conversations": [{"from": "human", "value": f"{qa['question']}\n<image>"}, {"from": "gpt", "value": qa['answer']}]
-                        })
-                    
-                    created_count += 1
-                    print(f"   -> Progress: {created_count}/{TARGET_TILE_COUNT}")
-
-                    if len(l1_results) % 5 == 0:
-                        with open(os.path.join(OUTPUT_PATH, "l1_dataset.json"), 'w', encoding='utf-8') as f:
-                            json.dump(l1_results, f, indent=4, ensure_ascii=False)
+                            if len(l1_results) % 5 == 0:
+                                with open(os.path.join(OUTPUT_PATH, "l1_dataset.json"), 'w', encoding='utf-8') as f:
+                                    json.dump(l1_results, f, indent=4, ensure_ascii=False)
 
         except Exception as e:
             print(f"Error processing {tile_id}: {e}")
@@ -315,11 +321,10 @@ def process_l1_dataset():
         finally:
             if os.path.exists(tif_path): os.remove(tif_path)
 
-    # 최종 저장
     with open(os.path.join(OUTPUT_PATH, "l1_dataset.json"), 'w', encoding='utf-8') as f:
         json.dump(l1_results, f, indent=4, ensure_ascii=False)
     
-    print(f"🎉 TEST COMPLETE! Created {len(l1_results)} entries in {OUTPUT_PATH}")
+    print(f"🎉 GRSM Generation Complete! {len(l1_results)} entries created.")
 
 if __name__ == "__main__":
-    process_l1_dataset()
+    process_grsm_dataset()
