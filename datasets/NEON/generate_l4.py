@@ -50,73 +50,76 @@ def analyze_tree_geometry(height, area, dbh):
     
     return tree_type, hd_ratio
 
-def analyze_stand_details(row):
-    # 한 타일의 모든 통계 데이터 추출
-    heights = safe_eval(row['individual_heights'])
-    areas = safe_eval(row['individual_crown_areas'])
-    dbhs = safe_eval(row['individual_dbhs'])
-    carbons_a = safe_eval(row['individual_carbon_annual'])
-    carbons_s = safe_eval(row['individual_carbon_stored'])
+def process_l3_stats(stats):
+    # L3 데이터 내의 리스트 추출
+    heights = stats.get('heights', [])
+    areas = stats.get('areas', [])
+    dbhs = stats.get('dbhs', [])
+    
+    # 탄소 총량 (개별 리스트가 없으면 총량만 사용)
+    total_carbon_stored = stats.get('sum_carbon_stored', 0)
+    total_carbon_annual = stats.get('sum_carbon_annual', 0)
     
     if not heights: return None
     
-    # 그룹별 데이터 저장소
     groups = {
-        "Conifer": {'h': [], 'a': [], 'd': [], 'c_s': [], 'c_a': [], 'hd': []},
-        "Broadleaf": {'h': [], 'a': [], 'd': [], 'c_s': [], 'c_a': [], 'hd': []}
+        "Conifer": {'h': [], 'a': [], 'd': [], 'hd': [], 'count': 0},
+        "Broadleaf": {'h': [], 'a': [], 'd': [], 'hd': [], 'count': 0}
     }
+    
+    # 수종 분류 수행
+    total_vol_proxy = 0 # 탄소 배분을 위한 부피 추정치 합
     
     for i in range(len(heights)):
         h, a, d = heights[i], areas[i], dbhs[i]
-        c_a, c_s = carbons_a[i], carbons_s[i]
-        
         t_type, hd_ratio = analyze_tree_geometry(h, a, d)
         
         g = groups[t_type]
         g['h'].append(h)
         g['a'].append(a)
         g['d'].append(d)
-        g['c_s'].append(c_s)
-        g['c_a'].append(c_a)
         g['hd'].append(hd_ratio)
+        g['count'] += 1
         
-    # 통계 요약 함수 (최대/최소/평균/합계 모두 포함)
-    def summarize(data):
-        count = len(data['h'])
+        # 부피 비례 상수 (간이 계산: D^2 * H) -> 탄소 배분용
+        vol = (d ** 2) * h
+        g.setdefault('vol_sum', 0)
+        g['vol_sum'] += vol
+        total_vol_proxy += vol
+
+    # 통계 요약 함수
+    def summarize(name, data, total_vol):
+        count = data['count']
         if count == 0: return None
+        
+        # 탄소량 추정 (전체 탄소를 부피 비례로 나눔)
+        ratio = data.get('vol_sum', 0) / total_vol if total_vol > 0 else 0
+        stored_est = total_carbon_stored * ratio
+        annual_est = total_carbon_annual * ratio
+        
         return {
             "count": count,
-            "height": {
-                "mean": round(np.mean(data['h']), 2),
-                "max": round(np.max(data['h']), 2),
-                "min": round(np.min(data['h']), 2)
-            },
-            "crown_area": {
-                "mean": round(np.mean(data['a']), 2),
-                "total": round(np.sum(data['a']), 2)
-            },
-            "dbh": {
-                "mean": round(np.mean(data['d']), 2),
-                "max": round(np.max(data['d']), 2)
-            },
+            "height": {"mean": round(np.mean(data['h']), 2), "max": round(np.max(data['h']), 2), "min": round(np.min(data['h']), 2)},
+            "crown_area": {"mean": round(np.mean(data['a']), 2), "total": round(np.sum(data['a']), 2)},
+            "dbh": {"mean": round(np.mean(data['d']), 2), "max": round(np.max(data['d']), 2)},
             "carbon": {
-                "total_stored": round(np.sum(data['c_s']), 2),
-                "total_annual": round(np.sum(data['c_a']), 2),
-                "per_tree_efficiency": round(np.mean(data['c_a']), 2) # 그루당 효율
+                "total_stored": round(stored_est, 2),
+                "total_annual": round(annual_est, 2),
+                "per_tree_efficiency": round(annual_est / count, 2)
             },
             "hd_ratio": round(np.mean(data['hd']), 1)
         }
 
     return {
-        "conifer": summarize(groups['Conifer']),
-        "broadleaf": summarize(groups['Broadleaf']),
+        "conifer": summarize("Conifer", groups['Conifer'], total_vol_proxy),
+        "broadleaf": summarize("Broadleaf", groups['Broadleaf'], total_vol_proxy),
         "total_trees": len(heights),
-        "total_carbon_stored": round(sum(carbons_s), 2),
-        "total_carbon_annual": round(sum(carbons_a), 2)
+        "total_carbon_stored": round(total_carbon_stored, 2),
+        "total_carbon_annual": round(total_carbon_annual, 2)
     }
 
 
-def create_expert_report_prompt(tile_id, year, analysis):
+def create_expert_report_prompt(tile_id, analysis):
     
     # 데이터 텍스트화 함수
     def format_stats(name, stats):
@@ -146,7 +149,7 @@ def create_expert_report_prompt(tile_id, year, analysis):
     제공된 정밀 측정 데이터를 바탕으로, 주관적 의견을 배제하고 철저히 데이터에 입각한 '산림 자원 현황 상세 보고서'를 작성해 주세요.
 
     [분석 대상지 개요]
-    - ID: {tile_id} (조사연도: {year})
+    - ID: {tile_id}
     - 전체 임목 본수: {analysis['total_trees']}본
     - 임상 구성: 침엽수 {c_ratio}% vs 활엽수 {b_ratio}%
     - 총 탄소 저장량: {analysis['total_carbon_stored']} kg CO2eq
@@ -190,47 +193,27 @@ def generate_l4_dataset():
     with open(L3_JSON_PATH, 'r') as f:
         l3_data = json.load(f)
 
-    l3_map = {
-        item['id']: {
-            'image': item['image'], 
-            'mask_path': item.get('mask_path')
-        }
-        for item in l3_data   
-    }
-    print(f"Loaded {len(l3_map)} entries from Level-3.")
-    
-    if not os.path.exists(CSV_PATH) or not os.path.exists(CARBON_CSV_PATH):
-        print("CSV Files Missing.")
-        return
-
-    df_org = pd.read_csv(CSV_PATH)
-    df_carbon = pd.read_csv(CARBON_CSV_PATH)
-    
-    df_merged = pd.merge(df_org, df_carbon, on='tile_id', how='inner')
-    
-    # [테스트 설정] 딱 10개만 슬라이싱 / [실제 설정] 딱 1000개 슬라이싱
-    df_test = df_merged.iloc[:10]
+    print(f"Loaded {len(l3_data)} tiles")
     
     l4_results = []
-    print(f"Generating Expert Reports for {len(df_test)} tiles...")
 
     save_interval = 50
+
+    # [테스트 설정] 딱 10개만 슬라이싱 / [실제 설정] 딱 1000개 슬라이싱
+    target_data = l3_data[:10]
     
-    for idx, row in tqdm(df_test.iterrows(), total=len(df_test)):
-        tile_id = row['tile_id']
+    for item in tqdm(target_data):
+        tile_id = item['id']
 
-        if tile_id not in l3_map:
-            continue
-
-        l3_info = l3_map[tile_id]
+        if 'stats' not in item: continue
         
         try:
             # 1. 정밀 분석
-            analysis = analyze_stand_details(row)
+            analysis = process_l3_stats(item['stats'])
             if not analysis: continue
 
             # 2. 프롬프트 생성
-            prompt = create_expert_report_prompt(tile_id, row['year'], analysis)
+            prompt = create_expert_report_prompt(tile_id, analysis)
             
             # 3. Gemini 생성
             response = model.generate_content(prompt)
@@ -239,8 +222,7 @@ def generate_l4_dataset():
             # 4. 저장
             l4_entry = {
                 "id": tile_id + "_L4",
-                "image": l3_info['image'],
-                "year": int(row['year']),
+                "image": item['image'],
                 "metadata": analysis,
                 "conversations": [
                     {
@@ -254,6 +236,7 @@ def generate_l4_dataset():
                 ]
             }
             l4_results.append(l4_entry)
+
 
             if (len(l4_results)) % save_interval == 0:
                 with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
