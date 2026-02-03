@@ -190,7 +190,13 @@ def generate_l4_dataset():
     with open(L3_JSON_PATH, 'r') as f:
         l3_data = json.load(f)
 
-    l3_map = {l3_data['id']: {'image': l3_data['image'], 'mask_path': l3_data.get('mask_path')}}
+    l3_map = {
+        item['id']: {
+            'image': item['image'], 
+            'mask_path': item.get('mask_path')
+        }
+        for item in l3_data   
+    }
     print(f"Loaded {len(l3_map)} entries from Level-3.")
     
     if not os.path.exists(CSV_PATH) or not os.path.exists(CARBON_CSV_PATH):
