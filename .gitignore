@@ -36,3 +36,5 @@ miniconda.exe
 .env
 venv/
 
+.vscode
+
