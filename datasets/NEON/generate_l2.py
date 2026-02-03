@@ -39,7 +39,7 @@ SAM_BATCH_SIZE = 64
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 테스트: 타일 5장/실전: 타일 1000장
-TARGET_TILE_COUNT = 5 
+TARGET_TILE_COUNT = 1000
 
 # site: 지역 코드, year: 관찰년도, save_dir: 저장할 폴더 경로
 def download_neon_image(site, year, tile_id, save_dir):
@@ -183,7 +183,7 @@ def generate_l2_qa(species_counts):
         
         raw_text = response.text.strip()
         
-        print(f"\n[DEBUG] Raw Gemini Output:\n{raw_text}\n" + "-"*30)
+        # print(f"\n[DEBUG] Raw Gemini Output:\n{raw_text}\n" + "-"*30)
 
         if raw_text.startswith('```json'):
             raw_text = raw_text[7:]
