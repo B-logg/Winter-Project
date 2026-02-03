@@ -177,7 +177,8 @@ def generate_l2_qa(species_counts):
         response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
         text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(text)
-    except:
+    except Exception as e:
+        print(f"Error: {e}")
         return {
             "question": "두 수종의 공존 관계나 위치를 설명하고, 두 수종이 공존함으로써 산림에 어떤 영향을 주는지 설명하세요.",
             "answer": "이 숲에는 침엽수 [SEG]와 활엽수 [SEG]가 함께 자라고 있고, 이러한 혼효림은 숲 생태계에서 침엽수 [SEG]와 활엽수 [SEG]의 비율이 3대 7일 때 가장 생태적으로 안정적이고, 생물 다양성도 높게 유지된다."
