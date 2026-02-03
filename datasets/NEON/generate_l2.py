@@ -174,9 +174,20 @@ def generate_l2_qa(species_counts):
     """
     
     try:
-        response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        text = response.text.strip().replace('```json', '').replace('```', '')
+        response = client.models.generate_content(
+            model='gemini-2.0-flash', 
+            contents=prompt,
+            config={'response_mime_type': 'application/json'})
+        
+        text = response.text.strip()
+        start_idx = text.find('{')
+        end_idx = text.rfind('}')
+
+        if start_idx != -1 and end_idx != -1:
+            text = text[start_idx : end_idx + 1]
+        
         return json.loads(text)
+    
     except Exception as e:
         print(f"Error: {e}")
         return {
