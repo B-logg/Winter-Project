@@ -200,7 +200,7 @@ def generate_l4_dataset():
     save_interval = 50
 
     # [테스트 설정] 딱 10개만 슬라이싱 / [실제 설정] 딱 1000개 슬라이싱
-    target_data = l3_data[:10]
+    target_data = l3_data[:1000]
     
     for item in tqdm(target_data):
         tile_id = item['id']
