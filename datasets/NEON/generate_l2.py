@@ -7,6 +7,7 @@ import rasterio
 from rasterio.windows import Window
 import torch
 import cv2
+import re
 from PIL import Image
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -180,13 +181,13 @@ def generate_l2_qa(species_counts):
             config={'response_mime_type': 'application/json'})
         
         text = response.text.strip()
-        start_idx = text.find('{')
-        end_idx = text.rfind('}')
-
-        if start_idx != -1 and end_idx != -1:
-            text = text[start_idx : end_idx + 1]
         
-        return json.loads(text)
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            clean_json = match.group(0)
+            return json.loads(clean_json)
+        else:
+            raise ValueError("No JSON found in response")
     
     except Exception as e:
         print(f"Error: {e}")
