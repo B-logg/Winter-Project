@@ -17,11 +17,12 @@ GEMINI_API_KEY = os.getenv("Gemini_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.5-pro')
 
-ORIGINAL_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
+CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset.csv")
 CARBON_CSV_PATH = os.path.join(CURRENT_DIR, "NEON_dataset_with_carbon.csv")
-OUTPUT_L4_PATH = os.path.join(CURRENT_DIR, "l4_dataset/l4_expert_report.json")
+L3_JSON_PATH = os.path.join(CURRENT_DIR, "l3_dataset/l3_dataset.json")
+OUTPUT_PATH = os.path.join(CURRENT_DIR, "l4_dataset/l4_dataset.json")
 
-os.makedirs(os.path.dirname(OUTPUT_L4_PATH), exist_ok=True)
+os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 
 
 def safe_eval(val):
@@ -183,18 +184,26 @@ def create_expert_report_prompt(tile_id, year, analysis):
 
 
 def generate_l4_dataset():
-    print("Data Loading & Merging...")
-    if not os.path.exists(ORIGINAL_CSV_PATH) or not os.path.exists(CARBON_CSV_PATH):
+    if not os.path.exists(L3_JSON_PATH):
+        print(f"Error: {L3_JSON_PATH} not found")
+        return
+    with open(L3_JSON_PATH, 'r') as f:
+        l3_data = json.load(f)
+
+    l3_map = {l3_data['id']: {'image': l3_data['image'], 'mask_path': l3_data.get('mask_path')}}
+    print(f"Loaded {len(l3_map)} entries from Level-3.")
+    
+    if not os.path.exists(CSV_PATH) or not os.path.exists(CARBON_CSV_PATH):
         print("CSV Files Missing.")
         return
 
-    df_org = pd.read_csv(ORIGINAL_CSV_PATH)
+    df_org = pd.read_csv(CSV_PATH)
     df_carbon = pd.read_csv(CARBON_CSV_PATH)
     
     df_merged = pd.merge(df_org, df_carbon, on='tile_id', how='inner')
     
     # [테스트 설정] 딱 10개만 슬라이싱 / [실제 설정] 딱 1000개 슬라이싱
-    df_test = df_merged.iloc[:1000]
+    df_test = df_merged.iloc[:10]
     
     l4_results = []
     print(f"Generating Expert Reports for {len(df_test)} tiles...")
@@ -203,6 +212,11 @@ def generate_l4_dataset():
     
     for idx, row in tqdm(df_test.iterrows(), total=len(df_test)):
         tile_id = row['tile_id']
+
+        if tile_id not in l3_map:
+            continue
+
+        l3_info = l3_map[tile_id]
         
         try:
             # 1. 정밀 분석
@@ -218,11 +232,10 @@ def generate_l4_dataset():
             
             # 4. 저장
             l4_entry = {
-                "id": tile_id,
-                "tile_id": tile_id,
+                "id": tile_id + "_L4",
+                "image": l3_info['image'],
                 "year": int(row['year']),
                 "metadata": analysis,
-                "report": report_text,
                 "conversations": [
                     {
                         "from": "human", 
@@ -237,7 +250,7 @@ def generate_l4_dataset():
             l4_results.append(l4_entry)
 
             if (len(l4_results)) % save_interval == 0:
-                with open(OUTPUT_L4_PATH, 'w', encoding='utf-8') as f:
+                with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
                     json.dump(l4_results, f, indent=4, ensure_ascii=False)
 
             time.sleep(1.2) # API 쿨타임
@@ -246,10 +259,10 @@ def generate_l4_dataset():
             print(f"Error processing {tile_id}: {e}")
             continue
 
-    with open(OUTPUT_L4_PATH, 'w', encoding='utf-8') as f:
+    with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
         json.dump(l4_results, f, indent=4, ensure_ascii=False)
         
-    print(f"Expert L4 Dataset ({len(l4_results)} samples) Created! Saved to {OUTPUT_L4_PATH}")
+    print(f"Expert L4 Dataset ({len(l4_results)} samples) Created! Saved to {OUTPUT_PATH}")
 
 if __name__ == "__main__":
     generate_l4_dataset()
