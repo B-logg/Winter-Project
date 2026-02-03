@@ -180,14 +180,24 @@ def generate_l2_qa(species_counts):
             contents=prompt,
             config={'response_mime_type': 'application/json'})
         
-        text = response.text.strip()
+        raw_text = response.text.strip()
         
-        match = re.search(r'\{.*\}', text, re.DOTALL)
+        print(f"\n[DEBUG] Raw Gemini Output:\n{raw_text}\n" + "-"*30)
+
+        if raw_text.startswith('```json'):
+            raw_text = raw_text[7:]
+        if raw_text.endswith('```'):
+            raw_text = raw_text[:-3]
+        
+        raw_text = raw_text.strip() # 공백 제거
+
+        # 2. 정규표현식으로 { } 사이의 내용만 강제 추출
+        match = re.search(r'\{[\s\S]*\}', raw_text)
         if match:
-            clean_json = match.group(0)
-            return json.loads(clean_json)
+            clean_json_str = match.group(0)
+            return json.loads(clean_json_str)
         else:
-            raise ValueError("No JSON found in response")
+            raise ValueError("No JSON object found in text")
     
     except Exception as e:
         print(f"Error: {e}")
