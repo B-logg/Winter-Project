@@ -38,12 +38,17 @@ dataset_configs = [
     },
     {
         "name": "Level-4",
-        # 이전에 생성한 최종 L4 파일명 확인 필요
         "json_path": os.path.join(BASE_DIR, "l4_dataset/l4_dataset_final.json"),
         "img_prefix": "l3_dataset/images", # L4는 L3 이미지를 공유함
         "mask_prefix": None ,
+    },
+    # iNaturalist도 똑같은 양식으로 추가 
+    {
+        "name": "Level-1-iNaturalist",
+        "json_path": os.path.join(BASE_DIR, "l1_dataset_inaturalist/l1_dataset_inaturalist.json"),
+        "img_prefix": "l1_dataset_inaturalist/images",
+        "mask_prefix": "l1_dataset_inaturalist/masks"
     }
-    # iNaturalist도 똑같은 양식으로 추가 가능
 ]
 
 # 2. 경로 정규화 함수
