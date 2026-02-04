@@ -38,7 +38,7 @@ dataset_configs = [
     },
     {
         "name": "Level-4",
-        "json_path": os.path.join(BASE_DIR, "l4_dataset/l4_dataset_final.json"),
+        "json_path": os.path.join(BASE_DIR, "l4_dataset/l4_dataset.json"),
         "img_prefix": "l3_dataset/images", # L4는 L3 이미지를 공유함
         "mask_prefix": None ,
     },
