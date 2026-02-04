@@ -1,196 +1,367 @@
+# train_ft.py의 로직을 기반으로 함
+
 import os
+import sys
+import time
+import json
+import tqdm
 import torch
+import argparse
+import deepspeed
+import numpy as np
 import transformers
+from functools import partial
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoTokenizer, BitsAndBytesConfig, Trainer, TrainingArguments
+from torch.utils.tensorboard import SummaryWriter
+from transformers import BitsAndBytesConfig
 
 from model.GLaMM import GLaMMForCausalLM 
+from model.llava import conversation as conversation_lib
+from dataset.dataset import custom_collate_fn
+from tools.utils import AverageMeter, ProgressMeter, dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from model.llava.model.language_model.llava_llama import LlamaConfig
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="GLaMM Forest Finetuning")
+    
+    # 기본 설정
+    parser.add_argument("--version", default="MBZUAI/GLaMM-GranD-Pretrained")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Path to train.json")
+    parser.add_argument("--eval_data_path", type=str, default=None)
+    parser.add_argument("--image_folder", type=str, required=True)
+    parser.add_argument("--model_max_length", default=2048, type=int)
+    parser.add_argument("--local_rank", default=0, type=int)
+    
+    # 학습 하이퍼파라미터
+    parser.add_argument("--epochs", default=5, type=int)
+    parser.add_argument("--batch_size", default=2, type=int)
+    parser.add_argument("--grad_accumulation_steps", default=1, type=int)
+    parser.add_argument("--lr", default=2e-4, type=float)
+    parser.add_argument("--workers", default=4, type=int)
+    parser.add_argument("--print_freq", default=10, type=int)
+    parser.add_argument("--output_dir", default="./checkpoints", type=str)
+    
+    # LoRA 설정
+    parser.add_argument("--lora_r", default=128, type=int)
+    parser.add_argument("--lora_alpha", default=256, type=int)
+    parser.add_argument("--lora_dropout", default=0.05, type=float)
+    
+    # Loss 가중치 (기본값 유지)
+    parser.add_argument("--ce_loss_weight", default=1.0, type=float)
+    parser.add_argument("--dice_loss_weight", default=0.5, type=float)
+    parser.add_argument("--bce_loss_weight", default=2.0, type=float)
+    
+    # 기타 모델 설정 (GLaMM 필수 인자)
+    parser.add_argument("--vision_pretrained", default="./checkpoints/sam_vit_h_4b8939.pth", type=str)
+    parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument("--train_mask_decoder", action="store_true", default=True)
+    parser.add_argument("--vision_tower", default="openai/clip-vit-large-patch14-336", type=str)
+    parser.add_argument("--use_mm_start_end", action="store_true", default=True)
+    parser.add_argument("--conv_type", default="llava_v1", type=str)
+
+    # DeepSpeed가 자동으로 넣어주는 인자 무시용
+    parser.add_argument("--deepspeed", type=str)
+    parser.add_argument("--deepspeed_config", type=str)
+
+    return parser.parse_args()
+
+# Custom Dataset Class (사용자 JSON 구조 맞춤)
+class ForestDataset(Dataset):
+    def __init__(self, json_path, image_folder, tokenizer, image_processor, model_args):
+        self.image_folder = image_folder
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.model_args = model_args
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
+            
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # 1. 이미지 로드
+        image_file = item['image']
+        image_path = os.path.join(self.image_folder, image_file)
+        try:
+            image = Image.open(image_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            return self.__getitem__((idx + 1) % len(self)) # 에러 시 다음 데이터 사용
+
+        # 2. 전처리 (Processor)
+        # custom_collate_fn이 처리하기 쉽도록 raw dictionary 형태로 반환
+        # GLaMM의 custom_collate_fn은 아래 키들을 기대합니다.
+        
+        # Conversations 처리
+        sources = [item['conversations']]
+        
+        # 마스크 경로 처리
+        mask_path = item.get('mask_path', None)
+        if mask_path:
+            if isinstance(mask_path, str):
+                mask_path = [os.path.join(self.image_folder, mask_path)]
+            elif isinstance(mask_path, list):
+                mask_path = [os.path.join(self.image_folder, m) for m in mask_path]
+        
+        # 결과 Dict 반환
+        return {
+            'image': image,
+            'conversations': sources,
+            'image_path': image_path,
+            'mask_path': mask_path,
+            'region': item.get('bboxes', None) # bbox가 있다면
+        }
+    
+# Main
 def find_target_linear_modules(model, exclude_keywords=[]):
-    # LoRA를 적용할 선형 레이어를 찾기
-    # Full Fine-Tuning할 모듈은 제외
     cls = torch.nn.Linear
     lora_module_names = set()
-
     for name, module in model.named_modules():
-        if any(keyword in name for keyword in exclude_keywords):
-            continue
-
+        if any(keyword in name for keyword in exclude_keywords): continue
         if isinstance(module, cls):
-            names = name.split('.')
-            lora_module_names.add(names[-1])
-    
-    if 'lm_head' in lora_module_names:
-        lora_module_names.remove('lm_head')
-    
+            lora_module_names.add(name.split('.')[-1])
+    if 'lm_head' in lora_module_names: lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
-def print_trainable_parameters(model):
-    # 학습 가능한 파라미터 수를 출력
-    trainable_params = 0
-    all_param = 0
-
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
+def main():
+    args = parse_args()
     
-    print(
-        f"trainable params: {trainable_params:,} || "
-        f"all params: {all_param:,} || "
-        f"trainable%: {100 * trainable_params / all_param:.2f}%"
+    # 1. 토크나이저 설정
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
+    tokenizer.pad_token = tokenizer.unk_token
+    
+    # Special Tokens 추가 ([SEG], <bbox> 등)
+    special_tokens = ['[SEG]', '<bbox>', '<point>', '<p>', '</p>']
+    if args.use_mm_start_end:
+        special_tokens.extend([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN])
+    tokenizer.add_tokens(special_tokens, special_tokens=True)
+    
+    args.bbox_token_idx = tokenizer("<bbox>", add_special_tokens=False).input_ids[0]
+    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
-def train():
-    # Argument Parsing
-    parser = transformers.HfArgumentParser(
-        (transformers.TrainingArguments)
-    )
-
-    # 실제 실행 시에는 command line args로 받으므로 여기서는 빈 괄호 or sys.argv 사용
-    # 편의 상 스크립트 실행 시 전달된 인자를 받도록 설정
-    training_args, = parser.parse_args_into_dataclasses()
-
-    # 모델 경로
-    model_path = os.path.expanduser("~/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
-
-    # 모델 로드 및 양자화 설정
-    # Vision Tower: CLIP
-    # grounding_encoder: SAM 전체
-    # mm_projector: LLaVA Projector
-    # text_hidden_fcs: GLaMM Projector
-    # region_encoder: Region Feature Extractor
-
+    # 2. 모델 로드 및 4-bit 양자화
     skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
                     "text_hidden_fcs", "region_encoder", "lm_head"]
     
-    print(f"Loading Model with NF4 Quantization (Skipping: {skip_modules})")
-
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, # A100 가속
+        bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
         llm_int8_skip_modules=skip_modules
     )
 
+    print(f"Loading GLaMM from {args.version}...")
+    
+    # GLaMM 모델 초기화에 필요한 인자들 딕셔너리로 준비
+    model_kwargs = {
+        "train_mask_decoder": args.train_mask_decoder,
+        "out_dim": args.out_dim,
+        "ce_loss_weight": args.ce_loss_weight,
+        "dice_loss_weight": args.dice_loss_weight,
+        "bce_loss_weight": args.bce_loss_weight,
+        "seg_token_idx": args.seg_token_idx,
+        "vision_pretrained": args.vision_pretrained,
+        "vision_tower": args.vision_tower,
+        "use_mm_start_end": args.use_mm_start_end,
+        "mm_vision_select_layer": -2,
+        "with_region": True
+    }
+    
     model = GLaMMForCausalLM.from_pretrained(
-        model_path,
+        args.version,
         quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16, # 스킵된 모듈을 BF16으로 로드
-        trust_remote_code=True
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        **model_kwargs
     )
-
-    # Q-LoRA 전처리 (Gradient Checkpointing 등)
+    
+    # 3. 모델 전처리 (Q-LoRA & Casting)
     model = prepare_model_for_kbit_training(model)
-
-    # 데이터 타입 보정 (BF16으로 맞추기)
-    print("Ensuring critical modules are in BF16")
-
-    # model.model은 GLaMMModel 인스턴스
+    
+    # BF16 Casting for Full-Tuning Modules
     glamm_model = model.model
-
-    # Vision Tower Casting
-    if hasattr(glamm_model, "vision_tower"):
-        vt = glamm_model.vision_tower
-        if isinstance(vt, list): vt = vt[0]
-        for param in vt.parameters():
-            param.data = param.data.to(torch.bfloat16)
+    modules_to_cast = ["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     
-    # SAM Casting
-    # GLaMMBaseModel에 정의됨
-    if hasattr(glamm_model, "grounding_encoder"):
-        for param in glamm_model.grounding_encoder.parameters():
-            param.data = param.data.to(torch.bfloat16)
+    print("Casting modules to BF16...")
+    for mod_name in modules_to_cast:
+        if hasattr(glamm_model, mod_name):
+            module = getattr(glamm_model, mod_name)
+            if isinstance(module, list): module = module[0] # List인 경우
+            for param in module.parameters():
+                param.data = param.data.to(torch.bfloat16)
 
-    # Projectors Casting
-    # mm_projector (LlavaMetaModel)
-    if hasattr(glamm_model, "mm_projector"):
-        for param in glamm_model.mm_projector.parameters():
-            param.data = param.data.to(torch.bfloat16)
-
-    # text_hidden_fcs (GLaMMBaseModel)
-    if hasattr(glamm_model, "text_hidden_fcs"):
-        for param in glamm_model.text_hidden_fcs.parameters():
-            param.data = param.data.to(torch.bfloat16)
-
-    # region_encoder(LlavaMetaModel)
-    if hasattr(glamm_model, "region_encoder"):
-        for param in glamm_model.region_encoder.parameters():
-            param.data = param.data.to(torch.bfloat16)
-    
-    # LoRA 설정 (LLM, Vision Tower)
-    # LoRA 적용: LLM(Q-LoRA), Vision Tower(Global Image Encoder)
-    # Full Fine-Tuning: Mask Decoder(Pixel Decoder), All projectors, Region Encoder
-
-    # LoRA 타겟에서 제외할 키워드
-    exclude_keywords = [
-        "grounding_encoder", # SAM 전체
-        "mm_projector", # projection layer
-        "text_hidden_fcs", # projection layer
-        "region_encoder" # Region Encoder
-    ]
-
+    # 4. LoRA 설정
+    exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     target_modules = find_target_linear_modules(model, exclude_keywords)
-    print(f"LoRA Target Modules: {target_modules}")
-
+    
     lora_config = LoraConfig(
-        r=128, # High rank
-        lora_alpha=256,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
         target_modules=target_modules,
-        lora_dropout=0.05,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM"
     )
+    
+    model = get_peft_model(model, lora_config)
+    model.resize_token_embeddings(len(tokenizer)) # 토큰 추가 반영
 
-    # Full Fine-Tuning 모듈
-    # model.base_model.model로 접근해야 원본 모델 접근 가능
+    # 5. Full-Tuning 모듈 Unfreeze
+    # (Mask Decoder, Projectors 등)
     base_glamm = model.base_model.model.model
-
-    # Mask Decoder require_grad=True
-    # SAM 구조: grounding_encoder -> mask_decoder
+    
+    # Mask Decoder 해동
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
-        for name, param in mask_decoder.named_parameters():
-            param.requires_grad=True
-
-        # Image Encoder & Prompt Encoder는 유지
-        for param in base_glamm.grounding_encoder.image_encoder.parameters():
-            param.requires_grad = False
-        for param in base_glamm.grounding_encoder.prompt_encoder.parameters():
-            param.requires_grad = False
-
-    # Projectors & Region Encoder requires_grad=True
-    modules_to_unfreeze = ["mm_projector", "text_hidden_fcs", "region_encoder"]
-
-    for mod_name in modules_to_unfreeze:
+        for param in mask_decoder.parameters(): param.requires_grad = True
+        # Image Encoder는 얼림
+        for param in base_glamm.grounding_encoder.image_encoder.parameters(): param.requires_grad = False
+        
+    # Projectors 해동
+    for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
-            module = getattr(base_glamm, mod_name)
-            for param in module.parameters():
+            for param in getattr(base_glamm, mod_name).parameters():
                 param.requires_grad = True
-    
-    # 통계 출력
-    print_trainable_parameters(model)
 
-    # Trainer 설정 (데이터셋 로더 필요)
+    # 학습 파라미터 출력
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable Params: {trainable_params:,}")
 
-    # 기존 GLaMM의 train.py에 있는 DataCollator와 Dataset 클래스를 사용 필요
-    # from dataset import GLaMMDataset, DataCollatorForGLaMM
+    # 6. 데이터셋 & 로더 준비
+    print(f"Loading Dataset from {args.dataset_path}")
+    train_dataset = ForestDataset(
+        json_path=args.dataset_path,
+        image_folder=args.image_folder,
+        tokenizer=tokenizer,
+        image_processor=base_glamm.get_vision_tower().image_processor,
+        model_args=args
+    )
     
-    # dataset = GLaMMDataset(...)
+    # Custom Collate Fn 사용
+    collate_fn = partial(
+        custom_collate_fn, 
+        tokenizer=tokenizer, 
+        use_mm_start_end=args.use_mm_start_end, 
+        local_rank=args.local_rank,
+        inference=False
+    )
     
-    # trainer = Trainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=dataset,
-    #     ...
-    # )
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.workers, 
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+
+    # DeepSpeed 초기화
+    # DeepSpeed Config는 CLI에서 전달된 json 사용
+    # optimizer 파라미터 등은 ds_config에서 제어됨
+
+    ds_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accumulation_steps,
+        "optimizer": {
+            "type": "AdamW",
+            "params": { "lr": args.lr, "weight_decay": 0.0, "betas": [0.9, 0.95] }
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": args.epochs * len(train_loader),
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": 100
+            }
+        },
+        "bf16": { "enabled": True },
+        "zero_optimization": {
+            "stage": 2,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8
+        }
+    }
+
+    model_engine, optimizer, _, scheduler = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config=ds_config
+        )
     
-    # trainer.train()
-    # trainer.save_state()
-    # trainer.save_model(output_dir=training_args.output_dir)
+    # Training Loop
+    print("Starting Training Loop")
+    global_step = 0
+    
+    # Tensorboard
+    if args.local_rank == 0:
+        writer = SummaryWriter(args.output_dir)
+    
+    for epoch in range(args.epochs):
+        model_engine.train()
+        progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=(args.local_rank != 0))
+        
+        for step, batch in enumerate(progress):
+            # Cuda로 이동
+            batch = dict_to_cuda(batch)
+            
+            # BF16 변환 (이미지 등)
+            if "global_enc_images" in batch and batch["global_enc_images"] is not None:
+                batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
+            if "grounding_enc_images" in batch and batch["grounding_enc_images"] is not None:
+                batch["grounding_enc_images"] = batch["grounding_enc_images"].bfloat16()
+                
+            # Forward
+            outputs = model_engine(**batch)
+            loss = outputs['loss']
+            
+            # Backward & Step
+            model_engine.backward(loss)
+            model_engine.step()
+            
+            # Logging
+            if args.local_rank == 0 and step % args.print_freq == 0:
+                current_lr = model_engine.get_lr()[0]
+                writer.add_scalar("Train/Loss", loss.item(), global_step)
+                writer.add_scalar("Train/LR", current_lr, global_step)
+                if 'ce_loss' in outputs: writer.add_scalar("Train/CE_Loss", outputs['ce_loss'].item(), global_step)
+                if 'mask_loss' in outputs: writer.add_scalar("Train/Mask_Loss", outputs['mask_loss'].item(), global_step)
+                
+            global_step += 1
+            
+        # Epoch 종료 후 저장
+        if args.local_rank == 0:
+            save_checkpoint(model_engine, args, epoch)
+
+
+def save_checkpoint(model_engine, args, epoch):
+    save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 1. LoRA Adapters 저장
+    # model_engine.module 은 PEFT 모델
+    model_engine.module.save_pretrained(save_path)
+    
+    # 2. Non-LoRA Trainable Weights 저장 (Mask Decoder 등)
+    print(f"Saving non-LoRA weights to {save_path}...")
+    non_lora_state = {}
+    for name, param in model_engine.module.named_parameters():
+        if param.requires_grad and "lora_" not in name:
+            non_lora_state[name] = param.cpu()
+            
+    torch.save(non_lora_state, os.path.join(save_path, "non_lora_trainables.bin"))
+    print("Save complete.")
 
 if __name__ == "__main__":
-    train()
+    main()

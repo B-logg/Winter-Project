@@ -1,58 +1,37 @@
 #!/bin/bash
 
-# ==========================================
-# [A100 8대 산림 특화 학습 설정]
-# ==========================================
+# [A100 산림 특화 학습 설정]
 
+# 프로젝트 루트
 PROJ_ROOT=~/Winter-Project
-# 병합된 데이터셋 경로
-DATA_PATH="$PROJ_ROOT/datasets/datasets/final_train.json"
-# 이미지 최상위 폴더
-IMAGE_FOLDER="$PROJ_ROOT/datasets/datasets"
-# 체크포인트 경로
-MODEL_PATH="$PROJ_ROOT/groundingLMM/checkpoints/GLaMM-GCG"
-# 결과 저장
-OUTPUT_DIR="$PROJ_ROOT/checkpoints/GLaMM-Forest-A100-v1"
 
+# 데이터셋 경로
+DATA_PATH="$PROJ_ROOT/datasets/datasets/train.json"
+IMAGE_FOLDER="$PROJ_ROOT/datasets/datasets"
+
+# 모델 체크포인트
+MODEL_PATH="$PROJ_ROOT/groundingLMM/checkpoints/GLaMM-GCG"
+# SAM 체크포인트 (GLaMM 모델 안에 있으면 자동 로드되지만 명시)
+VISION_PRETRAINED="$PROJ_ROOT/groundingLMM/checkpoints/sam_vit_h_4b8939.pth"
+
+# 결과 저장
+OUTPUT_DIR="$PROJ_ROOT/checkpoints/GLaMM-Forest-Weight"
+
+# GPU 설정
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONPATH="./:$PYTHONPATH"
 
 # DeepSpeed 실행
-deepspeed --num_gpus=8 train_glamm_forest.py \
-    --deepspeed ./scripts/zero2.json \
-    --model_name_or_path $MODEL_PATH \
-    --version v1 \
+deepspeed --num_gpus=8 train_glamm.py \
+    --version $MODEL_PATH \
     --dataset_path $DATA_PATH \
     --image_folder $IMAGE_FOLDER \
-    --vision_tower openai/clip-vit-large-patch14-336 \
-    --mm_projector_type mlp2x_gelu \
-    --tune_mm_mlp_adapter True \
-    --mm_vision_select_layer -2 \
-    --mm_use_im_start_end False \
-    --mm_use_im_patch_token False \
-    --image_aspect_ratio pad \
-    --group_by_modality_length True \
-    --bf16 True \
+    --vision_pretrained $VISION_PRETRAINED \
     --output_dir $OUTPUT_DIR \
-    --num_train_epochs 5 \
-    --per_device_train_batch_size 8 \
-    --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 1 \
-    --evaluation_strategy "no" \
-    --save_strategy "steps" \
-    --save_steps 200 \
-    --save_total_limit 3 \
-    --learning_rate 2e-4 \
-    --weight_decay 0.0 \
-    --warmup_ratio 0.03 \
-    --lr_scheduler_type "cosine" \
-    --logging_steps 1 \
-    --tf32 True \
-    --model_max_length 2048 \
-    --gradient_checkpointing True \
-    --dataloader_num_workers 8 \
-    --report_to tensorboard \
-    --use_qlora True \
-    --qlora_r 128 \
-    --qlora_alpha 256 \
-    --use_grounding True
+    --batch_size 2 \
+    --grad_accumulation_steps 1 \
+    --epochs 5 \
+    --lr 2e-4 \
+    --lora_r 128 \
+    --lora_alpha 256 \
+    --use_mm_start_end
