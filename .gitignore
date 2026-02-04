@@ -3,6 +3,15 @@ datasets/checkpoints/
 **/checkpoints/
 *.pth
 *.bin
+*.pt
+checkpoints/
+output/
+training_log.txt
+Miniconda3-latest-Linux-x86_64.sh
+datasets/
+data/
+*.json
+*.env
 
 AI_Hub
 NEON_dataset.csv
@@ -26,10 +35,15 @@ L3_Work_Dir/
 
 # 파이썬 및 시스템 캐시
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 .DS_Store
 .ipynb_checkpoints/
+
+glamm_env.tar.gz
+winter_project.tar.gz
+my_envs/
 
 # 실행 파일 및 환경 관련
 miniconda.exe
@@ -38,3 +52,4 @@ venv/
 
 .vscode
 
+Miniconda3-latest-Linux-x86_64.sh
