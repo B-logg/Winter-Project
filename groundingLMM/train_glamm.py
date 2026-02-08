@@ -9,6 +9,7 @@ import torch
 import argparse
 import deepspeed
 import numpy as np
+from transformers import CLIPImageProcessor
 import transformers
 from functools import partial
 from PIL import Image
@@ -133,8 +134,16 @@ def main():
     
     # 1. 토크나이저 설정
     tokenizer = transformers.AutoTokenizer.from_pretrained(
+
+
+
+
+
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
+    # [Fix] Force Context Length (Safe Insert)
+    tokenizer.model_max_length = 8192
+    print(f'Overriding tokenizer model_max_length to {tokenizer.model_max_length}')
     tokenizer.pad_token = tokenizer.unk_token
     
     # Special Tokens 추가 ([SEG], <bbox> 등)
@@ -241,7 +250,7 @@ def main():
         json_path=args.dataset_path,
         image_folder=args.image_folder,
         tokenizer=tokenizer,
-        image_processor=base_glamm.get_vision_tower().image_processor,
+        image_processor=CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336"),
         model_args=args
     )
     

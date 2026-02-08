@@ -1,37 +1,48 @@
 #!/bin/bash
 
-# [A100 산림 특화 학습 설정]
+# ==========================================
+# [A40 4대 전용] GLaMM Forest Custom Training
+# ==========================================
 
-# 프로젝트 루트
-PROJ_ROOT=~/Winter-Project
-
-# 데이터셋 경로
+# 1. 기본 경로 설정
+PROJ_ROOT=/shared/home/naislab/학부연구생/bosung/Winter-Project
 DATA_PATH="$PROJ_ROOT/datasets/datasets/train.json"
 IMAGE_FOLDER="$PROJ_ROOT/datasets/datasets"
-
-# 모델 체크포인트
 MODEL_PATH="$PROJ_ROOT/groundingLMM/checkpoints/GLaMM-GCG"
-# SAM 체크포인트 (GLaMM 모델 안에 있으면 자동 로드되지만 명시)
 VISION_PRETRAINED="$PROJ_ROOT/groundingLMM/checkpoints/sam_vit_h_4b8939.pth"
+OUTPUT_DIR="$PROJ_ROOT/checkpoints/GLaMM-Forest-A40-4GPU"
+mkdir -p $OUTPUT_DIR
 
-# 결과 저장
-OUTPUT_DIR="$PROJ_ROOT/checkpoints/GLaMM-Forest-Weight"
-
-# GPU 설정
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# 2. GPU 설정
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTHONPATH="./:$PYTHONPATH"
 
-# DeepSpeed 실행
-deepspeed --num_gpus=8 train_glamm.py \
+# 3. [핵심] 라이브러리 경로 강제 지정 (찾으신 경로 적용!)
+# -----------------------------------------------------------------------
+# 찾으신 cusparse 경로의 상위 폴더(lib)를 지정합니다.
+export LD_LIBRARY_PATH=/shared/home/naislab/학부연구생/bosung/my_envs/glamm/lib/python3.10/site-packages/nvidia/cusparse/lib:$LD_LIBRARY_PATH
+
+# PyTorch 및 기타 라이브러리 경로도 절대 경로로 지정
+export LD_LIBRARY_PATH=/shared/home/naislab/학부연구생/bosung/my_envs/glamm/lib/python3.10/site-packages/torch/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/shared/home/naislab/학부연구생/bosung/my_envs/glamm/lib:$LD_LIBRARY_PATH
+# -----------------------------------------------------------------------
+
+# 4. 학습 시작
+deepspeed --num_gpus=4 train_glamm.py \
     --version $MODEL_PATH \
     --dataset_path $DATA_PATH \
     --image_folder $IMAGE_FOLDER \
     --vision_pretrained $VISION_PRETRAINED \
     --output_dir $OUTPUT_DIR \
-    --batch_size 1 \
-    --grad_accumulation_steps 1 \
+    --batch_size 2 \
+    --grad_accumulation_steps 3 \
     --epochs 5 \
     --lr 2e-4 \
+    --workers 8 \
+    --print_freq 1 \
     --lora_r 128 \
     --lora_alpha 256 \
-    --use_mm_start_end
+    --lora_dropout 0.05 \
+    --vision_tower "openai/clip-vit-large-patch14-336" \
+    --use_mm_start_end \
+    --train_mask_decoder

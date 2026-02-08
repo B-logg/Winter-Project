@@ -76,8 +76,23 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images):
+        import torch
         image_features, image_forward_outs = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features.to(self.get_model().mm_projector[0].weight.device))
+        
+        # [Physical Device Binding]
+        curr_gpu = torch.cuda.current_device()
+        torch.cuda.set_device(curr_gpu) # 현재 프로세스의 기본 GPU 고정
+        
+        proj = self.get_model().mm_projector
+        target_dtype = next(proj.parameters()).dtype
+        
+        # 가중치와 데이터를 현재 GPU로 강제 집결
+        proj = proj.to(device=f'cuda:{curr_gpu}', dtype=target_dtype)
+        image_features = image_features.to(device=f'cuda:{curr_gpu}', dtype=target_dtype)
+        
+        # 연산 수행
+        image_features = proj(image_features)
+        
         return image_features, image_forward_outs
 
     def prepare_inputs_labels_for_multimodal(
@@ -141,7 +156,7 @@ class LlavaMetaForCausalLM(ABC):
                 cur_input_embeds = (
                     cur_input_embeds
                     + (
-                        0.0 * self.get_model().mm_projector(vision_tower.dummy_feature)
+                        0.0 * self.get_model().mm_projector(vision_tower.dummy_feature.to(device=self.get_model().mm_projector[0].weight.device, dtype=self.get_model().mm_projector[0].weight.dtype))
                     ).sum()
                 )
                 new_input_embeds.append(cur_input_embeds)
