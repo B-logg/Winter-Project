@@ -189,27 +189,23 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
     # Initializing lists
     image_path_list, global_enc_image_list, grounding_enc_image_list = [], [], []
     bboxes_list, conversation_list, masks_list = [], [], []
-    # label_list는 모델이 마스크 정보를 얻기 위해 사용하므로, 마스크를 담을 리스트로 활용합니다.
     resize_list, questions_list = [], [] 
     selected_labels_list, offset_list, inferences = [], [0], []
     cnt = 0
 
     for item in batch:
+        # ... (아이템 언패킹 로직은 기존과 동일) ...
         if isinstance(item, dict):
             image_path = item.get("image_path", item.get("file_name", None))
             global_enc_image = item.get("global_enc_images", item.get("global_enc_image", item.get("image", None)))
             grounding_enc_image = item.get("grounding_enc_images", item.get("grounding_enc_image", global_enc_image))
-            
             bboxes = item.get("bboxes", None)
             conversations = item.get("conversations", None)
             masks = item.get("masks", None)
-            # label = item.get("label", None) # <-- [삭제] 모델은 label_list를 마스크 shape 확인용으로 씁니다.
             resize = item.get("resize_list", item.get("resize", None))
             questions = item.get("questions", None)
             sampled_classes = item.get("sampled_classes", None)
-        # (Tuple unpacking 로직 생략 - Dict 기반이므로)
         else:
-             # Fallback logic if needed
              pass
 
         # 이미지 로드
@@ -222,14 +218,30 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         
         bboxes_list.append(bboxes)
         
+        # --- [Fix] 대화 리스트 확장 및 <image> 토큰 강제 삽입 ---
+        # 원본 데이터 훼손 방지를 위해 deepcopy 권장
         if isinstance(conversations, list):
-            conversation_list.extend(conversations)
+            # 복사본 생성
+            import copy
+            cur_convs = copy.deepcopy(conversations)
         else:
-            conversation_list.append(conversations)
+            cur_convs = copy.deepcopy([conversations])
 
-        # [마스크 처리]
-        # ForestDataset에서 이미 빈 텐서(0, 1024, 1024) 처리를 했으므로 그대로 담습니다.
-        # None 체크는 방어적으로 수행
+        # 첫 번째 턴에 <image> 토큰이 없으면 강제로 추가
+        if use_mm_start_end:
+            # 보통 DEFAULT_IMAGE_TOKEN은 '<image>'
+            if isinstance(cur_convs[0], dict):
+                if DEFAULT_IMAGE_TOKEN not in cur_convs[0]['value']:
+                    # "human" 턴의 맨 앞에 <image>\n 추가
+                    if cur_convs[0]['from'] == 'human':
+                        cur_convs[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + cur_convs[0]['value']
+            elif isinstance(cur_convs[0], str): # 혹시 문자열일 경우
+                if DEFAULT_IMAGE_TOKEN not in cur_convs[0]:
+                    cur_convs[0] = DEFAULT_IMAGE_TOKEN + '\n' + cur_convs[0]
+
+        conversation_list.extend(cur_convs)
+        # ----------------------------------------------------
+
         if masks is not None:
              masks_list.append(masks.float())
         else:
@@ -239,12 +251,12 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         questions_list.append(questions)
         selected_labels_list.append(sampled_classes)
         
-        conv_len = len(conversations) if isinstance(conversations, list) else 1
+        conv_len = len(cur_convs) # 수정된 conv 길이 사용
         cnt += conv_len
         offset_list.append(cnt)
         inferences.append(inference)
 
-    # 대화 처리 및 토큰화 로직 (기존과 동일)
+    # 대화 처리 (치환) - 기존 로직 유지
     if use_mm_start_end:
         replace_token = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
         new_conv_list = []
@@ -265,6 +277,7 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
                 new_conv_list.append(conv)
         conversation_list = new_conv_list
 
+    # 토큰화
     input_ids_list = []
     for prompt in conversation_list:
         prompt_str = _convert_conv_to_string(prompt)
@@ -291,7 +304,6 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
             targets = targets[:, :truncate_len]
             attention_masks = attention_masks[:, :truncate_len]
 
-    # [최종 반환] GLaMM.py의 model_forward 인자와 1:1 매핑
     return {
         "image_paths": image_path_list,
         "global_enc_images": torch.stack(global_enc_image_list, dim=0),
@@ -301,9 +313,8 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         "labels": targets,
         "attention_masks": attention_masks,
         
-        # [핵심] masks_list와 label_list에 동일한 마스크 리스트를 전달합니다.
         "masks_list": masks_list, 
-        "label_list": masks_list, # 모델 내부에서 label_list[i].shape를 호출하므로 필수
+        "label_list": masks_list, 
         
         "resize_list": resize_list if any(x is not None for x in resize_list) else None,
         "offset": torch.LongTensor(offset_list),
@@ -311,7 +322,6 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         "sampled_classes_list": selected_labels_list,
         "inference": inferences[0],
         "conversation_list": conversation_list,
-        # 호환성을 위해 추가
         "images": torch.stack(global_enc_image_list, dim=0) 
     }
 
