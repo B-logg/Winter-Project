@@ -14,7 +14,7 @@ OUTPUT_DIR="$PROJ_ROOT/checkpoints/GLaMM-Forest-A40-4GPU"
 mkdir -p $OUTPUT_DIR
 
 # 2. GPU 설정
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONPATH="./:$PYTHONPATH"
 
 # 3. [핵심] 라이브러리 경로 강제 지정 (찾으신 경로 적용!)
@@ -28,7 +28,7 @@ export LD_LIBRARY_PATH=/shared/home/naislab/학부연구생/bosung/my_envs/glamm
 # -----------------------------------------------------------------------
 
 # 4. 학습 시작
-deepspeed --num_gpus=4 train_glamm.py \
+deepspeed --num_gpus=2 train_glamm.py \
     --version $MODEL_PATH \
     --dataset_path $DATA_PATH \
     --image_folder $IMAGE_FOLDER \
@@ -36,7 +36,7 @@ deepspeed --num_gpus=4 train_glamm.py \
     --output_dir $OUTPUT_DIR \
     --batch_size 2 \
     --grad_accumulation_steps 3 \
-    --epochs 5 \
+    --epochs 6 \
     --lr 2e-4 \
     --workers 8 \
     --print_freq 1 \
