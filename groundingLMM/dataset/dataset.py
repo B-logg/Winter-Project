@@ -184,7 +184,6 @@ def _lazy_load_image(data, target_size=336):
     except: 
         return torch.zeros((3, target_size, target_size))
 
-
 def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=False, local_rank=-1):
     # Initializing lists
     image_path_list, global_enc_image_list, grounding_enc_image_list = [], [], []

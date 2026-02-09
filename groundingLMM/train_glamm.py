@@ -109,19 +109,15 @@ class ForestDataset(Dataset):
             print(f"Error loading image {image_path}: {e}")
             return self.__getitem__((idx + 1) % len(self))
 
-        # CLIP Image
         if self.image_processor:
             clip_image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
         else:
             clip_image = torch.zeros(3, 336, 336)
 
-        # SAM Image
         sam_image = self.preprocess_for_sam(image)
 
-        # Mask Processing
+        # --- [핵심 수정] 마스크 인스턴스 분리 로직 ---
         mask_path = item.get('mask_path', None)
-        
-        # 기본값: 빈 텐서 (Mask Count = 0)
         masks = torch.zeros((0, 1024, 1024)).float()
 
         if mask_path:
@@ -132,15 +128,33 @@ class ForestDataset(Dataset):
             for mp in mask_paths:
                 full_mp = os.path.join(self.image_folder, mp)
                 try:
+                    # 1. 마스크 로드 (Grayscale)
+                    # 파일에 1, 2, 3... 처럼 객체 ID가 들어있다고 가정
                     mask_np = cv2.imread(full_mp, 0)
                     if mask_np is None: continue
+                    
+                    # 2. 리사이즈 (Nearest Neighbor 필수! ID값 변형 방지)
                     mask_resized = cv2.resize(mask_np, (1024, 1024), interpolation=cv2.INTER_NEAREST)
-                    mask_tensor = torch.from_numpy(mask_resized).float() / 255.0
-                    mask_tensor = (mask_tensor > 0.5).float()
-                    mask_list.append(mask_tensor)
-                except Exception:
-                    pass
+                    
+                    # 3. 고유한 객체 ID 추출 (0은 배경이므로 제외)
+                    obj_ids = np.unique(mask_resized)
+                    obj_ids = obj_ids[obj_ids > 0] # 0보다 큰 값만 추출
+                    
+                    # 4. ID 별로 마스크 쪼개기
+                    if len(obj_ids) > 0:
+                        for obj_id in obj_ids:
+                            # 해당 ID만 1로 만들고 나머지는 0
+                            binary_mask = (mask_resized == obj_id).astype(np.float32)
+                            mask_tensor = torch.from_numpy(binary_mask)
+                            mask_list.append(mask_tensor)
+                    else:
+                        # 만약 0밖에 없다면(빈 마스크) 건너뜀
+                        pass
+
+                except Exception as e:
+                    print(f"Skipping mask: {e}")
             
+            # 5. 스택 (이제 [11, 1024, 1024] 처럼 객체 수만큼 쌓임)
             if len(mask_list) > 0:
                 masks = torch.stack(mask_list)
 
@@ -149,7 +163,7 @@ class ForestDataset(Dataset):
             'grounding_enc_images': sam_image,
             'conversations': [item['conversations']],
             'image_path': image_path,
-            'masks': masks, # 빈 텐서 또는 유효한 마스크 텐서
+            'masks': masks, 
             'region': item.get('bboxes', None),
             'resize_list': [orig_w, orig_h]
         }
