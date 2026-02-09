@@ -69,7 +69,7 @@ def parse_args():
 
     return parser.parse_args()
 
-# Custom Dataset Class (사용자 JSON 구조 맞춤)
+# Custom Dataset Class
 class ForestDataset(Dataset):
     def __init__(self, json_path, image_folder, tokenizer, image_processor, model_args):
         self.image_folder = image_folder
@@ -77,7 +77,6 @@ class ForestDataset(Dataset):
         self.image_processor = image_processor
         self.model_args = model_args
         
-        # [수정 1] SAM 전용 정규화 상수 정의 (이게 없으면 에러남)
         self.sam_mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
         self.sam_std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
         
@@ -88,30 +87,21 @@ class ForestDataset(Dataset):
         return len(self.data)
     
     def preprocess_for_sam(self, image):
-        """이미지를 SAM 입력 크기(1024)로 리사이즈 및 정규화"""
-        # 1. 1024x1024로 리사이즈
         img_res = image.resize((1024, 1024)) 
-        
-        # 2. Numpy -> Tensor
         img_np = np.array(img_res)
-        if img_np.ndim == 2: # Grayscale
+        if img_np.ndim == 2:
              img_np = np.stack([img_np]*3, axis=-1)
-        elif img_np.shape[2] == 4: # RGBA
+        elif img_np.shape[2] == 4:
              img_np = img_np[:, :, :3]
-             
-        # [H, W, C] -> [C, H, W]
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float()
-        
-        # 3. 정규화
         img_tensor = (img_tensor - self.sam_mean) / self.sam_std
         return img_tensor
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        
-        # 이미지 로드
         image_file = item['image']
         image_path = os.path.join(self.image_folder, image_file)
+        
         try:
             image = Image.open(image_path).convert('RGB')
             orig_w, orig_h = image.size
@@ -119,24 +109,24 @@ class ForestDataset(Dataset):
             print(f"Error loading image {image_path}: {e}")
             return self.__getitem__((idx + 1) % len(self))
 
-        # CLIP 용 이미지 전처리 (336x336)
+        # CLIP Image
         if self.image_processor:
             clip_image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
         else:
             clip_image = torch.zeros(3, 336, 336)
 
-        # SAM 용 이미지 전처리 (1024x1024)
+        # SAM Image
         sam_image = self.preprocess_for_sam(image)
 
-        # 마스크 처리
+        # Mask Processing
         mask_path = item.get('mask_path', None)
-        masks = None
+        
+        # 기본값: 빈 텐서 (Mask Count = 0)
+        masks = torch.zeros((0, 1024, 1024)).float()
 
         if mask_path:
-            if isinstance(mask_path, str):
-                mask_paths = [mask_path] # 변수명 오타 수정 (mask_paths)
-            else:
-                mask_paths = mask_path
+            if isinstance(mask_path, str): mask_paths = [mask_path]
+            else: mask_paths = mask_path
                 
             mask_list = []
             for mp in mask_paths:
@@ -144,32 +134,25 @@ class ForestDataset(Dataset):
                 try:
                     mask_np = cv2.imread(full_mp, 0)
                     if mask_np is None: continue
-                    
-                    # SAM 출력 크기에 맞춰 1024x1024로 리사이즈 (NEAREST)
                     mask_resized = cv2.resize(mask_np, (1024, 1024), interpolation=cv2.INTER_NEAREST)
-
-                    # 정규화(0, 1)
                     mask_tensor = torch.from_numpy(mask_resized).float() / 255.0
                     mask_tensor = (mask_tensor > 0.5).float()
                     mask_list.append(mask_tensor)
-
-                except Exception as e:
-                    print(f"Skipping mask: {e}")
+                except Exception:
+                    pass
             
             if len(mask_list) > 0:
-                masks = torch.stack(mask_list) # [N, 1024, 1024]
-        
-        # 결과 Dict 반환
+                masks = torch.stack(mask_list)
+
         return {
-            'image': clip_image,                  # CLIP (336)
-            'grounding_enc_images': sam_image,    # SAM (1024)
+            'image': clip_image,
+            'grounding_enc_images': sam_image,
             'conversations': [item['conversations']],
             'image_path': image_path,
-            'masks': masks,                       # [수정 2] 키 이름을 'mask_path' -> 'masks'로 변경 (중요!)
+            'masks': masks, # 빈 텐서 또는 유효한 마스크 텐서
             'region': item.get('bboxes', None),
             'resize_list': [orig_w, orig_h]
         }
-    
 # Main
 def find_target_linear_modules(model, exclude_keywords=[]):
     cls = torch.nn.Linear
