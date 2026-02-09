@@ -195,39 +195,30 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
 
     # Iterating through the batch
     for item in batch:
-        # 1. 아이템 언패킹 (Dict vs Tuple 대응)
         if isinstance(item, dict):
             image_path = item.get("image_path", item.get("file_name", None))
-            # CLIP용 이미지 (336)
             global_enc_image = item.get("global_enc_images", item.get("global_enc_image", item.get("image", None)))
-            # SAM용 이미지 (1024)
             grounding_enc_image = item.get("grounding_enc_images", item.get("grounding_enc_image", global_enc_image))
             
             bboxes = item.get("bboxes", None)
             conversations = item.get("conversations", None)
             masks = item.get("masks", None)
             label = item.get("label", None)
-            resize = item.get("resize_list", item.get("resize", None)) # resize_list 키 우선 확인
+            resize = item.get("resize_list", item.get("resize", None))
             questions = item.get("questions", None)
             sampled_classes = item.get("sampled_classes", None)
         elif len(item) == 5:
             image_path, global_enc_image, grounding_enc_image, bboxes, conversations = item
             masks = None; label = None; resize = None; questions = None; sampled_classes = None
         else:
-            # Legacy unpacking fallback
             try:
                 image_path, global_enc_image, grounding_enc_image, bboxes, conversations, masks, label, resize, questions, sampled_classes = item
             except ValueError:
                 print("Skipping corrupted batch item")
                 continue
 
-        # 2. 이미지 처리 및 스택 준비
-        # CLIP Image (336)
+        # 이미지 로드
         global_enc_image = _lazy_load_image(global_enc_image, 336)
-        
-        # Grounding Image (1024) - [중요]
-        # 만약 grounding_enc_image가 None이면 global_enc_image(336)를 1024로 늘려서라도 채워야 함
-        # 하지만 ForestDataset은 이미 1024 텐서를 보내주므로 _lazy_load_image가 그대로 통과시킴
         grounding_enc_image = _lazy_load_image(grounding_enc_image, 1024)
 
         image_path_list.append(image_path)
@@ -236,17 +227,16 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         
         bboxes_list.append(bboxes)
         
-        # 대화 리스트 확장
         if isinstance(conversations, list):
             conversation_list.extend(conversations)
         else:
             conversation_list.append(conversations)
 
-        # 마스크 처리 (List[Tensor])
-        # masks는 [N, 1024, 1024] Tensor일 수도 있고 None일 수도 있음
-        if masks is not None:
+        # [중요] 마스크 처리: None이면 빈 텐서(0, 1024, 1024)라도 넣어서 리스트 유지
+        if masks is not None and masks.numel() > 0:
              masks_list.append(masks.float())
         else:
+             # GLaMM 모델이 shape을 참조할 때 에러가 안 나도록 빈 텐서 추가
              masks_list.append(torch.zeros((0, 1024, 1024)).float())
 
         label_list.append(label)
@@ -254,14 +244,12 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         questions_list.append(questions)
         selected_labels_list.append(sampled_classes)
         
-        # Offset 계산 (대화 턴 수 누적)
-        # conversations가 중첩 리스트일 경우(여러 턴), 길이만큼 증가
         conv_len = len(conversations) if isinstance(conversations, list) else 1
         cnt += conv_len
         offset_list.append(cnt)
         inferences.append(inference)
 
-    # 3. 대화 텍스트 처리 (Image Token 치환)
+    # 대화 처리
     if use_mm_start_end:
         replace_token = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
         new_conv_list = []
@@ -282,7 +270,7 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
                 new_conv_list.append(conv)
         conversation_list = new_conv_list
 
-    # 4. 토큰화 (Tokenization)
+    # 토큰화
     input_ids_list = []
     for prompt in conversation_list:
         prompt_str = _convert_conv_to_string(prompt)
@@ -296,7 +284,7 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
     )
     attention_masks = input_ids.ne(tokenizer.pad_token_id)
 
-    # 5. 타겟(Labels) 생성
+    # 레이블 생성
     targets = input_ids.clone()
     conv_template = conversation_lib.default_conversation.copy()
     sep = conv_template.sep + conv_template.roles[1] + ": "
@@ -305,26 +293,23 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
     for conversation, target in zip(conversation_list, targets):
         _process_conversation(conversation, target, tokenizer, sep, sep2)
 
-    # 6. 추론 모드 대응 (Truncation)
     if not inferences[0]:
-        # 이미지 토큰(576개) 공간 확보를 위해 텍스트 길이 제한
         truncate_len = tokenizer.model_max_length - 576
         if input_ids.shape[1] > truncate_len:
             input_ids = input_ids[:, :truncate_len]
             targets = targets[:, :truncate_len]
             attention_masks = attention_masks[:, :truncate_len]
 
-    # 7. 최종 배치 딕셔너리 생성
-    # GLaMM 모델 forward 인자에 매핑됨
     return {
         "image_paths": image_path_list,
-        "global_enc_images": torch.stack(global_enc_image_list, dim=0),      # [B, 3, 336, 336]
-        "grounding_enc_images": torch.stack(grounding_enc_image_list, dim=0), # [B, 3, 1024, 1024]
+        "global_enc_images": torch.stack(global_enc_image_list, dim=0),
+        "grounding_enc_images": torch.stack(grounding_enc_image_list, dim=0),
         "bboxes": bboxes_list if any(x is not None for x in bboxes_list) else None,
         "input_ids": input_ids,
         "labels": targets,
         "attention_masks": attention_masks,
-        "masks_list": masks_list if any(x is not None and x.numel() > 0 for x in masks_list) else None,
+        "masks_list": masks_list, 
+        
         "label_list": label_list if any(x is not None for x in label_list) else None,
         "resize_list": resize_list if any(x is not None for x in resize_list) else None,
         "offset": torch.LongTensor(offset_list),
@@ -332,7 +317,6 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         "sampled_classes_list": selected_labels_list,
         "inference": inferences[0],
         "conversation_list": conversation_list,
-        # 호환성을 위해 추가 키 매핑
         "images": torch.stack(global_enc_image_list, dim=0) 
     }
 
