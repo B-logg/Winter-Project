@@ -240,7 +240,10 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
                 image_pe=self.model.grounding_encoder.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings, dense_prompt_embeddings=dense_embeddings,
                 multimask_output=False, )
-            orig_size = label_list[i].shape if not infer else label_list[i]
+            if not infer:
+                orig_size = label_list[i].shape[-2:]
+            else:
+                orig_size = label_list[i]
             # During inference, we have original size list in place of label list
             pred_mask = self.model.grounding_encoder.postprocess_masks(
                 low_res_masks, input_size=resize_list[i], original_size=orig_size, )
