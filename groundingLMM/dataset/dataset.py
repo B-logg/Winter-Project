@@ -4,6 +4,8 @@ import os
 from PIL import Image
 import numpy as np
 import torch
+import json
+import copy
 
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
@@ -19,7 +21,6 @@ from dataset.caption_datasets.GranD_ShortCaption_ds import GrandShortCaptionData
 from dataset.region_datasets.GranD_ReferringRegion_ds import GrandReferRegDataset
 from dataset.segm_datasets.GranD_ReferringSegm_ds import GrandReferSegmDataset
 from tools.utils import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
-
 
 
 def _convert_conv_to_string(conv):
@@ -101,7 +102,6 @@ class HybridCapDataset(HybridDatasetBase):
         datasets_config = {"CocoCap": CocoCapDataset,
                            "LLaVaInstruct": LLaVAInstructDataset,
                            "GrandCaptionDataset": GrandShortCaptionDataset,
-                           # Add other dataset mappings here
                            }
         super().__init__(
             dataset_dir, tokenizer, global_image_encoder, dataset, datasets_config, epoch_samples, batch_size,
@@ -119,7 +119,6 @@ class HybridRegDataset(HybridDatasetBase):
                            "VisGen_Reg": VisualGenomeRegDataset,
                            "Flickr_Reg": Flickr30kRegDataset,
                            "GrandRefer_Reg": GrandReferRegDataset,
-                           # Add other dataset mappings here
                            }
         super().__init__(
             dataset_dir, tokenizer, global_image_encoder, dataset, datasets_config, epoch_samples, batch_size,
@@ -143,7 +142,6 @@ class HybridSegDataset(HybridDatasetBase):
                            "GranDf_GCG": GranDfDataset,
                            "Flickr_GCG": Flickr30kGCGDataset,
                            "GrandRefer_Segm": GrandReferSegmDataset,
-                           # Add other dataset mappings here
                            }
         super().__init__(
             dataset_dir, tokenizer, global_image_encoder, dataset, datasets_config, epoch_samples, batch_size,
@@ -151,35 +149,44 @@ class HybridSegDataset(HybridDatasetBase):
         )
 
 
-
 def _lazy_load_image(data, target_size=336):
-    import torch
-    from PIL import Image
-    import os
-    import torchvision.transforms.functional as F
+    """
+    이미지 로드 및 전처리 헬퍼 함수
+    - Tensor인 경우 리사이즈
+    - Path인 경우 로드 후 전처리
+    - None인 경우 더미 텐서 반환
+    """
     if isinstance(data, torch.Tensor):
         if data.shape[-1] != target_size:
-            return F.resize(data, (target_size, target_size))
+            # 배치 차원이 없는 [C, H, W] 가정
+            return F.resize(data, (target_size, target_size), interpolation=transforms.InterpolationMode.BICUBIC)
         return data
+        
     img = None
     if isinstance(data, str):
-        base_root = '/shared/home/naislab/학부연구생/bosung/Winter-Project/datasets/datasets'
-        full_path = data if data.startswith('/') else os.path.join(base_root, data)
-        if os.path.exists(full_path):
-            try: img = Image.open(full_path).convert('RGB')
+        # [Fix] 절대 경로 처리를 위해 base_root는 상황에 맞게 수정 혹은 제거
+        if os.path.exists(data):
+            try: img = Image.open(data).convert('RGB')
             except: pass
     elif isinstance(data, Image.Image):
         img = data.convert('RGB')
-    if img is None: return torch.zeros((3, target_size, target_size))
+        
+    if img is None: 
+        return torch.zeros((3, target_size, target_size))
+        
     try:
-        img = img.resize((target_size, target_size))
+        # GLaMM/LLaVA 표준 전처리
+        img = img.resize((target_size, target_size), resample=Image.BICUBIC)
         tensor = F.to_tensor(img)
+        # CLIP Normalize Mean/Std
         tensor = F.normalize(tensor, mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
         return tensor
-    except: return torch.zeros((3, target_size, target_size))
+    except: 
+        return torch.zeros((3, target_size, target_size))
+
 
 def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=False, local_rank=-1):
-    # Initializing lists and counters
+    # Initializing lists
     image_path_list, global_enc_image_list, grounding_enc_image_list = [], [], []
     bboxes_list, conversation_list, masks_list = [], [], []
     label_list, resize_list, questions_list = [], [], []
@@ -188,56 +195,75 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
 
     # Iterating through the batch
     for item in batch:
-        # [Fix] 딕셔너리 형태 데이터 처리 (Key로 접근)
+        # 1. 아이템 언패킹 (Dict vs Tuple 대응)
         if isinstance(item, dict):
             image_path = item.get("image_path", item.get("file_name", None))
-            # 이미지가 들어올 곳을 찾음 (global_enc_image or image)
+            # CLIP용 이미지 (336)
             global_enc_image = item.get("global_enc_images", item.get("global_enc_image", item.get("image", None)))
+            # SAM용 이미지 (1024)
             grounding_enc_image = item.get("grounding_enc_images", item.get("grounding_enc_image", global_enc_image))
+            
             bboxes = item.get("bboxes", None)
             conversations = item.get("conversations", None)
             masks = item.get("masks", None)
             label = item.get("label", None)
-            resize = item.get("resize", None)
+            resize = item.get("resize_list", item.get("resize", None)) # resize_list 키 우선 확인
             questions = item.get("questions", None)
             sampled_classes = item.get("sampled_classes", None)
-        # 기존 튜플 형태 데이터 처리
         elif len(item) == 5:
             image_path, global_enc_image, grounding_enc_image, bboxes, conversations = item
             masks = None; label = None; resize = None; questions = None; sampled_classes = None
         else:
-            image_path, global_enc_image, grounding_enc_image, bboxes, conversations, masks, label, resize, questions, sampled_classes = item
+            # Legacy unpacking fallback
+            try:
+                image_path, global_enc_image, grounding_enc_image, bboxes, conversations, masks, label, resize, questions, sampled_classes = item
+            except ValueError:
+                print("Skipping corrupted batch item")
+                continue
 
-        # [Fix] 이미지 로딩 및 텐서 변환 보장
-        # global_enc_image가 문자열(경로)이면 로딩 시도
-        if True: # 무조건 변환 시도 (str/Image 모두)
-            global_enc_image = _lazy_load_image(global_enc_image, 336)
-        # 로딩 실패하거나 None인 경우 더미 이미지
-        if global_enc_image is None:
-            global_enc_image = torch.zeros((3, 336, 336))
-        # grounding 이미지도 없으면 global 이미지 복사
-        if grounding_enc_image is None or isinstance(grounding_enc_image, str):
-            grounding_enc_image = global_enc_image
+        # 2. 이미지 처리 및 스택 준비
+        # CLIP Image (336)
+        global_enc_image = _lazy_load_image(global_enc_image, 336)
+        
+        # Grounding Image (1024) - [중요]
+        # 만약 grounding_enc_image가 None이면 global_enc_image(336)를 1024로 늘려서라도 채워야 함
+        # 하지만 ForestDataset은 이미 1024 텐서를 보내주므로 _lazy_load_image가 그대로 통과시킴
+        grounding_enc_image = _lazy_load_image(grounding_enc_image, 1024)
 
         image_path_list.append(image_path)
         global_enc_image_list.append(global_enc_image)
-        # [Fix] Grounding 이미지 텐서 변환 (리스트 추가 직전)
-        grounding_enc_image = _lazy_load_image(grounding_enc_image, 1024)
         grounding_enc_image_list.append(grounding_enc_image)
+        
         bboxes_list.append(bboxes)
-        conversation_list.extend(conversations)
-        masks_list.append([] if masks is None else masks.float())
+        
+        # 대화 리스트 확장
+        if isinstance(conversations, list):
+            conversation_list.extend(conversations)
+        else:
+            conversation_list.append(conversations)
+
+        # 마스크 처리 (List[Tensor])
+        # masks는 [N, 1024, 1024] Tensor일 수도 있고 None일 수도 있음
+        if masks is not None:
+             masks_list.append(masks.float())
+        else:
+             masks_list.append(torch.zeros((0, 1024, 1024)).float())
+
         label_list.append(label)
         resize_list.append(resize)
         questions_list.append(questions)
         selected_labels_list.append(sampled_classes)
-        offset_list.append(cnt := cnt + len(conversations))
+        
+        # Offset 계산 (대화 턴 수 누적)
+        # conversations가 중첩 리스트일 경우(여러 턴), 길이만큼 증가
+        conv_len = len(conversations) if isinstance(conversations, list) else 1
+        cnt += conv_len
+        offset_list.append(cnt)
         inferences.append(inference)
 
-    # Handling the conversation list
+    # 3. 대화 텍스트 처리 (Image Token 치환)
     if use_mm_start_end:
         replace_token = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-        # [Fix] 대화 데이터가 리스트일 경우 내부 value 수정
         new_conv_list = []
         for conv in conversation_list:
             if isinstance(conv, str):
@@ -246,212 +272,137 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
                 new_turn_list = []
                 for turn in conv:
                     if isinstance(turn, dict) and "value" in turn:
-                        turn["value"] = turn["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
-                    new_turn_list.append(turn)
+                        turn_copy = copy.deepcopy(turn)
+                        turn_copy["value"] = turn["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
+                        new_turn_list.append(turn_copy)
+                    else:
+                        new_turn_list.append(turn)
                 new_conv_list.append(new_turn_list)
             else:
                 new_conv_list.append(conv)
         conversation_list = new_conv_list
 
-    # Tokenizing and padding input ids
+    # 4. 토큰화 (Tokenization)
+    input_ids_list = []
+    for prompt in conversation_list:
+        prompt_str = _convert_conv_to_string(prompt)
+        tokenized = tokenizer_image_token(prompt_str, tokenizer, return_tensors="pt")
+        input_ids_list.append(tokenized)
+        
     input_ids = torch.nn.utils.rnn.pad_sequence(
-        [tokenizer_image_token(_convert_conv_to_string(prompt), tokenizer, return_tensors="pt") for prompt in conversation_list],
-        batch_first=True, padding_value=tokenizer.pad_token_id
+        input_ids_list,
+        batch_first=True, 
+        padding_value=tokenizer.pad_token_id
     )
     attention_masks = input_ids.ne(tokenizer.pad_token_id)
 
-    # Preparing targets and handling conversation types
-    conv = conversation_lib.default_conversation.copy()
+    # 5. 타겟(Labels) 생성
     targets = input_ids.clone()
-    # conv_type == "llava_v1"
-    sep = conv.sep + conv.roles[1] + ": "
-    sep2 = conv.sep2
+    conv_template = conversation_lib.default_conversation.copy()
+    sep = conv_template.sep + conv_template.roles[1] + ": "
+    sep2 = conv_template.sep2
 
     for conversation, target in zip(conversation_list, targets):
         _process_conversation(conversation, target, tokenizer, sep, sep2)
 
-    # Adjusting for inferences
+    # 6. 추론 모드 대응 (Truncation)
     if not inferences[0]:
-        truncate_len = tokenizer.model_max_length - 575
+        # 이미지 토큰(576개) 공간 확보를 위해 텍스트 길이 제한
+        truncate_len = tokenizer.model_max_length - 576
         if input_ids.shape[1] > truncate_len:
-            input_ids, targets, attention_masks = map(
-                lambda x: x[:, :truncate_len], [input_ids, targets, attention_masks]
-                )
+            input_ids = input_ids[:, :truncate_len]
+            targets = targets[:, :truncate_len]
+            attention_masks = attention_masks[:, :truncate_len]
 
+    # 7. 최종 배치 딕셔너리 생성
+    # GLaMM 모델 forward 인자에 매핑됨
     return {
         "image_paths": image_path_list,
-        "global_enc_images": torch.stack(global_enc_image_list, dim=0),
-        "grounding_enc_images": None if grounding_enc_image_list[0] is None else torch.stack(grounding_enc_image_list, dim=0),
-        "bboxes": None if bboxes_list[0] is None else bboxes_list,
+        "global_enc_images": torch.stack(global_enc_image_list, dim=0),      # [B, 3, 336, 336]
+        "grounding_enc_images": torch.stack(grounding_enc_image_list, dim=0), # [B, 3, 1024, 1024]
+        "bboxes": bboxes_list if any(x is not None for x in bboxes_list) else None,
         "input_ids": input_ids,
         "labels": targets,
         "attention_masks": attention_masks,
-        "masks_list": None if masks_list[0] is None else masks_list,
-        "label_list": None if label_list[0] is None else label_list,
-        "resize_list": None if resize_list[0] is None else resize_list,
+        "masks_list": masks_list if any(x is not None and x.numel() > 0 for x in masks_list) else None,
+        "label_list": label_list if any(x is not None for x in label_list) else None,
+        "resize_list": resize_list if any(x is not None for x in resize_list) else None,
         "offset": torch.LongTensor(offset_list),
         "questions_list": questions_list,
         "sampled_classes_list": selected_labels_list,
         "inference": inferences[0],
         "conversation_list": conversation_list,
+        # 호환성을 위해 추가 키 매핑
+        "images": torch.stack(global_enc_image_list, dim=0) 
     }
 
 
 def _process_conversation(conversation, target, tokenizer, sep, sep2):
-    # [Config] 컨텍스트 길이 확장 (User Request: 2048 -> 8192)
-    if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 8192:
-        tokenizer.model_max_length = 8192
-    import torch
-    import json
-    try:
-        roles = {'human': conversation[0]['from'], 'gpt': conversation[1]['from']}
-    except:
-        roles = {'human': 'human', 'gpt': 'gpt'}
+    """
+    대화 내용을 기반으로 Masking된 Label(Target)을 생성하는 함수
+    - Human 발화: IGNORE_INDEX (-100)
+    - GPT 발화: Loss 계산
+    """
+    # 컨텍스트 길이 안전장치
+    if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 2048:
+        tokenizer.model_max_length = 2048 # 최소 2048 확보
+
+    roles = {"human": "human", "gpt": "gpt"}
+    # 대화 포맷에 따라 role 매핑
+    if isinstance(conversation, list) and len(conversation) > 0:
+        if "from" in conversation[0]:
+             roles = {"human": conversation[0]["from"], "gpt": conversation[1]["from"]}
+
+    # Human부터 시작하도록 조정
     source = conversation
-    if roles[source[0]['from']] != roles['human']:
+    if roles[source[0]["from"]] != roles["human"]:
         source = source[1:]
 
-    input_ids = []
-    targets = []
-    IGNORE_INDEX = -100
-
+    input_ids_list = []
+    targets_list = []
+    
+    # 순회하며 마스킹 처리
     for i, sentence in enumerate(source):
-        role = roles[sentence['from']]
-        val = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
-        if role == roles['human']:
-            input_ids.append(tokenizer.bos_token_id)
+        role = roles[sentence["from"]]
+        # 이미지 토큰 제거 후 텍스트만 추출
+        val = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, "").strip()
+        
+        if role == roles["human"]:
+            # [Human] -> Input에 포함, Label은 -100 (Loss 제외)
+            input_ids_list.append(tokenizer.bos_token_id)
             ids = tokenizer(val, add_special_tokens=False).input_ids
-            input_ids.extend(ids)
-            input_ids.append(sep)
-            targets.extend([IGNORE_INDEX] * (len(ids) + 2))
-        elif role == roles['gpt']:
+            input_ids_list.extend(ids)
+            # Separator 추가 (예: "User: Hello \n")
+            # sep이 문자열이 아니라 토큰 ID일 수도 있으므로 처리 필요하지만, 
+            # GLaMM 코드베이스에서는 보통 sep 문자열을 토크나이저로 처리하는 게 아니라
+            # 이미 처리된 ids 뒤에 붙이는 방식을 씀. 
+            # 여기서는 기존 로직 유지 (단, sep이 긴 문자열일 경우 주의)
+            # 안전하게 토큰화해서 붙이는 방식 권장:
+            sep_ids = tokenizer(sep, add_special_tokens=False).input_ids
+            input_ids_list.extend(sep_ids)
+            
+            # Target은 전체 길이만큼 -100
+            current_len = 1 + len(ids) + len(sep_ids) # bos + text + sep
+            targets_list.extend([IGNORE_INDEX] * current_len)
+            
+        elif role == roles["gpt"]:
+            # [GPT] -> Input에 포함, Label도 동일하게 설정
             ids = tokenizer(val, add_special_tokens=False).input_ids
-            input_ids.extend(ids)
-            input_ids.append(sep2)
-            targets.extend(ids)
-            targets.append(sep2)
+            input_ids_list.extend(ids)
+            
+            sep2_ids = tokenizer(sep2, add_special_tokens=False).input_ids
+            input_ids_list.extend(sep2_ids)
+            
+            targets_list.extend(ids)
+            targets_list.extend(sep2_ids)
 
-    # [Fix] 오직 정수(int)만 남기기 (문자열 제거)
-    input_ids = [x for x in input_ids if isinstance(x, int)]
-    targets = [x for x in targets if isinstance(x, int)]
-
-    if len(input_ids) > tokenizer.model_max_length:
-        input_ids = input_ids[:tokenizer.model_max_length]
-        targets = targets[:tokenizer.model_max_length]
-
-    return torch.tensor(input_ids, dtype=torch.long), torch.tensor(targets, dtype=torch.long)
-
-    import torch
-    import json
-    try:
-        roles = {'human': conversation[0]['from'], 'gpt': conversation[1]['from']}
-    except:
-        roles = {'human': 'human', 'gpt': 'gpt'}
-    source = conversation
-    if roles[source[0]['from']] != roles['human']:
-        source = source[1:]
-
-    input_ids = []
-    targets = []
-    IGNORE_INDEX = -100
-
-    for i, sentence in enumerate(source):
-        role = roles[sentence['from']]
-        val = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
-        if role == roles['human']:
-            input_ids.append(tokenizer.bos_token_id)
-            ids = tokenizer(val, add_special_tokens=False).input_ids
-            input_ids.extend(ids)
-            input_ids.append(sep)
-            targets.extend([IGNORE_INDEX] * (len(ids) + 2))
-        elif role == roles['gpt']:
-            ids = tokenizer(val, add_special_tokens=False).input_ids
-            input_ids.extend(ids)
-            input_ids.append(sep2)
-            targets.extend(ids)
-            targets.append(sep2)
-
-    if len(input_ids) > tokenizer.model_max_length:
-        input_ids = input_ids[:tokenizer.model_max_length]
-        targets = targets[:tokenizer.model_max_length]
-
-    return torch.tensor(input_ids, dtype=torch.long), torch.tensor(targets, dtype=torch.long)
-
-    try:
-        roles = {'human': conversation[0]['from'], 'gpt': conversation[1]['from']}
-    except:
-        roles = {'human': 'human', 'gpt': 'gpt'}
-    source = conversation
-    if roles[source[0]['from']] != roles['human']:
-        source = source[1:]
-
-    input_ids = []
-    targets = []
-    # IGNORE_INDEX는 보통 -100
-    IGNORE_INDEX = -100
-
-    for i, sentence in enumerate(source):
-        role = roles[sentence['from']]
-        val = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
-        if role == roles['human']:
-            input_ids.append(tokenizer.bos_token_id)
-            # 텍스트 토큰화 결과는 리스트로 변환
-            ids = tokenizer(val, add_special_tokens=False).input_ids
-            input_ids.extend(ids)
-            input_ids.append(sep)
-            targets.extend([IGNORE_INDEX] * (len(ids) + 2)) # bos + sep 포함
-        elif role == roles['gpt']:
-            ids = tokenizer(val, add_special_tokens=False).input_ids
-            input_ids.extend(ids)
-            input_ids.append(sep2)
-            targets.extend(ids)
-            targets.append(sep2)
-
-    # 길이 제한 (모델 max_length 초과 방지)
-    if len(input_ids) > tokenizer.model_max_length:
-        input_ids = input_ids[:tokenizer.model_max_length]
-        targets = targets[:tokenizer.model_max_length]
-
-    return torch.tensor(input_ids, dtype=torch.long), torch.tensor(targets, dtype=torch.long)
-
-    import json
-    import torch
-    try:
-        # 1. 데이터 위생 처리 (문자열이면 딕셔너리로 변환)
-        if isinstance(conversation, str):
-            conversation = json.loads(conversation)
-        if isinstance(conversation, list) and len(conversation) > 0 and isinstance(conversation[0], str):
-            conversation = [json.loads(c) for c in conversation]
-
-        # 2. 데이터 유효성 검사 (이상하면 기본값 사용)
-        if not isinstance(conversation, list) or len(conversation) < 2:
-            raise ValueError("Invalid conversation format")
-
-        # 3. 정상 처리 로직
-        roles = {"human": conversation[0]["from"], "gpt": conversation[1]["from"]}
-        source = conversation
-        if roles[source[0]["from"]] != roles["human"]:
-            source = source[1:]
-
-        input_ids = []
-        targets = []
-        for i, sentence in enumerate(source):
-            role = roles[sentence["from"]]
-            val = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, "").strip()
-            if role == roles["human"]:
-                input_ids.append(tokenizer.bos_token_id)
-                input_ids.extend(tokenizer(val, add_special_tokens=False).input_ids)
-                input_ids.append(sep)
-                targets.extend([IGNORE_INDEX] * (len(input_ids) - len(targets)))
-            elif role == roles["gpt"]:
-                tokenized = tokenizer(val, add_special_tokens=False).input_ids
-                input_ids.extend(tokenized)
-                input_ids.append(sep2)
-                targets.extend(tokenized)
-                targets.append(sep2)
-    except Exception as e:
-        # 4. 최후의 수단: 에러 시 더미 데이터 반환 (학습 중단 방지)
-        # print(f"Data Skip: {e}") # 로그 너무 많을까봐 주석 처리
-        return torch.tensor([1, 2]), torch.tensor([1, 2])
-
-    return torch.tensor(input_ids), torch.tensor(targets)
+    # Tensor에 값 할당 (길이 검증)
+    # target 텐서는 이미 input_ids와 같은 크기로 생성되어 넘어왔으므로
+    # 앞에서부터 차례대로 채워넣기 (padding 부분은 유지)
+    limit = min(len(targets_list), target.shape[0])
+    target[:limit] = torch.tensor(targets_list[:limit], dtype=torch.long)
+    
+    # Human 발화 부분이나 Padding 등은 이미 IGNORE_INDEX 처리가 필요할 수 있음
+    # 위 로직은 리스트를 새로 만들었으므로, 기존 target(padding 포함)의 유효 구간을 덮어쓰는 방식
+    
+    return target
