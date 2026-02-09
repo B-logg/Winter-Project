@@ -262,16 +262,34 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
         num_masks = 0
 
         if pred_masks:
-            # Iterate over batch and compute mask-related losses
             for batch_idx, pred_mask in enumerate(pred_masks):
-                if pred_mask.numel() > 0:  # Ensure pred_mask is not empty
+                if pred_mask.numel() > 0:  
                     gt_mask = masks_list[batch_idx]
-                    # Resize gt_mask to match pred_mask if needed
-                    if gt_mask.shape[0] != pred_mask.shape[0]:
-                        gt_mask = gt_mask[:pred_mask.shape[0]]
+                    
+                    # [핵심 수정 로직 시작] -----------------------------------------
+                    # 상황: 모델은 N개를 예측했는데, 정답은 1개밖에 없는 경우 (N > 1)
+                    if gt_mask.shape[0] == 1 and pred_mask.shape[0] > 1:
+                        # 해결: 예측된 N개의 마스크를 전부 더해서 하나로 합침 (Logical OR 연산 효과)
+                        # sigmoid 전이므로 단순히 더하면 안 되고, max를 취하거나 sum 후 처리해야 함.
+                        # 여기서는 가장 강한 예측값을 남기는 max 방식이 안전함.
+                        pred_mask = pred_mask.max(dim=0, keepdim=True)[0] 
+                        
+                        # (옵션) 혹은 sum을 쓸 수도 있음: pred_mask = pred_mask.sum(dim=0, keepdim=True)
+                        # 하지만 Logits 상태라 sum은 위험할 수 있으니 max 권장.
+                        
+                    # 반대 상황: 정답은 N개인데 모델이 1개만 예측한 경우 (거의 없음)
+                    elif gt_mask.shape[0] > 1 and pred_mask.shape[0] == 1:
+                         gt_mask = gt_mask.max(dim=0, keepdim=True)[0]
+                         
+                    # 그래도 개수가 안 맞으면 (예: 정답 3개 vs 예측 5개) -> 개수 맞춰서 자름 (기존 로직)
+                    elif gt_mask.shape[0] != pred_mask.shape[0]:
+                        min_len = min(gt_mask.shape[0], pred_mask.shape[0])
+                        gt_mask = gt_mask[:min_len]
+                        pred_mask = pred_mask[:min_len]
+                    # -----------------------------------------------------------
 
-                    assert gt_mask.shape[0] == pred_mask.shape[
-                        0], f"Shape mismatch: gt_mask {gt_mask.shape}, pred_mask {pred_mask.shape}"
+                    # 이제 shape이 [1, 1024, 1024]로 같아졌으니 에러 안 남!
+                    # assert gt_mask.shape[0] == pred_mask.shape[0] # (삭제하거나 주석 처리)
 
                     # Compute Binary Cross-Entropy Loss
                     mask_bce_loss += (compute_sigmoid_cross_entropy(pred_mask, gt_mask, mask_count=gt_mask.shape[0]) *
@@ -286,7 +304,6 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
         mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
         mask_loss = mask_bce_loss + mask_dice_loss
 
-        # Aggregate all loss components
         total_loss = ce_loss + mask_loss
         return {"loss": total_loss, "ce_loss": ce_loss, "mask_bce_loss": mask_bce_loss,
                 "mask_dice_loss": mask_dice_loss, "mask_loss": mask_loss, }
