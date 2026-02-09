@@ -345,15 +345,13 @@ def _process_conversation(conversation, target, tokenizer, sep, sep2):
     """
     # 컨텍스트 길이 안전장치
     if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 2048:
-        tokenizer.model_max_length = 2048 # 최소 2048 확보
+        tokenizer.model_max_length = 2048
 
     roles = {"human": "human", "gpt": "gpt"}
-    # 대화 포맷에 따라 role 매핑
     if isinstance(conversation, list) and len(conversation) > 0:
         if "from" in conversation[0]:
              roles = {"human": conversation[0]["from"], "gpt": conversation[1]["from"]}
 
-    # Human부터 시작하도록 조정
     source = conversation
     if roles[source[0]["from"]] != roles["human"]:
         source = source[1:]
@@ -361,48 +359,42 @@ def _process_conversation(conversation, target, tokenizer, sep, sep2):
     input_ids_list = []
     targets_list = []
     
-    # 순회하며 마스킹 처리
     for i, sentence in enumerate(source):
         role = roles[sentence["from"]]
-        # 이미지 토큰 제거 후 텍스트만 추출
         val = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, "").strip()
         
         if role == roles["human"]:
-            # [Human] -> Input에 포함, Label은 -100 (Loss 제외)
             input_ids_list.append(tokenizer.bos_token_id)
             ids = tokenizer(val, add_special_tokens=False).input_ids
             input_ids_list.extend(ids)
-            # Separator 추가 (예: "User: Hello \n")
-            # sep이 문자열이 아니라 토큰 ID일 수도 있으므로 처리 필요하지만, 
-            # GLaMM 코드베이스에서는 보통 sep 문자열을 토크나이저로 처리하는 게 아니라
-            # 이미 처리된 ids 뒤에 붙이는 방식을 씀. 
-            # 여기서는 기존 로직 유지 (단, sep이 긴 문자열일 경우 주의)
-            # 안전하게 토큰화해서 붙이는 방식 권장:
-            sep_ids = tokenizer(sep, add_special_tokens=False).input_ids
-            input_ids_list.extend(sep_ids)
             
-            # Target은 전체 길이만큼 -100
-            current_len = 1 + len(ids) + len(sep_ids) # bos + text + sep
+            # [안전장치] sep 토큰화
+            if sep is not None:
+                sep_ids = tokenizer(sep, add_special_tokens=False).input_ids
+                input_ids_list.extend(sep_ids)
+                current_len = 1 + len(ids) + len(sep_ids) 
+            else:
+                current_len = 1 + len(ids)
+            
             targets_list.extend([IGNORE_INDEX] * current_len)
             
         elif role == roles["gpt"]:
-            # [GPT] -> Input에 포함, Label도 동일하게 설정
             ids = tokenizer(val, add_special_tokens=False).input_ids
             input_ids_list.extend(ids)
             
-            sep2_ids = tokenizer(sep2, add_special_tokens=False).input_ids
-            input_ids_list.extend(sep2_ids)
-            
-            targets_list.extend(ids)
-            targets_list.extend(sep2_ids)
+            # [핵심 수정] sep2가 None인지 확인 후 처리
+            if sep2 is not None:
+                sep2_ids = tokenizer(sep2, add_special_tokens=False).input_ids
+                input_ids_list.extend(sep2_ids)
+                
+                targets_list.extend(ids)
+                targets_list.extend(sep2_ids)
+            else:
+                # sep2가 없으면 그냥 문장만 추가
+                targets_list.extend(ids)
 
-    # Tensor에 값 할당 (길이 검증)
-    # target 텐서는 이미 input_ids와 같은 크기로 생성되어 넘어왔으므로
-    # 앞에서부터 차례대로 채워넣기 (padding 부분은 유지)
+    # Tensor 할당 (길이 검증)
     limit = min(len(targets_list), target.shape[0])
     target[:limit] = torch.tensor(targets_list[:limit], dtype=torch.long)
-    
-    # Human 발화 부분이나 Padding 등은 이미 IGNORE_INDEX 처리가 필요할 수 있음
-    # 위 로직은 리스트를 새로 만들었으므로, 기존 target(padding 포함)의 유효 구간을 덮어쓰는 방식
     
     return target
