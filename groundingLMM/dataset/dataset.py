@@ -186,6 +186,8 @@ def _lazy_load_image(data, target_size=336):
 
 
 def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=False, local_rank=-1):
+    if local_rank == 0:
+        print("✅ [DEBUG] New Collate Function is RUNNING! (Masks check)")
     # Initializing lists
     image_path_list, global_enc_image_list, grounding_enc_image_list = [], [], []
     bboxes_list, conversation_list, masks_list = [], [], []
