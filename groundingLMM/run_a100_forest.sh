@@ -46,3 +46,6 @@ deepspeed --num_gpus=1 train_glamm.py \
     --vision_tower "openai/clip-vit-large-patch14-336" \
     --use_mm_start_end \
     --train_mask_decoder
+
+# nohup ./run_a100_forest.sh > log.txt 2>&1 &
+# tail -f log.txt

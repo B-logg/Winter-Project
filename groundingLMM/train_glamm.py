@@ -95,8 +95,13 @@ class ForestDataset(Dataset):
             return self.__getitem__((idx + 1) % len(self)) # 에러 시 다음 데이터 사용
 
         # 2. 전처리 (Processor)
-        # custom_collate_fn이 처리하기 쉽도록 raw dictionary 형태로 반환
-        # GLaMM의 custom_collate_fn은 아래 키들을 기대합니다.
+        if self.image_processor:
+            # CLIPImageProcessor는 픽셀 값을 정규화하고 텐서로 변환한다.
+            # return_tensor='pt'는 PyTorch 텐서를 반환하라는 의미이다.
+            # ['pixel_values'][0]을 통해 배치 차원을 제거하고 [3, H, W] 텐서를 가져온다.
+            processed_image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            processed_image = image
         
         # Conversations 처리
         sources = [item['conversations']]
@@ -111,7 +116,7 @@ class ForestDataset(Dataset):
         
         # 결과 Dict 반환
         return {
-            'image': image,
+            'image': processed_image,
             'conversations': sources,
             'image_path': image_path,
             'mask_path': mask_path,
