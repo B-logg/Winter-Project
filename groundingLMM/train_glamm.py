@@ -378,7 +378,7 @@ def main():
     global_step = 0
     
     # 실제 모델의 임베딩 크기를 확인 (이 값을 넘는 인덱스는 무조건 에러남)
-    final_vocab_size = model.get_input_embeddings().weight.shape[0]
+    final_vocab_size = len(tokenizer)
     print(f"🔒 Clamp limit set to vocab size: {final_vocab_size}")
 
     if args.local_rank == 0:
