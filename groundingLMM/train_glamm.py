@@ -386,25 +386,41 @@ def main():
         progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=(args.local_rank != 0))
         
         for step, batch in enumerate(progress):
+            # 1. 배치 로드
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Final Fix] 데이터 무결성 철통 방어 (Labels & Inputs)
+            # 🔥 [Final Fix] 불량 데이터(Bad Batch) 사전 차단 및 정화
             # =================================================================
-            
-            # 1. 정답지(Labels) 정화 (여기가 핵심!)
-            if 'labels' in batch:
-                # (1) -200을 -100(무시)으로 변경
-                batch['labels'][batch['labels'] == -200] = -100
-                
-                # (2) Vocab Size보다 큰 값 -> -100
-                batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
-                
-                # (3) [추가된 방어막] 음수인데 -100이 아닌 값(예: -1, -50) -> -100
-                # 이 값이 남아있으면 IndexKernel 에러가 터집니다!
-                batch['labels'][(batch['labels'] < 0) & (batch['labels'] != -100)] = -100
 
-            # 2. 데이터 길이 안전 절삭 (OOM 방지)
+            # [1] 이미지 토큰(-200) 누락 검사 -> 없으면 패스 (이게 핵심!)
+            # GLaMM 모델은 이미지 토큰이 없으면 마스크 계산에서 무조건 에러가 납니다.
+            if 'input_ids' in batch:
+                has_image_token = (batch['input_ids'] == -200).any()
+                if not has_image_token:
+                    # 로그에 경고 한 번 찍고 이번 스텝은 건너뜁니다.
+                    if args.local_rank == 0:
+                        print(f"⚠️ Step {step}: Skipping batch due to missing image token (-200).")
+                    del batch # 메모리 해제
+                    continue
+
+            # [2] 스마트 클램핑 (Smart Clamping)
+            # 이미지 토큰(-200)은 보호하고, 범위 밖의 쓰레기 값(32007 이상)은 잡습니다.
+            if 'input_ids' in batch:
+                is_image_token = (batch['input_ids'] == -200)
+                # 0 ~ Vocab Size로 강제 고정 (이때 -200은 0이 됨)
+                clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
+                # 아까 기억해둔 위치에 -200 복구
+                batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
+
+            # [3] 정답지(Labels) 정화
+            if 'labels' in batch:
+                # -200 -> -100 (무시)
+                batch['labels'][batch['labels'] == -200] = -100
+                # 이상한 값 방어
+                batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
+
+            # [4] 데이터 길이 안전 절삭 (OOM 방지)
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
@@ -415,23 +431,14 @@ def main():
                 elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
 
-            # 3. Segmentation Mask 무조건 재건축
+            # [5] Segmentation Mask 재계산
+            # 입력이 잘렸거나 변형되었으므로 마스크를 현재 상태에 맞춰 새로고침
             if 'input_ids' in batch and args.seg_token_idx is not None:
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
                 if new_seg_mask.any():
                     batch['seg_token_mask'] = new_seg_mask
-                    # (Offset 재계산은 에러 유발하므로 삭제됨)
                 else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
-
-            # 4. [스마트 클램핑] Input IDs 정화 (이미지 토큰 보호)
-            if 'input_ids' in batch:
-                # -200 보호
-                is_image_token = (batch['input_ids'] == -200)
-                # 나머지 값 강제 고정
-                clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
-                # 복구
-                batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             # =================================================================
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
