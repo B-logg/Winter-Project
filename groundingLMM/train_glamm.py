@@ -302,6 +302,12 @@ def main():
             # [중요] 버퍼 변환 (CUBLAS 에러 방지)
             for buffer in module.buffers():
                 buffer.data = buffer.data.to(torch.bfloat16)
+            
+    if hasattr(glamm_model, "grounding_encoder"):
+        prompt_encoder = glamm_model.grounding_encoder.prompt_encoder
+        if hasattr(prompt_encoder, "positional_encoding_gaussian_matrix"):
+            prompt_encoder.positional_encoding_gaussian_matrix = \
+                prompt_encoder.positional_encoding_gaussian_matrix.to(device=device, dtype=torch.bfloat16)
 
     # 4. LoRA 설정
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
