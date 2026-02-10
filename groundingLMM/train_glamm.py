@@ -389,7 +389,7 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 보정 (스마트 클램핑 적용!)
+            # 🔥 [Final Fix] 데이터 무결성 보정 (Offset 코드 삭제됨!)
             # =================================================================
             
             # 1. 정답지(Labels) 정화
@@ -397,7 +397,7 @@ def main():
                 batch['labels'][batch['labels'] == -200] = -100
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
 
-            # 2. 데이터 길이 안전 절삭 (OOM 방지)
+            # 2. 데이터 길이 안전 절삭
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
@@ -408,30 +408,23 @@ def main():
                 elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
 
-            # 3. [핵심] Segmentation Mask & Offset 재계산 
+            # 3. [핵심] Segmentation Mask 재계산 (Offset은 건드리지 않음!)
+            # 입력이 잘렸을 수 있으므로 마스크만 새로고침 합니다.
             if 'input_ids' in batch and args.seg_token_idx is not None:
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
                 if new_seg_mask.any():
                     batch['seg_token_mask'] = new_seg_mask
-                    seg_counts = new_seg_mask.long().sum(dim=1)
-                    new_offset = torch.cat([torch.zeros(1, device=device, dtype=torch.long), seg_counts.cumsum(0)])
-                    batch['offset'] = new_offset
+                    # ❌ [삭제됨] offset 재계산 코드는 에러를 유발하므로 삭제했습니다.
+                    # 기존 offset (배치 인덱스 [0, 1, ...])을 그대로 쓰면 됩니다.
                 else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
 
-            # 4. [🔥스마트 클램핑] 이게 없어서 터진겁니다! 반드시 포함하세요.
-            # 이미지 토큰(-200)은 보호하고, 쓰레기 값(Bad Batch)만 잡습니다.
-            # -------------------------------------------------------------------------
+            # 4. [🔥스마트 클램핑] 이미지 토큰(-200) 보호 + 쓰레기 값 제거
             if 'input_ids' in batch:
-                # (1) -200인 위치(이미지)를 미리 기억
                 is_image_token = (batch['input_ids'] == -200)
-                
-                # (2) 모든 값을 안전 범위(0~32006)로 강제 고정 (이때 -200은 0이 됨)
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
-                
-                # (3) 아까 기억해둔 위치에 다시 -200을 덮어씌워 복구
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
-            # -------------------------------------------------------------------------
+            # =================================================================
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
                 batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
