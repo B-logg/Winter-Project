@@ -180,16 +180,17 @@ def find_target_linear_modules(model, exclude_keywords=[]):
 
 def main():
     args = parse_args()
+
+    # 현재 프로세스의 GPU ID를 확실하게 설정
+    # DeepSpeed가 넘겨준 local_rank를 사용하여 현재 디바이스를 고정한다.
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device("cuda", args.local_rank)
     
     # 1. 토크나이저 설정
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-
-
-
-
-
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
+
     # [Fix] Force Context Length (Safe Insert)
     tokenizer.model_max_length = 8192
     print(f'Overriding tokenizer model_max_length to {tokenizer.model_max_length}')
@@ -238,6 +239,7 @@ def main():
         quantization_config=bnb_config,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
+        device_map = {"": args.local_rank}
         **model_kwargs
     )
     

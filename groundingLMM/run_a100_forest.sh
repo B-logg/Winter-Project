@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# ==========================================
-# [A40 4대 전용] GLaMM Forest Custom Training
-# ==========================================
 
 # 1. 기본 경로 설정
 PROJ_ROOT=/shared/home/naislab/학부연구생/bosung/Winter-Project
@@ -14,7 +11,7 @@ OUTPUT_DIR="$PROJ_ROOT/checkpoints/GLaMM-Forest-A40-4GPU"
 mkdir -p $OUTPUT_DIR
 
 # 2. GPU 설정
-export CUDA_VISIBLE_DEVICES=0, 1
+export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONPATH="./:$PYTHONPATH"
 
 # 3. [핵심] 라이브러리 경로 강제 지정 (찾으신 경로 적용!)
