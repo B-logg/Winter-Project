@@ -260,6 +260,8 @@ def main():
             if isinstance(module, list): module = module[0] # List인 경우
             for param in module.parameters():
                 param.data = param.data.to(torch.bfloat16)
+            for buffer in module.buffers():
+                buffer.data = buffer.data.to(torch.bfloat16)
 
     # 4. LoRA 설정
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
