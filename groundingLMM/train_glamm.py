@@ -177,6 +177,7 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
+    # 안전을 위해 max length를 config에서 읽어오거나 2048로 고정
     temp_config = transformers.AutoConfig.from_pretrained(args.version)
     max_pos_len = getattr(temp_config, "max_position_embeddings", 4096)
     tokenizer.model_max_length = max_pos_len
@@ -354,7 +355,7 @@ def main():
         }
     }
 
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구
+    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (DeepSpeed 초기화 직전)
     print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
     count_fixed = 0
     for name, module in model.named_modules():
@@ -375,7 +376,7 @@ def main():
     print("Starting Training Loop")
     global_step = 0
     
-    # [중요] Vocab Size 설정 (Clamp 제거했으므로 로깅용으로만 사용)
+    # Vocab Size 설정 (Clamp 제거했으므로 로깅용으로만 사용)
     final_vocab_size = len(tokenizer) 
 
     if args.local_rank == 0:
@@ -394,6 +395,7 @@ def main():
             
             # 1. 정답지(Labels) 정화
             if 'labels' in batch:
+                # -200 (이미지 토큰)을 -100 (무시)으로 변경하여 Loss 에러 방지
                 batch['labels'][batch['labels'] == -200] = -100
 
             # 2. 데이터 길이 안전 절삭
@@ -410,23 +412,24 @@ def main():
             # 3. [핵심] Segmentation Mask 및 Offset 재계산 
             # 입력이 잘리거나 변형되었으므로, seg_token_mask와 offset을 현재 상태에 맞게 다시 계산해야 함.
             if 'input_ids' in batch and args.seg_token_idx is not None:
-                # 3-1. 마스크 재생성
+                # 3-1. 마스크 재생성 (현재 배치 기준)
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
+                
                 if new_seg_mask.any():
                     batch['seg_token_mask'] = new_seg_mask
                     
-                    # 3-2. Offset 재계산 (이게 없어서 터졌던 겁니다!)
-                    # offset은 각 배치의 누적 토큰 개수를 의미합니다.
-                    # 현재 마스크된 토큰의 개수를 세서 offset을 다시 만듭니다.
+                    # 3-2. Offset 재계산 (이게 없어서 IndexError가 났던 것!)
+                    # 각 배치 내 [SEG] 토큰 개수의 누적합(cumsum)을 offset으로 사용
                     seg_counts = new_seg_mask.long().sum(dim=1)
+                    # offset은 [0, 첫번째_배치_개수, 첫+두번째_배치_개수 ...] 형태여야 함
                     new_offset = torch.cat([torch.zeros(1, device=device, dtype=torch.long), seg_counts.cumsum(0)])
                     batch['offset'] = new_offset
                 else:
-                    # 마스크가 없으면 관련 키 삭제
+                    # 마스크가 없으면 관련 키 삭제 (모델이 알아서 처리)
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
-                    # offset은 이미지 개수와 관련 있으므로 함부로 지우면 안 되지만, 
-                    # 마스크가 없으면 offset도 의미가 없어질 수 있음. (보통 유지)
+                    # offset은 유지하거나, 필요 시 빈 텐서로 교체할 수도 있지만, 보통 마스크 없으면 안 쓰임.
 
+            # ❌ [삭제됨] clamp 코드는 절대 다시 넣지 마세요! 이미지를 죽입니다.
             # =================================================================
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
