@@ -284,22 +284,31 @@ def main():
                 param.requires_grad = True
 
     # ==============================================================================
-    # 8. [🔥 진짜 수정됨] LoRA 및 학습 파라미터 강제 변환 (param.data 사용)
-    # module.to()를 쓰면 4-bit 모델에서 에러가 나거나 무시되므로, param.data를 직접 바꿉니다.
+    # 8. [🔥 Final Hybrid Casting] SAM은 .to() 사용, LLM은 .data 사용 (충돌 해결)
     # ==============================================================================
-    print("🚑 FORCE Casting: Converting LoRA params to BFloat16 via .data ...")
+    print("🚑 HYBRID Casting: Converting modules to BFloat16 intelligently...")
+    
+    # (1) SAM (Grounding Encoder)은 4-bit가 아니므로 .to()를 써서 확실하게 변환
+    if hasattr(base_glamm, "grounding_encoder"):
+        print(" -> Casting Grounding Encoder (SAM) to BFloat16...")
+        base_glamm.grounding_encoder.to(torch.bfloat16)
+
+    # (2) Projector 등 기타 모듈도 안전하게 .to() 사용
+    if hasattr(base_glamm, "mm_projector"):
+        base_glamm.mm_projector.to(torch.bfloat16)
+    if hasattr(base_glamm, "text_hidden_fcs"):
+        base_glamm.text_hidden_fcs.to(torch.bfloat16)
+        
+    # (3) [중요] 4-bit LLM에 붙은 LoRA 어댑터는 .to()를 쓰면 에러나므로 param.data로 변환
+    print(" -> Casting LLM LoRA Adapters manually...")
     count_casted = 0
     for name, param in model.named_parameters():
-        # LoRA 레이어거나 학습해야 하는 파라미터라면
-        if "lora_" in name or param.requires_grad:
-            # Float32라면 BFloat16으로 강제 변환
-            if param.dtype == torch.float32:
-                param.data = param.data.to(torch.bfloat16)
-                count_casted += 1
-    
-    print(f"✅ Successfully casted {count_casted} parameters to BFloat16.")
+        if param.requires_grad and param.dtype == torch.float32:
+            param.data = param.data.to(torch.bfloat16)
+            count_casted += 1
+    print(f" -> Manually casted {count_casted} remaining parameters.")
 
-    # 9. [SAM 안전장치] Gaussian Matrix는 FP32 유지
+    # (4) SAM Gaussian Matrix는 FP32 복구 (필수)
     count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
