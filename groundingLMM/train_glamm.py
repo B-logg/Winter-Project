@@ -182,7 +182,7 @@ def find_target_linear_modules(model, exclude_keywords=[]):
 def main():
     args = parse_args()
 
-    # 현재 프로세스의 GPU ID를 확실하게 설정
+    # GPU 설정
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     
@@ -190,10 +190,7 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
-
-    # [Fix] Force Context Length
     tokenizer.model_max_length = 8192
-    print(f'Overriding tokenizer model_max_length to {tokenizer.model_max_length}')
     tokenizer.pad_token = tokenizer.unk_token
     
     # Special Tokens 추가
@@ -206,6 +203,7 @@ def main():
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
     # 2. 모델 로드 및 4-bit 양자화
+    # [중요] embed_tokens와 lm_head를 4bit 압축에서 제외해야 리사이즈가 안전함
     skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
                     "text_hidden_fcs", "region_encoder", "lm_head", "embed_tokens"]
     
@@ -243,54 +241,49 @@ def main():
     )
 
     # =================================================================================
-    # 🔥 [핵심 수정] 강제 리사이즈 (Force Resize) 적용 🔥
-    # 함수 호출(model.resize_token_embeddings) 대신 직접 할당하여 씹힘 방지
+    # 🔥 [최종 수정] 임베딩 & 출력층(LM Head) 강제 리사이즈 🔥
     # =================================================================================
-    print(f"🔄 [Force Resize] Target Tokenizer Len: {len(tokenizer)}")
+    target_vocab_size = len(tokenizer)
+    print(f"🔄 [Resize Check] Tokenizer: {target_vocab_size}")
     
-    # 1. 모델 설정 강제 업데이트
-    model.config.vocab_size = len(tokenizer)
+    # 1. Config 업데이트
+    model.config.vocab_size = target_vocab_size
     if hasattr(model, "model") and hasattr(model.model, "config"):
-        model.model.config.vocab_size = len(tokenizer)
+        model.model.config.vocab_size = target_vocab_size
 
-    # 2. 임베딩 레이어 직접 확장
-    # GLaMM 구조상 model.model.embed_tokens에 위치함
-    current_embed = model.model.embed_tokens
-    if current_embed.weight.shape[0] != len(tokenizer):
-        print(f"   ↳ Expanding embedding from {current_embed.weight.shape[0]} to {len(tokenizer)}...")
-        
-        # 새 레이어 생성 (BF16)
-        new_embed = torch.nn.Embedding(len(tokenizer), current_embed.embedding_dim, padding_idx=current_embed.padding_idx)
+    # 2. Input Embeddings 확장
+    current_embed = model.get_input_embeddings()
+    if current_embed.weight.shape[0] != target_vocab_size:
+        print(f"   ↳ Extending Input Embeddings: {current_embed.weight.shape[0]} -> {target_vocab_size}")
+        new_embed = torch.nn.Embedding(target_vocab_size, current_embed.embedding_dim, padding_idx=current_embed.padding_idx)
         new_embed.to(device=device, dtype=torch.bfloat16)
-        
-        # 기존 가중치 복사 (매우 중요)
         with torch.no_grad():
             new_embed.weight[:current_embed.weight.shape[0]] = current_embed.weight
-            
-        # 모델에 갈아끼우기
-        model.model.embed_tokens = new_embed
-        
-        # LM Head도 확장 필요 (출력층)
-        current_head = model.lm_head
-        if current_head.out_features != len(tokenizer):
-            print(f"   ↳ Expanding LM Head from {current_head.out_features} to {len(tokenizer)}...")
-            new_head = torch.nn.Linear(current_head.in_features, len(tokenizer), bias=False)
-            new_head.to(device=device, dtype=torch.bfloat16)
-            with torch.no_grad():
-                new_head.weight[:current_head.out_features, :] = current_head.weight
-            model.lm_head = new_head
+        model.set_input_embeddings(new_embed)
 
-    print(f"✅ [Force Resize] Final Embed Size: {model.model.embed_tokens.weight.shape[0]}")
+    # 3. Output LM Head 확장 (이게 안 되어 있어서 Index 에러가 났을 것임)
+    current_head = model.get_output_embeddings()
+    if current_head.out_features != target_vocab_size:
+        print(f"   ↳ Extending LM Head: {current_head.out_features} -> {target_vocab_size}")
+        new_head = torch.nn.Linear(current_head.in_features, target_vocab_size, bias=False)
+        new_head.to(device=device, dtype=torch.bfloat16)
+        with torch.no_grad():
+            new_head.weight[:current_head.out_features, :] = current_head.weight
+        model.set_output_embeddings(new_head)
+
+    # 검증
+    print(f"✅ Final Input Embed: {model.get_input_embeddings().weight.shape}")
+    print(f"✅ Final Output Head: {model.get_output_embeddings().weight.shape}")
     # =================================================================================
     
-    # 3. 모델 전처리 (Q-LoRA & Casting)
+    # 3. 모델 전처리
     model = prepare_model_for_kbit_training(model)
     
-    # BF16 Casting for Full-Tuning Modules
+    # BF16 Casting (SAM Gaussian Matrix 보호 포함)
     glamm_model = model.model
     modules_to_cast = ["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     
-    print("Casting modules (Params & Buffers) to BF16...")
+    print("Casting modules to BF16 (keeping SAM Gaussian Matrix in FP32)...")
     for mod_name in modules_to_cast:
         if hasattr(glamm_model, mod_name):
             module = getattr(glamm_model, mod_name)
@@ -300,21 +293,12 @@ def main():
             for param in module.parameters():
                 param.data = param.data.to(torch.bfloat16)
             
-            # 버퍼 변환 (CUBLAS 에러 방지)
+            # [🔥핵심] Buffer 변환 시 Gaussian Matrix는 FP32 유지 (CUBLAS 에러 방지)
             for name, buffer in module.named_buffers():
                 if "positional_encoding_gaussian_matrix" in name:
-                    # 건드리지 않거나, 확실하게 FP32로 지정
                     buffer.data = buffer.data.to(torch.float32)
                 else:
                     buffer.data = buffer.data.to(torch.bfloat16)
-    
-    
-            
-    if hasattr(glamm_model, "grounding_encoder"):
-        prompt_encoder = glamm_model.grounding_encoder.prompt_encoder
-        if hasattr(prompt_encoder, "positional_encoding_gaussian_matrix"):
-            prompt_encoder.positional_encoding_gaussian_matrix = \
-                prompt_encoder.positional_encoding_gaussian_matrix.to(device=device, dtype=torch.bfloat16)
 
     # 4. LoRA 설정
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
@@ -334,7 +318,6 @@ def main():
 
     # 5. Full-Tuning 모듈 Unfreeze
     base_glamm = model.base_model.model.model
-    
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
         for param in mask_decoder.parameters(): param.requires_grad = True
@@ -401,21 +384,6 @@ def main():
             "allgather_bucket_size": 5e8
         }
     }
-
-    print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
-    count_fixed = 0
-    for name, module in model.named_modules():
-        if hasattr(module, "positional_encoding_gaussian_matrix"):
-            # 무조건 FP32로 강제 변환
-            module.positional_encoding_gaussian_matrix = \
-                module.positional_encoding_gaussian_matrix.to(device=device, dtype=torch.float32)
-            print(f"   💊 Fixed: {name} -> FP32")
-            count_fixed += 1
-            
-    if count_fixed == 0:
-        print("⚠️ 경고: Gaussian Matrix를 찾지 못했습니다! 에러가 날 수 있습니다.")
-    else:
-        print(f"✅ 총 {count_fixed}개의 행렬을 FP32로 복구했습니다.")
 
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
             model=model,
