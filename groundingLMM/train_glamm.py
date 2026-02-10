@@ -207,7 +207,7 @@ def main():
 
     # 2. 모델 로드 및 4-bit 양자화
     skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
-                    "text_hidden_fcs", "region_encoder", "lm_head"]
+                    "text_hidden_fcs", "region_encoder", "lm_head", "embed_tokens"]
     
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
