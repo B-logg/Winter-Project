@@ -182,7 +182,6 @@ def main():
     args = parse_args()
 
     # 현재 프로세스의 GPU ID를 확실하게 설정
-    # DeepSpeed가 넘겨준 local_rank를 사용하여 현재 디바이스를 고정한다.
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     
@@ -191,12 +190,12 @@ def main():
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
 
-    # [Fix] Force Context Length (Safe Insert)
+    # [Fix] Force Context Length
     tokenizer.model_max_length = 8192
     print(f'Overriding tokenizer model_max_length to {tokenizer.model_max_length}')
     tokenizer.pad_token = tokenizer.unk_token
     
-    # Special Tokens 추가 ([SEG], <bbox> 등)
+    # Special Tokens 추가
     special_tokens = ['[SEG]', '<bbox>', '<point>', '<p>', '</p>']
     if args.use_mm_start_end:
         special_tokens.extend([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN])
@@ -219,7 +218,6 @@ def main():
 
     print(f"Loading GLaMM from {args.version}...")
     
-    # GLaMM 모델 초기화에 필요한 인자들 딕셔너리로 준비
     model_kwargs = {
         "train_mask_decoder": args.train_mask_decoder,
         "out_dim": args.out_dim,
@@ -243,8 +241,46 @@ def main():
         **model_kwargs
     )
 
-    print(f"Resizing token embeddings to {len(tokenizer)}...")
-    model.resize_token_embeddings(len(tokenizer))
+    # =================================================================================
+    # 🔥 [핵심 수정] 강제 리사이즈 (Force Resize) 적용 🔥
+    # 함수 호출(model.resize_token_embeddings) 대신 직접 할당하여 씹힘 방지
+    # =================================================================================
+    print(f"🔄 [Force Resize] Target Tokenizer Len: {len(tokenizer)}")
+    
+    # 1. 모델 설정 강제 업데이트
+    model.config.vocab_size = len(tokenizer)
+    if hasattr(model, "model") and hasattr(model.model, "config"):
+        model.model.config.vocab_size = len(tokenizer)
+
+    # 2. 임베딩 레이어 직접 확장
+    # GLaMM 구조상 model.model.embed_tokens에 위치함
+    current_embed = model.model.embed_tokens
+    if current_embed.weight.shape[0] != len(tokenizer):
+        print(f"   ↳ Expanding embedding from {current_embed.weight.shape[0]} to {len(tokenizer)}...")
+        
+        # 새 레이어 생성 (BF16)
+        new_embed = torch.nn.Embedding(len(tokenizer), current_embed.embedding_dim, padding_idx=current_embed.padding_idx)
+        new_embed.to(device=device, dtype=torch.bfloat16)
+        
+        # 기존 가중치 복사 (매우 중요)
+        with torch.no_grad():
+            new_embed.weight[:current_embed.weight.shape[0]] = current_embed.weight
+            
+        # 모델에 갈아끼우기
+        model.model.embed_tokens = new_embed
+        
+        # LM Head도 확장 필요 (출력층)
+        current_head = model.lm_head
+        if current_head.out_features != len(tokenizer):
+            print(f"   ↳ Expanding LM Head from {current_head.out_features} to {len(tokenizer)}...")
+            new_head = torch.nn.Linear(current_head.in_features, len(tokenizer), bias=False)
+            new_head.to(device=device, dtype=torch.bfloat16)
+            with torch.no_grad():
+                new_head.weight[:current_head.out_features, :] = current_head.weight
+            model.lm_head = new_head
+
+    print(f"✅ [Force Resize] Final Embed Size: {model.model.embed_tokens.weight.shape[0]}")
+    # =================================================================================
     
     # 3. 모델 전처리 (Q-LoRA & Casting)
     model = prepare_model_for_kbit_training(model)
@@ -253,13 +289,17 @@ def main():
     glamm_model = model.model
     modules_to_cast = ["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     
-    print("Casting modules to BF16...")
+    print("Casting modules (Params & Buffers) to BF16...")
     for mod_name in modules_to_cast:
         if hasattr(glamm_model, mod_name):
             module = getattr(glamm_model, mod_name)
-            if isinstance(module, list): module = module[0] # List인 경우
+            if isinstance(module, list): module = module[0]
+            
+            # 파라미터 변환
             for param in module.parameters():
                 param.data = param.data.to(torch.bfloat16)
+            
+            # [중요] 버퍼 변환 (CUBLAS 에러 방지)
             for buffer in module.buffers():
                 buffer.data = buffer.data.to(torch.bfloat16)
 
@@ -280,23 +320,18 @@ def main():
     model = get_peft_model(model, lora_config)
 
     # 5. Full-Tuning 모듈 Unfreeze
-    # (Mask Decoder, Projectors 등)
     base_glamm = model.base_model.model.model
     
-    # Mask Decoder 해동
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
         for param in mask_decoder.parameters(): param.requires_grad = True
-        # Image Encoder는 얼림
         for param in base_glamm.grounding_encoder.image_encoder.parameters(): param.requires_grad = False
         
-    # Projectors 해동
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
             for param in getattr(base_glamm, mod_name).parameters():
                 param.requires_grad = True
 
-    # 학습 파라미터 출력
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable Params: {trainable_params:,}")
 
@@ -310,7 +345,6 @@ def main():
         model_args=args
     )
     
-    # Custom Collate Fn 사용
     collate_fn = partial(
         custom_collate_fn, 
         tokenizer=tokenizer, 
@@ -327,10 +361,6 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True
     )
-
-    # DeepSpeed 초기화
-    # DeepSpeed Config는 CLI에서 전달된 json 사용
-    # optimizer 파라미터 등은 ds_config에서 제어됨
 
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
@@ -369,7 +399,6 @@ def main():
     print("Starting Training Loop")
     global_step = 0
     
-    # Tensorboard
     if args.local_rank == 0:
         writer = SummaryWriter(args.output_dir)
     
@@ -378,63 +407,19 @@ def main():
         progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=(args.local_rank != 0))
         
         for step, batch in enumerate(progress):
-            # Cuda로 이동
             batch = dict_to_cuda(batch)
-
-            if step == 0:
-                print("\n" + "="*50)
-                print("🛑 [DEBUG] 임베딩 크기 vs 입력 데이터 검사")
-                
-                # 1. 모델의 실제 임베딩 크기 확인 (PEFT 등으로 감싸진 깊숙한 곳까지 확인)
-                try:
-                    # GLaMM 구조상 embed_tokens 위치 찾기
-                    if hasattr(model, "base_model"):
-                        embed_weight = model.base_model.model.model.embed_tokens.weight
-                    else:
-                        embed_weight = model.model.embed_tokens.weight
-                    
-                    vocab_size = embed_weight.shape[0]
-                    print(f"📊 모델의 임베딩 크기 (Vocab Size): {vocab_size}")
-                    print(f"   - 데이터 타입: {embed_weight.dtype}")
-                    print(f"   - 디바이스: {embed_weight.device}")
-                except Exception as e:
-                    print(f"⚠️ 임베딩 레이어 찾기 실패: {e}")
-                    vocab_size = 32000 # 기본값 가정
-
-                # 2. 입력 데이터(input_ids) 검사
-                input_ids = batch['input_ids']
-                max_id = input_ids.max().item()
-                min_id = input_ids.min().item()
-                
-                print(f"📥 입력 데이터(input_ids) 정보:")
-                print(f"   - Shape: {input_ids.shape}")
-                print(f"   - Max ID: {max_id}")
-                print(f"   - Min ID: {min_id}")
-
-                # 3. 충돌 여부 판정
-                if max_id >= vocab_size:
-                    print(f"🚨 [CRITICAL] 입력 ID({max_id})가 임베딩 크기({vocab_size})보다 큽니다! -> 이게 에러 원인입니다.")
-                elif min_id < 0:
-                     print(f"🚨 [CRITICAL] 음수 ID({min_id})가 발견되었습니다! (이미지 토큰 처리 오류 가능성)")
-                else:
-                    print("✅ 데이터 범위는 정상입니다.")
-                print("="*50 + "\n")
             
-            # BF16 변환 (이미지 등)
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
                 batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
             if "grounding_enc_images" in batch and batch["grounding_enc_images"] is not None:
                 batch["grounding_enc_images"] = batch["grounding_enc_images"].bfloat16()
                 
-            # Forward
             outputs = model_engine(**batch)
             loss = outputs['loss']
             
-            # Backward & Step
             model_engine.backward(loss)
             model_engine.step()
             
-            # Logging
             if args.local_rank == 0 and step % args.print_freq == 0:
                 current_lr = model_engine.get_lr()[0]
                 writer.add_scalar("Train/Loss", loss.item(), global_step)
@@ -444,7 +429,6 @@ def main():
                 
             global_step += 1
             
-        # Epoch 종료 후 저장
         if args.local_rank == 0:
             save_checkpoint(model_engine, args, epoch)
 
