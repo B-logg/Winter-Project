@@ -284,34 +284,28 @@ def main():
                 param.requires_grad = True
 
     # ==============================================================================
-    # 8. [🔥 강력 수정] LoRA 강제 변환 (모듈 단위로 접근)
-    # 기존 방식이 안 먹혀서, 모듈을 직접 찾아서 bfloat16()을 호출합니다.
+    # 8. [🔥 진짜 수정됨] LoRA 및 학습 파라미터 강제 변환 (param.data 사용)
+    # module.to()를 쓰면 4-bit 모델에서 에러가 나거나 무시되므로, param.data를 직접 바꿉니다.
     # ==============================================================================
-    print("🚑 FORCE Casting: Converting LoRA and trainable params to BFloat16...")
+    print("🚑 FORCE Casting: Converting LoRA params to BFloat16 via .data ...")
+    count_casted = 0
+    for name, param in model.named_parameters():
+        # LoRA 레이어거나 학습해야 하는 파라미터라면
+        if "lora_" in name or param.requires_grad:
+            # Float32라면 BFloat16으로 강제 변환
+            if param.dtype == torch.float32:
+                param.data = param.data.to(torch.bfloat16)
+                count_casted += 1
     
-    # 1) 전체 모델에서 학습 가능한 파라미터만 골라서 강제 변환
-    for name, module in model.named_modules():
-        # LoRA 레이어거나, 학습해야 하는 Linear 레이어인 경우
-        if "lora_" in name or any(p.requires_grad for p in module.parameters()):
-            module.to(torch.bfloat16)
-            
-    # 2) 혹시 모르니 파라미터 단위로 한 번 더 확인사살
-    for param in model.parameters():
-        if param.requires_grad and param.dtype != torch.bfloat16:
-            param.data = param.data.to(torch.bfloat16)
+    print(f"✅ Successfully casted {count_casted} parameters to BFloat16.")
 
-    # 3) [중요] SAM Gaussian Matrix는 무조건 FP32 유지 (이거 바뀌면 큰일 남)
+    # 9. [SAM 안전장치] Gaussian Matrix는 FP32 유지
     count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
             module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(torch.float32)
             count_reset += 1
     print(f"✅ Reset {count_reset} Gaussian matrices to FP32.")
-    
-    # 4) 검증: 실제로 바뀌었는지 출력
-    trainable_dtypes = [p.dtype for p in model.parameters() if p.requires_grad]
-    if len(trainable_dtypes) > 0:
-        print(f"🧐 Check Trainable Dtypes: {set(trainable_dtypes)}") # {torch.bfloat16} 만 나와야 함
     # ==============================================================================
 
     # 9. 데이터셋 로드
