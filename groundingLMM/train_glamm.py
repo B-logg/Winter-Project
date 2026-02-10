@@ -380,6 +380,45 @@ def main():
         for step, batch in enumerate(progress):
             # Cuda로 이동
             batch = dict_to_cuda(batch)
+
+            if step == 0:
+                print("\n" + "="*50)
+                print("🛑 [DEBUG] 임베딩 크기 vs 입력 데이터 검사")
+                
+                # 1. 모델의 실제 임베딩 크기 확인 (PEFT 등으로 감싸진 깊숙한 곳까지 확인)
+                try:
+                    # GLaMM 구조상 embed_tokens 위치 찾기
+                    if hasattr(model, "base_model"):
+                        embed_weight = model.base_model.model.model.embed_tokens.weight
+                    else:
+                        embed_weight = model.model.embed_tokens.weight
+                    
+                    vocab_size = embed_weight.shape[0]
+                    print(f"📊 모델의 임베딩 크기 (Vocab Size): {vocab_size}")
+                    print(f"   - 데이터 타입: {embed_weight.dtype}")
+                    print(f"   - 디바이스: {embed_weight.device}")
+                except Exception as e:
+                    print(f"⚠️ 임베딩 레이어 찾기 실패: {e}")
+                    vocab_size = 32000 # 기본값 가정
+
+                # 2. 입력 데이터(input_ids) 검사
+                input_ids = batch['input_ids']
+                max_id = input_ids.max().item()
+                min_id = input_ids.min().item()
+                
+                print(f"📥 입력 데이터(input_ids) 정보:")
+                print(f"   - Shape: {input_ids.shape}")
+                print(f"   - Max ID: {max_id}")
+                print(f"   - Min ID: {min_id}")
+
+                # 3. 충돌 여부 판정
+                if max_id >= vocab_size:
+                    print(f"🚨 [CRITICAL] 입력 ID({max_id})가 임베딩 크기({vocab_size})보다 큽니다! -> 이게 에러 원인입니다.")
+                elif min_id < 0:
+                     print(f"🚨 [CRITICAL] 음수 ID({min_id})가 발견되었습니다! (이미지 토큰 처리 오류 가능성)")
+                else:
+                    print("✅ 데이터 범위는 정상입니다.")
+                print("="*50 + "\n")
             
             # BF16 변환 (이미지 등)
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
