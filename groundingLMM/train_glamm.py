@@ -252,10 +252,11 @@ def main():
             new_head.weight[:n_copy, :] = current_head.weight[:n_copy, :]
         model.set_output_embeddings(new_head)
     
-    # 5. 모델 전처리 & Casting
+    # 5. 모델 전처리
     model = prepare_model_for_kbit_training(model)
 
     # 6. LoRA 설정
+    # 주의: 여기서 grounding_encoder를 exclude 해도 가끔 PEFT가 못 거를 때가 있음.
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     target_modules = find_target_linear_modules(model, exclude_keywords)
     
@@ -271,7 +272,7 @@ def main():
     
     model = get_peft_model(model, lora_config)
 
-    # 7. Unfreeze
+    # 7. Unfreeze (SAM Mask Decoder 학습 풀기)
     base_glamm = model.base_model.model.model
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
@@ -284,31 +285,38 @@ def main():
                 param.requires_grad = True
 
     # ==============================================================================
-    # 8. [🔥 Final Hybrid Casting] SAM은 .to() 사용, LLM은 .data 사용 (충돌 해결)
+    # 8. [🔥 Pinpoint Casting] SAM 모듈과 LoRA 어댑터만 콕 집어서 BF16 변환
+    # (전체 모델 .to()는 4bit 때문에 안 되지만, 부분 모듈 .to()는 됩니다!)
     # ==============================================================================
-    print("🚑 HYBRID Casting: Converting modules to BFloat16 intelligently...")
+    print("🚑 Pinpoint Casting: Force converting SAM and LoRA modules to BFloat16...")
     
-    # (1) SAM (Grounding Encoder)은 4-bit가 아니므로 .to()를 써서 확실하게 변환
+    # (1) SAM (Grounding Encoder) - 4bit 아님. 안전하게 변환 가능.
+    # 여기가 FP32로 남아있어서 LoRA랑 충돌난 것임.
     if hasattr(base_glamm, "grounding_encoder"):
-        print(" -> Casting Grounding Encoder (SAM) to BFloat16...")
+        print(" -> Casting Grounding Encoder (SAM) to BF16...")
         base_glamm.grounding_encoder.to(torch.bfloat16)
 
-    # (2) Projector 등 기타 모듈도 안전하게 .to() 사용
+    # (2) Projector & FCs
     if hasattr(base_glamm, "mm_projector"):
         base_glamm.mm_projector.to(torch.bfloat16)
     if hasattr(base_glamm, "text_hidden_fcs"):
         base_glamm.text_hidden_fcs.to(torch.bfloat16)
         
-    # (3) [중요] 4-bit LLM에 붙은 LoRA 어댑터는 .to()를 쓰면 에러나므로 param.data로 변환
-    print(" -> Casting LLM LoRA Adapters manually...")
-    count_casted = 0
-    for name, param in model.named_parameters():
-        if param.requires_grad and param.dtype == torch.float32:
-            param.data = param.data.to(torch.bfloat16)
-            count_casted += 1
-    print(f" -> Manually casted {count_casted} remaining parameters.")
+    # (3) 모든 LoRA 레이어 찾아서 강제 변환
+    # PEFT 모델 구조상 named_modules()로 돌면서 lora가 포함된 애들만 바꾸면 안전함.
+    print(" -> Scanning for LoRA layers to cast...")
+    cast_count = 0
+    for name, module in model.named_modules():
+        if "lora_" in name or "Lora" in module.__class__.__name__:
+            # 4bit Linear에 붙은 LoRA도 모듈 자체는 FP32/BF16임.
+            try:
+                module.to(torch.bfloat16)
+                cast_count += 1
+            except:
+                pass 
+    print(f" -> Casted {cast_count} LoRA modules.")
 
-    # (4) SAM Gaussian Matrix는 FP32 복구 (필수)
+    # (4) SAM Gaussian Matrix는 FP32 복구 (필수 안전장치)
     count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
@@ -378,7 +386,7 @@ def main():
             config=ds_config
         )
     
-    # 11. 학습 루프 (스마트 클램핑 + Offset 초기화 포함)
+    # 11. 학습 루프
     print("Starting Training Loop")
     global_step = 0
     final_vocab_size = len(tokenizer) 
