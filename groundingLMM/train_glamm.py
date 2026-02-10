@@ -391,43 +391,44 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 보정 (모든 배치에 무조건 적용)
+            # 🔥 [Final Fix] 데이터 무결성 보정
             # =================================================================
             
-            # 1. 정답지(Labels) 정화 (-200 -> -100)
+            # 1. 정답지(Labels) 정화 (필수!)
+            # labels에 있는 -200(이미지 토큰)은 Loss 계산 시 에러를 유발하므로 -100(무시)으로 변경
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
-                # 안전장치: 범위를 벗어나는 라벨도 -100으로 처리
+                
+                # (옵션) 혹시 모를 범위 초과 라벨 방어
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
 
             # 2. 데이터 길이 안전 절삭 (필요시)
-            # 텍스트가 너무 길면 이미지가 들어갈 자리가 없으므로 자릅니다.
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
-                # print(f"✂️ Truncating: {batch['input_ids'].shape[1]} -> {safe_max_len}")
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
+                
                 if 'labels' in batch:
                     batch['labels'] = batch['labels'][:, :safe_max_len]
-                if 'attention_mask' in batch:
+                
+                # Custom Collate Fn이 attention_masks(복수형)로 줄 수도 있고 아닐 수도 있음
+                # 배치 딕셔너리에 있는 키를 확인하고 자름
+                if 'attention_masks' in batch:
+                    batch['attention_masks'] = batch['attention_masks'][:, :safe_max_len]
+                elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
 
             # 3. [핵심] Segmentation Mask 무조건 재건축 
-            # 기존 마스크를 믿지 말고, 현재 input_ids를 기반으로 새로 만듭니다.
+            # 입력 길이가 잘렸거나 변형되었을 수 있으므로, 현재 input_ids에 맞춰 마스크를 다시 생성
             if 'input_ids' in batch and args.seg_token_idx is not None:
-                # 현재 배치된 input_ids에서 [SEG] 토큰 위치를 찾습니다.
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
-                
-                # 하나라도 있으면 마스크 업데이트
                 if new_seg_mask.any():
                     batch['seg_token_mask'] = new_seg_mask
                 else:
-                    # 없으면 키 삭제 (모델 내부 로직에 맡김)
                     if 'seg_token_mask' in batch:
                         del batch['seg_token_mask']
 
-            # 4. 값 범위 고정 (Clamp) - Index Error 원천 봉쇄
-            if 'input_ids' in batch:
-                batch['input_ids'] = batch['input_ids'].clamp(0, final_vocab_size - 1)
+            # ❌ [삭제] batch['input_ids'].clamp(...) 
+            # 이 코드가 이미지 토큰(-200)을 0으로 만들어버려서 에러가 났던 것입니다. 삭제합니다!
             # =================================================================
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
