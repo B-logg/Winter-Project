@@ -300,12 +300,12 @@ def main():
                 param.requires_grad = True
 
     # ==============================================================================
-    # 8. [Missed Step Fix] LoRA 어댑터 및 학습 파라미터 자료형 변환 (필수!)
+    # 8. [🔥 이 부분이 빠져있었습니다!] LoRA 어댑터 자료형 변환 (필수)
+    # LoRA는 기본적으로 Float32로 생성되므로, BFloat16으로 바꿔줘야 에러가 안 납니다.
     # ==============================================================================
     print("🚑 Final Type Casting: Converting all trainable params to BFloat16...")
     for param in model.parameters():
         if param.requires_grad:
-            # LoRA 가중치(Float32)를 강제로 BFloat16으로 변환하여 에러 해결
             param.data = param.data.to(torch.bfloat16)
             
     # SAM Gaussian Matrix는 FP32 유지 (안전장치)
