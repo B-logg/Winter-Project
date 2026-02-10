@@ -375,7 +375,7 @@ def main():
     print("Starting Training Loop")
     global_step = 0
     
-    # Vocab Size 설정 (스마트 클램핑용)
+    # 안전장치용 Vocab Size
     final_vocab_size = len(tokenizer) 
 
     if args.local_rank == 0:
@@ -389,15 +389,22 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 보정 (Offset 코드 삭제됨!)
+            # 🔥 [Final Final Fix] 데이터 무결성 철통 방어 (Labels & Inputs)
             # =================================================================
             
-            # 1. 정답지(Labels) 정화
+            # 1. 정답지(Labels) 정화 (여기가 핵심!)
             if 'labels' in batch:
+                # (1) -200을 -100(무시)으로 변경
                 batch['labels'][batch['labels'] == -200] = -100
+                
+                # (2) Vocab Size보다 큰 값 -> -100
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
+                
+                # (3) [추가된 방어막] 음수인데 -100이 아닌 값(예: -1, -50) -> -100
+                # 이 값이 남아있으면 IndexKernel 에러가 터집니다!
+                batch['labels'][(batch['labels'] < 0) & (batch['labels'] != -100)] = -100
 
-            # 2. 데이터 길이 안전 절삭
+            # 2. 데이터 길이 안전 절삭 (OOM 방지)
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
@@ -408,21 +415,22 @@ def main():
                 elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
 
-            # 3. [핵심] Segmentation Mask 재계산 (Offset은 건드리지 않음!)
-            # 입력이 잘렸을 수 있으므로 마스크만 새로고침 합니다.
+            # 3. Segmentation Mask 무조건 재건축
             if 'input_ids' in batch and args.seg_token_idx is not None:
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
                 if new_seg_mask.any():
                     batch['seg_token_mask'] = new_seg_mask
-                    # ❌ [삭제됨] offset 재계산 코드는 에러를 유발하므로 삭제했습니다.
-                    # 기존 offset (배치 인덱스 [0, 1, ...])을 그대로 쓰면 됩니다.
+                    # (Offset 재계산은 에러 유발하므로 삭제됨)
                 else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
 
-            # 4. [🔥스마트 클램핑] 이미지 토큰(-200) 보호 + 쓰레기 값 제거
+            # 4. [스마트 클램핑] Input IDs 정화 (이미지 토큰 보호)
             if 'input_ids' in batch:
+                # -200 보호
                 is_image_token = (batch['input_ids'] == -200)
+                # 나머지 값 강제 고정
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
+                # 복구
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             # =================================================================
             
