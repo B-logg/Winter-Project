@@ -69,26 +69,6 @@ def parse_args():
 
     return parser.parse_args()
 
-def force_cast_gaussian_matrix(model, device):
-    """
-    SAM 모델 깊숙이 숨어있는 positional_encoding_gaussian_matrix를 찾아내서
-    강제로 BF16으로 변환하는 함수 (재귀 탐색)
-    """
-    print("🔍 Searching for 'positional_encoding_gaussian_matrix' to cast...")
-    count = 0
-    for name, module in model.named_modules():
-        if hasattr(module, "positional_encoding_gaussian_matrix"):
-            target = module.positional_encoding_gaussian_matrix
-            if isinstance(target, torch.Tensor):
-                # 강제 변환 및 재할당
-                module.positional_encoding_gaussian_matrix = target.to(device=device, dtype=torch.bfloat16)
-                print(f"   ✅ Casted: {name}.positional_encoding_gaussian_matrix -> {module.positional_encoding_gaussian_matrix.dtype}")
-                count += 1
-    
-    if count == 0:
-        print("⚠️ Warning: Gaussian Matrix를 찾지 못했습니다! 에러가 날 수 있습니다.")
-    else:
-        print(f"🎉 Total {count} matrices casted to BF16.")
 
 # Custom Dataset Class
 class ForestDataset(Dataset):
@@ -320,11 +300,15 @@ def main():
             for param in module.parameters():
                 param.data = param.data.to(torch.bfloat16)
             
-            # [중요] 버퍼 변환 (CUBLAS 에러 방지)
-            for buffer in module.buffers():
-                buffer.data = buffer.data.to(torch.bfloat16)
+            # 버퍼 변환 (CUBLAS 에러 방지)
+            for name, buffer in module.named_buffers():
+                if "positional_encoding_gaussian_matrix" in name:
+                    # 건드리지 않거나, 확실하게 FP32로 지정
+                    buffer.data = buffer.data.to(torch.float32)
+                else:
+                    buffer.data = buffer.data.to(torch.bfloat16)
     
-    force_cast_gaussian_matrix(model, device)
+    
             
     if hasattr(glamm_model, "grounding_encoder"):
         prompt_encoder = glamm_model.grounding_encoder.prompt_encoder
