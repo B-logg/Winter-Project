@@ -177,6 +177,7 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
+    # 안전을 위해 max length를 config에서 읽어오거나 2048로 고정
     temp_config = transformers.AutoConfig.from_pretrained(args.version)
     max_pos_len = getattr(temp_config, "max_position_embeddings", 4096)
     tokenizer.model_max_length = max_pos_len
@@ -354,7 +355,7 @@ def main():
         }
     }
 
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구
+    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (DeepSpeed 초기화 직전)
     print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
     count_fixed = 0
     for name, module in model.named_modules():
