@@ -194,7 +194,23 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
     cnt = 0
 
     for item in batch:
-        # ... (아이템 언패킹 로직은 기존과 동일) ...
+        if isinstance(item, dict):
+            convs = item.get("conversations", [])
+            img_path = item.get("image_path", item.get("file_name", "Unknown"))
+            
+            # 대화 텍스트 전체를 합쳐서 검사
+            full_text = ""
+            if isinstance(convs, list):
+                for t in convs:
+                    full_text += t.get('value', '')
+            
+            # <image> 토큰이 없으면 로그 출력!
+            if DEFAULT_IMAGE_TOKEN not in full_text:
+                print(f"\n🔥🔥🔥 [BINGO] 범인 발견!!! 🔥🔥🔥")
+                print(f"이미지 경로: {img_path}")
+                print(f"대화 내용: {full_text[:100]}...")
+                print("--------------------------------------\n")
+        
         if isinstance(item, dict):
             image_path = item.get("image_path", item.get("file_name", None))
             global_enc_image = item.get("global_enc_images", item.get("global_enc_image", item.get("image", None)))
