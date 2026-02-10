@@ -239,7 +239,7 @@ def main():
         quantization_config=bnb_config,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-        device_map = {"": args.local_rank}
+        device_map = {"": args.local_rank},
         **model_kwargs
     )
     
