@@ -186,6 +186,7 @@ def _lazy_load_image(data, target_size=336):
 
 def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=False, local_rank=-1):
     # Initializing lists
+    print("🔥🔥🔥 [DEBUG] 진짜로 수정된 코드가 돌고 있습니다!!! 🔥🔥🔥")
     image_path_list, global_enc_image_list, grounding_enc_image_list = [], [], []
     bboxes_list, conversation_list, masks_list = [], [], []
     resize_list, questions_list = [], [] 
