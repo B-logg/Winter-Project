@@ -429,6 +429,13 @@ def main():
         
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
+
+            max_len = 4096
+            if 'input_ids' in batch and batch['input_ids'].shape[1] > max_len:
+                # print(f"Cutting sequence from {batch['input_ids'].shape[1]} to {max_len}") # 확인용
+                batch['input_ids'] = batch['input_ids'][:, :max_len]
+                batch['labels'] = batch['labels'][:, :max_len]
+                batch['attention_mask'] = batch['attention_mask'][:, :max_len]
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
                 batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
