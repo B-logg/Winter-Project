@@ -186,7 +186,6 @@ def _lazy_load_image(data, target_size=336):
 
 def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=False, local_rank=-1):
     # Initializing lists
-    print("🔥🔥🔥 [DEBUG] 진짜로 수정된 코드가 돌고 있습니다!!! 🔥🔥🔥")
     image_path_list, global_enc_image_list, grounding_enc_image_list = [], [], []
     bboxes_list, conversation_list, masks_list = [], [], []
     resize_list, questions_list = [], [] 
@@ -194,23 +193,6 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
     cnt = 0
 
     for item in batch:
-        if isinstance(item, dict):
-            convs = item.get("conversations", [])
-            img_path = item.get("image_path", item.get("file_name", "Unknown"))
-            
-            # 대화 텍스트 전체를 합쳐서 검사
-            full_text = ""
-            if isinstance(convs, list):
-                for t in convs:
-                    full_text += t.get('value', '')
-            
-            # <image> 토큰이 없으면 로그 출력!
-            if DEFAULT_IMAGE_TOKEN not in full_text:
-                print(f"\n🔥🔥🔥 [BINGO] 범인 발견!!! 🔥🔥🔥")
-                print(f"이미지 경로: {img_path}")
-                print(f"대화 내용: {full_text[:100]}...")
-                print("--------------------------------------\n")
-        
         if isinstance(item, dict):
             image_path = item.get("image_path", item.get("file_name", None))
             global_enc_image = item.get("global_enc_images", item.get("global_enc_image", item.get("image", None)))
@@ -234,26 +216,41 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         
         bboxes_list.append(bboxes)
         
-        # --- [Fix] 대화 리스트 확장 및 <image> 토큰 강제 삽입 ---
-        # 원본 데이터 훼손 방지를 위해 deepcopy 권장
-        if isinstance(conversations, list):
-            # 복사본 생성
-            import copy
-            cur_convs = copy.deepcopy(conversations)
-        else:
-            cur_convs = copy.deepcopy([conversations])
+        # --- [Fix] 대화 리스트 확장 및 <image> 토큰 강제 삽입 (이중 리스트 대응) ---
+        import copy
+        cur_convs = []
+        
+        # conversations가 None이거나 비어있을 경우 방어
+        if conversations is None:
+            conversations = []
 
-        # 첫 번째 턴에 <image> 토큰이 없으면 강제로 추가
-        if use_mm_start_end:
-            # 보통 DEFAULT_IMAGE_TOKEN은 '<image>'
-            if isinstance(cur_convs[0], dict):
-                if DEFAULT_IMAGE_TOKEN not in cur_convs[0]['value']:
-                    # "human" 턴의 맨 앞에 <image>\n 추가
-                    if cur_convs[0]['from'] == 'human':
-                        cur_convs[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + cur_convs[0]['value']
-            elif isinstance(cur_convs[0], str): # 혹시 문자열일 경우
-                if DEFAULT_IMAGE_TOKEN not in cur_convs[0]:
-                    cur_convs[0] = DEFAULT_IMAGE_TOKEN + '\n' + cur_convs[0]
+        # 구조 정규화 (Flatten): [[dict]] -> [dict]
+        if isinstance(conversations, list):
+            for c in conversations:
+                if isinstance(c, list):
+                    cur_convs.extend(copy.deepcopy(c))
+                else:
+                    cur_convs.append(copy.deepcopy(c))
+        else:
+            # 리스트가 아니면(dict 등) 리스트로 감싸기
+            cur_convs = [copy.deepcopy(conversations)]
+
+        # <image> 토큰 강제 주입 로직
+        if use_mm_start_end and len(cur_convs) > 0:
+            first_turn = cur_convs[0]
+            # 딕셔너리인 경우
+            if isinstance(first_turn, dict):
+                if DEFAULT_IMAGE_TOKEN not in first_turn.get('value', ''):
+                    # human 턴이면 앞에 붙임
+                    if first_turn.get('from') == 'human':
+                        first_turn['value'] = DEFAULT_IMAGE_TOKEN + '\n' + first_turn['value']
+                    # human이 아니면(system 등) 그냥 냅두거나, 강제로 붙일 수도 있음. 
+                    # 일단 human일 때만 붙이는게 안전함.
+            
+            # 혹시 문자열인 경우
+            elif isinstance(first_turn, str):
+                if DEFAULT_IMAGE_TOKEN not in first_turn:
+                    cur_convs[0] = DEFAULT_IMAGE_TOKEN + '\n' + first_turn
 
         conversation_list.extend(cur_convs)
         # ----------------------------------------------------
@@ -267,12 +264,12 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         questions_list.append(questions)
         selected_labels_list.append(sampled_classes)
         
-        conv_len = len(cur_convs) # 수정된 conv 길이 사용
+        conv_len = len(cur_convs) 
         cnt += conv_len
         offset_list.append(cnt)
         inferences.append(inference)
 
-    # 대화 처리 (치환) - 기존 로직 유지
+    # 대화 처리 (치환)
     if use_mm_start_end:
         replace_token = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
         new_conv_list = []
@@ -289,6 +286,13 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
                     else:
                         new_turn_list.append(turn)
                 new_conv_list.append(new_turn_list)
+            elif isinstance(conv, dict): # 딕셔너리가 바로 온 경우 처리
+                 if "value" in conv:
+                    turn_copy = copy.deepcopy(conv)
+                    turn_copy["value"] = conv["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
+                    new_conv_list.append(turn_copy)
+                 else:
+                    new_conv_list.append(conv)
             else:
                 new_conv_list.append(conv)
         conversation_list = new_conv_list
