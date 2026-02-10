@@ -242,6 +242,9 @@ def main():
         device_map = {"": args.local_rank},
         **model_kwargs
     )
+
+    print(f"Resizing token embeddings to {len(tokenizer)}...")
+    model.resize_token_embeddings(len(tokenizer))
     
     # 3. 모델 전처리 (Q-LoRA & Casting)
     model = prepare_model_for_kbit_training(model)
@@ -268,11 +271,11 @@ def main():
         target_modules=target_modules,
         lora_dropout=args.lora_dropout,
         bias="none",
-        task_type="CAUSAL_LM"
+        task_type="CAUSAL_LM",
+        modules_to_save=["embed_tokens", "lm_head"]
     )
     
     model = get_peft_model(model, lora_config)
-    model.resize_token_embeddings(len(tokenizer)) # 토큰 추가 반영
 
     # 5. Full-Tuning 모듈 Unfreeze
     # (Mask Decoder, Projectors 등)
