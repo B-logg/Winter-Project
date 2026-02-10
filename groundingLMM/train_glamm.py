@@ -389,36 +389,44 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [데이터 무결성 보정] (Clamp 제거됨)
+            # 🔥 [Final Fix] 데이터 무결성 & Offset 동기화
             # =================================================================
             
-            # 1. 정답지(Labels) 정화 (-200 -> -100) 필수!
+            # 1. 정답지(Labels) 정화
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
-                # 안전장치: 범위를 벗어나는 라벨도 -100으로 처리
-                batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
 
-            # 2. 입력 데이터(Input IDs) 자르기 (OOM/IndexError 방지용)
-            # 텍스트가 너무 길면 이미지가 들어갈 자리가 없으므로 자릅니다.
+            # 2. 데이터 길이 안전 절삭
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
-                # 2-1. 입력과 라벨 자르기
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
-                
                 if 'labels' in batch:
                     batch['labels'] = batch['labels'][:, :safe_max_len]
-                
                 if 'attention_masks' in batch:
                     batch['attention_masks'] = batch['attention_masks'][:, :safe_max_len]
                 elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
-                
-                # 2-2. 마스크 재생성을 유도하기 위해 기존 마스크 삭제
-                # (GLaMM은 마스크가 없으면 input_ids 보고 새로 만듭니다)
-                if 'seg_token_mask' in batch:
-                    del batch['seg_token_mask']
 
-            # ❌ [삭제됨] Clamp 코드는 절대 넣지 마세요. 이미지를 죽입니다.
+            # 3. [핵심] Segmentation Mask 및 Offset 재계산 
+            # 입력이 잘리거나 변형되었으므로, seg_token_mask와 offset을 현재 상태에 맞게 다시 계산해야 함.
+            if 'input_ids' in batch and args.seg_token_idx is not None:
+                # 3-1. 마스크 재생성
+                new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
+                if new_seg_mask.any():
+                    batch['seg_token_mask'] = new_seg_mask
+                    
+                    # 3-2. Offset 재계산 (이게 없어서 터졌던 겁니다!)
+                    # offset은 각 배치의 누적 토큰 개수를 의미합니다.
+                    # 현재 마스크된 토큰의 개수를 세서 offset을 다시 만듭니다.
+                    seg_counts = new_seg_mask.long().sum(dim=1)
+                    new_offset = torch.cat([torch.zeros(1, device=device, dtype=torch.long), seg_counts.cumsum(0)])
+                    batch['offset'] = new_offset
+                else:
+                    # 마스크가 없으면 관련 키 삭제
+                    if 'seg_token_mask' in batch: del batch['seg_token_mask']
+                    # offset은 이미지 개수와 관련 있으므로 함부로 지우면 안 되지만, 
+                    # 마스크가 없으면 offset도 의미가 없어질 수 있음. (보통 유지)
+
             # =================================================================
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
