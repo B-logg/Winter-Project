@@ -265,8 +265,7 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
             for batch_idx, pred_mask in enumerate(pred_masks):
                 if pred_mask.numel() > 0:  
                     gt_mask = masks_list[batch_idx]
-                    
-                    # [핵심 수정 로직 시작] -----------------------------------------
+                   
                     # 상황: 모델은 N개를 예측했는데, 정답은 1개밖에 없는 경우 (N > 1)
                     if gt_mask.shape[0] == 1 and pred_mask.shape[0] > 1:
                         # 해결: 예측된 N개의 마스크를 전부 더해서 하나로 합침 (Logical OR 연산 효과)
