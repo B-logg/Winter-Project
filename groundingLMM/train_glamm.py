@@ -391,7 +391,7 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 보정 (Index Error / Shape Mismatch 방지)
+            # 🔥 [Final Fix] 데이터 무결성 보정 (모든 배치에 무조건 적용)
             # =================================================================
             
             # 1. 정답지(Labels) 정화 (-200 -> -100)
@@ -400,23 +400,32 @@ def main():
                 # 안전장치: 범위를 벗어나는 라벨도 -100으로 처리
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
 
-            # 2. 입력 데이터(Input IDs) 자르기 & 마스크 동기화
+            # 2. 데이터 길이 안전 절삭 (필요시)
+            # 텍스트가 너무 길면 이미지가 들어갈 자리가 없으므로 자릅니다.
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
-                # 2-1. 입력과 라벨 자르기
+                # print(f"✂️ Truncating: {batch['input_ids'].shape[1]} -> {safe_max_len}")
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
-                
                 if 'labels' in batch:
                     batch['labels'] = batch['labels'][:, :safe_max_len]
                 if 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
-                
-                # 2-2. [핵심] 길이가 안 맞는 seg_token_mask 삭제 
-                # (입력을 잘랐으니 기존 마스크는 쓰레기값이 됩니다. 지우면 모델이 알아서 처리하거나 넘어갑니다.)
-                if 'seg_token_mask' in batch:
-                    del batch['seg_token_mask']
 
-            # 3. 값 범위 고정 (Clamp) - Index Error 원천 봉쇄
+            # 3. [핵심] Segmentation Mask 무조건 재건축 
+            # 기존 마스크를 믿지 말고, 현재 input_ids를 기반으로 새로 만듭니다.
+            if 'input_ids' in batch and args.seg_token_idx is not None:
+                # 현재 배치된 input_ids에서 [SEG] 토큰 위치를 찾습니다.
+                new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
+                
+                # 하나라도 있으면 마스크 업데이트
+                if new_seg_mask.any():
+                    batch['seg_token_mask'] = new_seg_mask
+                else:
+                    # 없으면 키 삭제 (모델 내부 로직에 맡김)
+                    if 'seg_token_mask' in batch:
+                        del batch['seg_token_mask']
+
+            # 4. 값 범위 고정 (Clamp) - Index Error 원천 봉쇄
             if 'input_ids' in batch:
                 batch['input_ids'] = batch['input_ids'].clamp(0, final_vocab_size - 1)
             # =================================================================
