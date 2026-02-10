@@ -299,7 +299,22 @@ def main():
             for param in getattr(base_glamm, mod_name).parameters():
                 param.requires_grad = True
 
-    # 8. 데이터셋 로드
+    # ==============================================================================
+    # 8. [Missed Step Fix] LoRA 어댑터 및 학습 파라미터 자료형 변환 (필수!)
+    # ==============================================================================
+    print("🚑 Final Type Casting: Converting all trainable params to BFloat16...")
+    for param in model.parameters():
+        if param.requires_grad:
+            # LoRA 가중치(Float32)를 강제로 BFloat16으로 변환하여 에러 해결
+            param.data = param.data.to(torch.bfloat16)
+            
+    # SAM Gaussian Matrix는 FP32 유지 (안전장치)
+    for name, module in model.named_modules():
+        if hasattr(module, "positional_encoding_gaussian_matrix"):
+            module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(torch.float32)
+    # ==============================================================================
+
+    # 9. 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
     train_dataset = ForestDataset(
         json_path=args.dataset_path,
@@ -326,7 +341,7 @@ def main():
         pin_memory=True
     )
 
-    # 9. DeepSpeed 설정
+    # 10. DeepSpeed 설정
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
@@ -354,7 +369,7 @@ def main():
         }
     }
 
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구
+    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (DeepSpeed 초기화 직전)
     print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
     count_fixed = 0
     for name, module in model.named_modules():
@@ -371,7 +386,7 @@ def main():
             config=ds_config
         )
     
-    # 10. 학습 루프
+    # 11. 학습 루프
     print("Starting Training Loop")
     global_step = 0
     final_vocab_size = len(tokenizer) 
@@ -387,7 +402,7 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 & Offset 강제 교정 (이게 정답입니다!)
+            # 🔥 [Final Fix] 데이터 무결성 & Offset 강제 교정 (완벽합니다)
             # =================================================================
             
             # [1] 정답지(Labels) 정화
@@ -406,8 +421,7 @@ def main():
                 elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
 
-            # [3] Offset 강제 초기화 (★★★ 핵심 ★★★)
-            # 데이터셋이 잘못된 오프셋을 줘도, 배치 사이즈에 맞춰서 0, 1, 2...로 덮어씁니다.
+            # [3] Offset 강제 초기화 (IndexError 원천 차단)
             if 'input_ids' in batch:
                 bsz = batch['input_ids'].shape[0]
                 batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
