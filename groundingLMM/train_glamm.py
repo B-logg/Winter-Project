@@ -230,8 +230,6 @@ def main():
 
     # 4. 임베딩 리사이즈
     target_vocab_size = len(tokenizer)
-    print(f"🔄 [Resize Check] Tokenizer Size: {target_vocab_size}")
-    
     model.config.vocab_size = target_vocab_size
     if hasattr(model, "model") and hasattr(model.model, "config"):
         model.model.config.vocab_size = target_vocab_size
@@ -256,20 +254,6 @@ def main():
     
     # 5. 모델 전처리 & Casting
     model = prepare_model_for_kbit_training(model)
-    glamm_model = model.model
-    modules_to_cast = ["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
-    
-    for mod_name in modules_to_cast:
-        if hasattr(glamm_model, mod_name):
-            module = getattr(glamm_model, mod_name)
-            if isinstance(module, list): module = module[0]
-            for param in module.parameters():
-                param.data = param.data.to(torch.bfloat16)
-            for name, buffer in module.named_buffers():
-                if "positional_encoding_gaussian_matrix" in name:
-                    buffer.data = buffer.data.to(torch.float32)
-                else:
-                    buffer.data = buffer.data.to(torch.bfloat16)
 
     # 6. LoRA 설정
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
@@ -300,18 +284,34 @@ def main():
                 param.requires_grad = True
 
     # ==============================================================================
-    # 8. [🔥 이 부분이 빠져있었습니다!] LoRA 어댑터 자료형 변환 (필수)
-    # LoRA는 기본적으로 Float32로 생성되므로, BFloat16으로 바꿔줘야 에러가 안 납니다.
+    # 8. [🔥 강력 수정] LoRA 강제 변환 (모듈 단위로 접근)
+    # 기존 방식이 안 먹혀서, 모듈을 직접 찾아서 bfloat16()을 호출합니다.
     # ==============================================================================
-    print("🚑 Final Type Casting: Converting all trainable params to BFloat16...")
-    for param in model.parameters():
-        if param.requires_grad:
-            param.data = param.data.to(torch.bfloat16)
+    print("🚑 FORCE Casting: Converting LoRA and trainable params to BFloat16...")
+    
+    # 1) 전체 모델에서 학습 가능한 파라미터만 골라서 강제 변환
+    for name, module in model.named_modules():
+        # LoRA 레이어거나, 학습해야 하는 Linear 레이어인 경우
+        if "lora_" in name or any(p.requires_grad for p in module.parameters()):
+            module.to(torch.bfloat16)
             
-    # SAM Gaussian Matrix는 FP32 유지 (안전장치)
+    # 2) 혹시 모르니 파라미터 단위로 한 번 더 확인사살
+    for param in model.parameters():
+        if param.requires_grad and param.dtype != torch.bfloat16:
+            param.data = param.data.to(torch.bfloat16)
+
+    # 3) [중요] SAM Gaussian Matrix는 무조건 FP32 유지 (이거 바뀌면 큰일 남)
+    count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
             module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(torch.float32)
+            count_reset += 1
+    print(f"✅ Reset {count_reset} Gaussian matrices to FP32.")
+    
+    # 4) 검증: 실제로 바뀌었는지 출력
+    trainable_dtypes = [p.dtype for p in model.parameters() if p.requires_grad]
+    if len(trainable_dtypes) > 0:
+        print(f"🧐 Check Trainable Dtypes: {set(trainable_dtypes)}") # {torch.bfloat16} 만 나와야 함
     # ==============================================================================
 
     # 9. 데이터셋 로드
@@ -369,24 +369,13 @@ def main():
         }
     }
 
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (DeepSpeed 초기화 직전)
-    print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
-    count_fixed = 0
-    for name, module in model.named_modules():
-        if hasattr(module, "positional_encoding_gaussian_matrix"):
-            target = module.positional_encoding_gaussian_matrix
-            if target.dtype != torch.float32:
-                module.positional_encoding_gaussian_matrix = target.to(device=device, dtype=torch.float32)
-                count_fixed += 1
-    print(f"🎉 Total {count_fixed} matrices casted to FP32.")
-
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
             model=model,
             model_parameters=model.parameters(),
             config=ds_config
         )
     
-    # 11. 학습 루프
+    # 11. 학습 루프 (스마트 클램핑 + Offset 초기화 포함)
     print("Starting Training Loop")
     global_step = 0
     final_vocab_size = len(tokenizer) 
@@ -401,10 +390,6 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
-            # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 & Offset 강제 교정 (완벽합니다)
-            # =================================================================
-            
             # [1] 정답지(Labels) 정화
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
@@ -439,7 +424,6 @@ def main():
                 is_image_token = (batch['input_ids'] == -200)
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
-            # =================================================================
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
                 batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
