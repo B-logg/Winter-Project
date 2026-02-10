@@ -190,7 +190,11 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
-    tokenizer.model_max_length = 8192
+
+    temp_config = transformers.AutoConfig.from_pretrained(args.version)
+    max_len = getattr(temp_config, "max_position_embeddings", 4096) # 없으면 기본 4096
+
+    tokenizer.model_max_length = max_len
     tokenizer.pad_token = tokenizer.unk_token
     
     # Special Tokens 추가
