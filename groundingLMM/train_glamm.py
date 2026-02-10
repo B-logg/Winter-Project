@@ -256,7 +256,6 @@ def main():
     model = prepare_model_for_kbit_training(model)
 
     # 6. LoRA 설정
-    # 주의: 여기서 grounding_encoder를 exclude 해도 가끔 PEFT가 못 거를 때가 있음.
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     target_modules = find_target_linear_modules(model, exclude_keywords)
     
@@ -272,7 +271,7 @@ def main():
     
     model = get_peft_model(model, lora_config)
 
-    # 7. Unfreeze (SAM Mask Decoder 학습 풀기)
+    # 7. Unfreeze
     base_glamm = model.base_model.model.model
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
@@ -285,38 +284,20 @@ def main():
                 param.requires_grad = True
 
     # ==============================================================================
-    # 8. [🔥 Pinpoint Casting] SAM 모듈과 LoRA 어댑터만 콕 집어서 BF16 변환
-    # (전체 모델 .to()는 4bit 때문에 안 되지만, 부분 모듈 .to()는 됩니다!)
+    # 8. [🔥 안전한 강제 변환] module.to() 대신 param.data 사용 (4-bit 충돌 방지)
+    #    - LoRA가 Float32로 생성되므로, 이를 BFloat16으로 직접 바꿉니다.
     # ==============================================================================
-    print("🚑 Pinpoint Casting: Force converting SAM and LoRA modules to BFloat16...")
+    print("🚑 SAFE CASTING: Converting Float32 params to BFloat16 manually...")
+    count_casted = 0
+    for name, param in model.named_parameters():
+        # 학습 대상(LoRA 등)이면서 Float32인 경우만 타겟팅
+        if param.requires_grad and param.dtype == torch.float32:
+            param.data = param.data.to(torch.bfloat16)
+            count_casted += 1
     
-    # (1) SAM (Grounding Encoder) - 4bit 아님. 안전하게 변환 가능.
-    # 여기가 FP32로 남아있어서 LoRA랑 충돌난 것임.
-    if hasattr(base_glamm, "grounding_encoder"):
-        print(" -> Casting Grounding Encoder (SAM) to BF16...")
-        base_glamm.grounding_encoder.to(torch.bfloat16)
+    print(f"✅ Converted {count_casted} parameters to BFloat16.")
 
-    # (2) Projector & FCs
-    if hasattr(base_glamm, "mm_projector"):
-        base_glamm.mm_projector.to(torch.bfloat16)
-    if hasattr(base_glamm, "text_hidden_fcs"):
-        base_glamm.text_hidden_fcs.to(torch.bfloat16)
-        
-    # (3) 모든 LoRA 레이어 찾아서 강제 변환
-    # PEFT 모델 구조상 named_modules()로 돌면서 lora가 포함된 애들만 바꾸면 안전함.
-    print(" -> Scanning for LoRA layers to cast...")
-    cast_count = 0
-    for name, module in model.named_modules():
-        if "lora_" in name or "Lora" in module.__class__.__name__:
-            # 4bit Linear에 붙은 LoRA도 모듈 자체는 FP32/BF16임.
-            try:
-                module.to(torch.bfloat16)
-                cast_count += 1
-            except:
-                pass 
-    print(f" -> Casted {cast_count} LoRA modules.")
-
-    # (4) SAM Gaussian Matrix는 FP32 복구 (필수 안전장치)
+    # [SAM 안전장치] Gaussian Matrix는 FP32 유지 (얘는 BF16이면 안 됨)
     count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
@@ -401,6 +382,10 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
+            # =================================================================
+            # 🔥 [Final Fix] 데이터 무결성 & Offset 강제 교정
+            # =================================================================
+            
             # [1] 정답지(Labels) 정화
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
@@ -435,6 +420,7 @@ def main():
                 is_image_token = (batch['input_ids'] == -200)
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
+            # =================================================================
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
                 batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
