@@ -31,8 +31,8 @@ deepspeed --num_gpus=2 train_glamm.py \
     --image_folder $IMAGE_FOLDER \
     --vision_pretrained $VISION_PRETRAINED \
     --output_dir $OUTPUT_DIR \
-    --batch_size 2 \
-    --grad_accumulation_steps 3 \
+    --batch_size 1 \
+    --grad_accumulation_steps 6 \
     --epochs 6 \
     --lr 2e-4 \
     --workers 8 \
