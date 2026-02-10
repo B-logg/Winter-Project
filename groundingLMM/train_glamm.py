@@ -254,24 +254,10 @@ def main():
             new_head.weight[:n_copy, :] = current_head.weight[:n_copy, :]
         model.set_output_embeddings(new_head)
     
-    # 5. 모델 전처리 & Casting
+    # 5. 모델 전처리 (kbit 준비)
     model = prepare_model_for_kbit_training(model)
-    glamm_model = model.model
-    modules_to_cast = ["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
-    
-    for mod_name in modules_to_cast:
-        if hasattr(glamm_model, mod_name):
-            module = getattr(glamm_model, mod_name)
-            if isinstance(module, list): module = module[0]
-            for param in module.parameters():
-                param.data = param.data.to(torch.bfloat16)
-            for name, buffer in module.named_buffers():
-                if "positional_encoding_gaussian_matrix" in name:
-                    buffer.data = buffer.data.to(torch.float32)
-                else:
-                    buffer.data = buffer.data.to(torch.bfloat16)
 
-    # 6. LoRA 설정
+    # 6. LoRA 설정 (먼저 적용!)
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     target_modules = find_target_linear_modules(model, exclude_keywords)
     
@@ -287,7 +273,7 @@ def main():
     
     model = get_peft_model(model, lora_config)
 
-    # 7. Unfreeze
+    # 7. Unfreeze (학습할 모듈 풀기)
     base_glamm = model.base_model.model.model
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
@@ -299,7 +285,32 @@ def main():
             for param in getattr(base_glamm, mod_name).parameters():
                 param.requires_grad = True
 
-    # 8. 데이터셋 로드
+    # 8. [핵심 수정] 자료형 Casting (LoRA 적용 후에 실행해야 어댑터까지 BF16이 됨!)
+    print("Casting modules to BF16 (keeping SAM Gaussian Matrix in FP32)...")
+    glamm_model = model.base_model.model.model # PEFT로 감싸졌으므로 경로 주의
+    modules_to_cast = ["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
+    
+    for mod_name in modules_to_cast:
+        if hasattr(glamm_model, mod_name):
+            module = getattr(glamm_model, mod_name)
+            if isinstance(module, list): module = module[0]
+            
+            # 파라미터 변환 (LoRA 어댑터 포함)
+            for param in module.parameters():
+                if param.requires_grad: # 학습하는 애들은 확실하게 BF16으로
+                    param.data = param.data.to(torch.bfloat16)
+            
+            # 버퍼 변환
+            for name, buffer in module.named_buffers():
+                if "positional_encoding_gaussian_matrix" in name:
+                    buffer.data = buffer.data.to(torch.float32)
+                else:
+                    buffer.data = buffer.data.to(torch.bfloat16)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable Params: {trainable_params:,}")
+
+    # 9. 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
     train_dataset = ForestDataset(
         json_path=args.dataset_path,
@@ -326,7 +337,7 @@ def main():
         pin_memory=True
     )
 
-    # 9. DeepSpeed 설정
+    # 10. DeepSpeed 설정
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
@@ -354,7 +365,7 @@ def main():
         }
     }
 
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구
+    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (DeepSpeed 초기화 직전)
     print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
     count_fixed = 0
     for name, module in model.named_modules():
@@ -371,11 +382,9 @@ def main():
             config=ds_config
         )
     
-    # 10. 학습 루프
+    # 11. 학습 루프
     print("Starting Training Loop")
     global_step = 0
-    
-    # 안전장치용 Vocab Size
     final_vocab_size = len(tokenizer) 
 
     if args.local_rank == 0:
@@ -389,15 +398,28 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 & Offset 강제 교정 (최종 솔루션)
+            # 🔥 [Final Fix] 데이터 무결성 보정 (스마트 클램핑 + 불량 데이터 패스)
             # =================================================================
             
-            # 1. 정답지(Labels) 정화
+            # [1] 이미지 토큰 누락 검사 (가장 중요)
+            if 'input_ids' in batch:
+                has_image_token = (batch['input_ids'] == -200).any()
+                if not has_image_token:
+                    # 이미지 토큰이 없으면 GLaMM 마스크 생성에서 무조건 에러남 -> 패스
+                    if args.local_rank == 0:
+                        # print(f"⚠️ Skipping batch {step}: Missing image token (-200)")
+                        pass
+                    del batch
+                    continue
+
+            # [2] 정답지(Labels) 정화
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
+                # 음수 라벨 방어 (-100 제외)
+                batch['labels'][(batch['labels'] < 0) & (batch['labels'] != -100)] = -100
 
-            # 2. 데이터 길이 안전 절삭
+            # [3] 데이터 길이 안전 절삭
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
@@ -408,15 +430,7 @@ def main():
                 elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
 
-            # 3. [핵심] Offset 강제 초기화 (IndexError 원천 차단)
-            # 데이터셋이 잘못 계산한 offset을 무시하고, 현재 배치 사이즈에 맞춰 0, 1, 2... 로 덮어씁니다.
-            if 'input_ids' in batch:
-                current_batch_size = batch['input_ids'].shape[0]
-                # 무조건 [0, 1, 2, ... BatchSize] 형태로 새로 만듭니다.
-                batch['offset'] = torch.arange(current_batch_size + 1, dtype=torch.long, device=device)
-
-            # 4. Segmentation Mask 재계산
-            # 입력이 잘렸거나 오프셋이 변경되었으므로 마스크도 현재 상태에 맞춰 새로고침
+            # [4] Segmentation Mask 재계산 (Offset은 건드리지 않음)
             if 'input_ids' in batch and args.seg_token_idx is not None:
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
                 if new_seg_mask.any():
@@ -424,7 +438,7 @@ def main():
                 else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
 
-            # 5. [스마트 클램핑] 이미지 토큰(-200) 보호 + 쓰레기 값 제거
+            # [5] [스마트 클램핑] 이미지 토큰(-200) 보호 + 쓰레기 값 제거
             if 'input_ids' in batch:
                 is_image_token = (batch['input_ids'] == -200)
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
