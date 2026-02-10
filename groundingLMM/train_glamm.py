@@ -169,18 +169,18 @@ def find_target_linear_modules(model, exclude_keywords=[]):
 def main():
     args = parse_args()
 
-    # GPU 설정
+    # 1. GPU 설정
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     
-    # 1. 토크나이저 설정
+    # 2. 토크나이저 설정
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
     tokenizer.model_max_length = 8192
     tokenizer.pad_token = tokenizer.unk_token
     
-    # Special Tokens 추가
+    # Special Tokens
     special_tokens = ['[SEG]', '<bbox>', '<point>', '<p>', '</p>']
     if args.use_mm_start_end:
         special_tokens.extend([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN])
@@ -189,7 +189,7 @@ def main():
     args.bbox_token_idx = tokenizer("<bbox>", add_special_tokens=False).input_ids[0]
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
-    # 2. 모델 로드 및 4-bit 양자화
+    # 3. 모델 로드 (4-bit)
     skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
                     "text_hidden_fcs", "region_encoder", "lm_head", "embed_tokens"]
     
@@ -226,9 +226,7 @@ def main():
         **model_kwargs
     )
 
-    # =================================================================================
-    # 🔥 [Force Resize] 임베딩 & 출력층(LM Head) 강제 리사이즈 (IndexKernel 방어)
-    # =================================================================================
+    # 4. 임베딩 리사이즈 (Index Error 방지 1단계)
     target_vocab_size = len(tokenizer)
     print(f"🔄 [Resize Check] Tokenizer Size: {target_vocab_size}")
     
@@ -238,7 +236,6 @@ def main():
 
     current_embed = model.get_input_embeddings()
     if current_embed.weight.shape[0] != target_vocab_size:
-        print(f"   ↳ Extending Input Embeddings to {target_vocab_size}...")
         new_embed = torch.nn.Embedding(target_vocab_size, current_embed.embedding_dim, padding_idx=current_embed.padding_idx)
         new_embed.to(device=device, dtype=torch.bfloat16)
         with torch.no_grad():
@@ -247,38 +244,30 @@ def main():
 
     current_head = model.get_output_embeddings()
     if current_head.out_features != target_vocab_size:
-        print(f"   ↳ Extending Output Head to {target_vocab_size}...")
         new_head = torch.nn.Linear(current_head.in_features, target_vocab_size, bias=False)
         new_head.to(device=device, dtype=torch.bfloat16)
         with torch.no_grad():
             new_head.weight[:current_head.out_features, :] = current_head.weight
         model.set_output_embeddings(new_head)
     
-    # 3. 모델 전처리
+    # 5. 모델 전처리 & Casting
     model = prepare_model_for_kbit_training(model)
-    
-    # BF16 Casting (SAM Gaussian Matrix는 FP32로 보호)
     glamm_model = model.model
     modules_to_cast = ["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     
-    print("Casting modules to BF16 (keeping SAM Gaussian Matrix in FP32)...")
     for mod_name in modules_to_cast:
         if hasattr(glamm_model, mod_name):
             module = getattr(glamm_model, mod_name)
             if isinstance(module, list): module = module[0]
-            
-            # 파라미터 변환
             for param in module.parameters():
                 param.data = param.data.to(torch.bfloat16)
-            
-            # 버퍼 변환 (Gaussian Matrix는 건너뜀)
             for name, buffer in module.named_buffers():
                 if "positional_encoding_gaussian_matrix" in name:
                     buffer.data = buffer.data.to(torch.float32)
                 else:
                     buffer.data = buffer.data.to(torch.bfloat16)
 
-    # 4. LoRA 설정
+    # 6. LoRA 설정
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     target_modules = find_target_linear_modules(model, exclude_keywords)
     
@@ -294,7 +283,7 @@ def main():
     
     model = get_peft_model(model, lora_config)
 
-    # 5. Full-Tuning 모듈 Unfreeze
+    # 7. Unfreeze
     base_glamm = model.base_model.model.model
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
@@ -306,10 +295,7 @@ def main():
             for param in getattr(base_glamm, mod_name).parameters():
                 param.requires_grad = True
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable Params: {trainable_params:,}")
-
-    # 6. 데이터셋 & 로더 준비
+    # 8. 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
     train_dataset = ForestDataset(
         json_path=args.dataset_path,
@@ -336,6 +322,7 @@ def main():
         pin_memory=True
     )
 
+    # 9. DeepSpeed 설정
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
@@ -363,10 +350,7 @@ def main():
         }
     }
 
-    # =================================================================================
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (CUBLAS Error 방지) 🔥
-    # DeepSpeed 초기화 직전에 한 번 더 확실하게 FP32로 되돌립니다.
-    # =================================================================================
+    # 🔥 [CUBLAS Fix] SAM Gaussian Matrix 강제 FP32 복구
     print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
     count_fixed = 0
     for name, module in model.named_modules():
@@ -376,7 +360,6 @@ def main():
                 module.positional_encoding_gaussian_matrix = target.to(device=device, dtype=torch.float32)
                 count_fixed += 1
     print(f"🎉 Total {count_fixed} matrices casted to FP32.")
-    # =================================================================================
 
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
             model=model,
@@ -384,7 +367,7 @@ def main():
             config=ds_config
         )
     
-    # Training Loop
+    # 10. 학습 루프
     print("Starting Training Loop")
     global_step = 0
     
@@ -399,13 +382,16 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [수정] 데이터 길이 안전하게 절삭 (이미지 확장 공간 고려)
-            # 텍스트만 4096개 채우면 이미지가 들어갈 공간이 없어 터집니다.
-            # 2500 정도로 줄여서 이미지 토큰(약 576개)이 들어갈 여유를 줍니다.
+            # 🔥 [Fix 1] 정답지(Labels) 오염 정화 (-200 -> -100)
+            # =================================================================
+            if 'labels' in batch:
+                batch['labels'][batch['labels'] == -200] = -100
+
+            # =================================================================
+            # 🔥 [Fix 2] 데이터 길이 안전 절삭 (Index Error 방지)
             # =================================================================
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
-                # print(f"✂️ Truncating sequence from {batch['input_ids'].shape[1]} to {safe_max_len}")
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
                 batch['labels'] = batch['labels'][:, :safe_max_len]
                 batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
