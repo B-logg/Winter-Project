@@ -177,7 +177,6 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
-    # 안전을 위해 max length를 config에서 읽어오거나 2048로 고정
     temp_config = transformers.AutoConfig.from_pretrained(args.version)
     max_pos_len = getattr(temp_config, "max_position_embeddings", 4096)
     tokenizer.model_max_length = max_pos_len
@@ -229,7 +228,7 @@ def main():
         **model_kwargs
     )
 
-    # 4. 임베딩 리사이즈 (중요)
+    # 4. 임베딩 리사이즈
     target_vocab_size = len(tokenizer)
     print(f"🔄 [Resize Check] Tokenizer Size: {target_vocab_size}")
     
@@ -242,7 +241,6 @@ def main():
         new_embed = torch.nn.Embedding(target_vocab_size, current_embed.embedding_dim, padding_idx=current_embed.padding_idx)
         new_embed.to(device=device, dtype=torch.bfloat16)
         with torch.no_grad():
-            # 기존 가중치 복사 (부족한 부분은 랜덤 초기화됨)
             n_copy = min(current_embed.weight.shape[0], target_vocab_size)
             new_embed.weight[:n_copy] = current_embed.weight[:n_copy]
         model.set_input_embeddings(new_embed)
@@ -269,7 +267,7 @@ def main():
                 param.data = param.data.to(torch.bfloat16)
             for name, buffer in module.named_buffers():
                 if "positional_encoding_gaussian_matrix" in name:
-                    buffer.data = buffer.data.to(torch.float32) # FP32 유지
+                    buffer.data = buffer.data.to(torch.float32)
                 else:
                     buffer.data = buffer.data.to(torch.bfloat16)
 
@@ -356,7 +354,7 @@ def main():
         }
     }
 
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (DeepSpeed 초기화 직전)
+    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구
     print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
     count_fixed = 0
     for name, module in model.named_modules():
@@ -377,8 +375,8 @@ def main():
     print("Starting Training Loop")
     global_step = 0
     
-    # 실제 모델의 임베딩 크기를 확인 (이 값을 넘는 인덱스는 무조건 에러남)
-    final_vocab_size = len(tokenizer)
+    # [Fix] 정확한 Vocab Size 설정 (LoRA Wrapper 문제 해결)
+    final_vocab_size = len(tokenizer) 
     print(f"🔒 Clamp limit set to vocab size: {final_vocab_size}")
 
     if args.local_rank == 0:
@@ -392,27 +390,30 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [최종 안전장치] 데이터 무결성 강제 보정 (Index Error 방지)
+            # 🔥 [데이터 무결성 강제 보정] - IndexKernel / KeyError 방지
             # =================================================================
             
-            # 1. 정답지(Labels) 정화
+            # 1. 정답지(Labels) 정화 (-200 -> -100)
             if 'labels' in batch:
-                # 이미지 토큰(-200)을 -100(무시)으로 변경
                 batch['labels'][batch['labels'] == -200] = -100
-                # 혹시라도 범위를 벗어나는 이상한 라벨이 있으면 -100으로 변경
+                # 안전장치: 범위를 벗어나는 라벨도 무시
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
 
             # 2. 입력 데이터(Input IDs) 정화
             if 'input_ids' in batch:
-                # 2-1. 길이 자르기 (이미지 토큰 공간 확보를 위해 2500으로 제한)
+                # 2-1. 길이 자르기 (이미지 토큰 공간 고려하여 2500 제한)
                 safe_max_len = 2500  
                 if batch['input_ids'].shape[1] > safe_max_len:
                     batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
-                    batch['labels'] = batch['labels'][:, :safe_max_len]
-                    batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
+                    
+                    if 'labels' in batch:
+                        batch['labels'] = batch['labels'][:, :safe_max_len]
+                    
+                    # [Fix] KeyError 방지: 키가 있을 때만 자름
+                    if 'attention_mask' in batch:
+                        batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
                 
-                # 2-2. 값 범위 자르기 (Clamp) - 🌟 Index Error 원천 봉쇄 🌟
-                # 입력 ID가 vocab_size보다 크거나 음수면 강제로 유효 범위 안으로 맞춤
+                # 2-2. 값 범위 자르기 (Clamp) - Index Error 원천 봉쇄
                 batch['input_ids'] = batch['input_ids'].clamp(0, final_vocab_size - 1)
             # =================================================================
             
