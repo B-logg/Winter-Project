@@ -385,6 +385,27 @@ def main():
         }
     }
 
+    count_fixed = 0
+    
+    # 모델의 모든 서브 모듈을 다 뒤집니다.
+    for name, module in model.named_modules():
+        if hasattr(module, "positional_encoding_gaussian_matrix"):
+            target = module.positional_encoding_gaussian_matrix
+            
+            # 만약 BF16(BFloat16)이나 FP16이면 -> FP32(Float32)로 변환
+            if target.dtype != torch.float32:
+                module.positional_encoding_gaussian_matrix = target.to(device=device, dtype=torch.float32)
+                print(f"   💊 Fixed: {name} -> FP32 (was {target.dtype})")
+                count_fixed += 1
+            else:
+                print(f"   ✅ Already FP32: {name}")
+                count_fixed += 1
+            
+    if count_fixed == 0:
+        print("⚠️ [WARNING] Gaussian Matrix를 찾지 못했습니다! 에러가 날 수 있습니다.")
+    else:
+        print(f"🎉 총 {count_fixed}개의 행렬을 FP32로 확정했습니다.")
+
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
             model=model,
             model_parameters=model.parameters(),
