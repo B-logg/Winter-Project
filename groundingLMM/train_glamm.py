@@ -177,7 +177,6 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
-    # 안전을 위해 max length를 config에서 읽어오거나 2048로 고정
     temp_config = transformers.AutoConfig.from_pretrained(args.version)
     max_pos_len = getattr(temp_config, "max_position_embeddings", 4096)
     tokenizer.model_max_length = max_pos_len
@@ -355,7 +354,7 @@ def main():
         }
     }
 
-    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구 (DeepSpeed 초기화 직전)
+    # 🔥 [Emergency Fix] SAM Gaussian Matrix 강제 FP32 복구
     print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
     count_fixed = 0
     for name, module in model.named_modules():
@@ -376,7 +375,7 @@ def main():
     print("Starting Training Loop")
     global_step = 0
     
-    # Vocab Size 설정 (Clamp 제거했으므로 로깅용으로만 사용)
+    # Vocab Size 설정 (스마트 클램핑용)
     final_vocab_size = len(tokenizer) 
 
     if args.local_rank == 0:
@@ -390,16 +389,15 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 스마트 데이터 정화 (Bad Batch 완벽 차단)
+            # 🔥 [Final Fix] 데이터 무결성 보정 (스마트 클램핑 적용!)
             # =================================================================
             
             # 1. 정답지(Labels) 정화
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
-                # 라벨 범위 벗어나는 것도 무시 (-100)
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
 
-            # 2. 입력 데이터(Input IDs) 자르기
+            # 2. 데이터 길이 안전 절삭 (OOM 방지)
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
@@ -415,27 +413,24 @@ def main():
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
                 if new_seg_mask.any():
                     batch['seg_token_mask'] = new_seg_mask
-                    # Offset 재계산
                     seg_counts = new_seg_mask.long().sum(dim=1)
                     new_offset = torch.cat([torch.zeros(1, device=device, dtype=torch.long), seg_counts.cumsum(0)])
                     batch['offset'] = new_offset
                 else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
 
-            # 4. [🔥스마트 클램핑] 이미지 토큰(-200)은 살리고, 이상한 큰 값만 잡는다!
+            # 4. [🔥스마트 클램핑] 이게 없어서 터진겁니다! 반드시 포함하세요.
+            # 이미지 토큰(-200)은 보호하고, 쓰레기 값(Bad Batch)만 잡습니다.
             # -------------------------------------------------------------------------
             if 'input_ids' in batch:
-                # (1) 이미지 토큰 위치 기억
+                # (1) -200인 위치(이미지)를 미리 기억
                 is_image_token = (batch['input_ids'] == -200)
                 
-                # (2) 일단 모든 값을 유효 범위(0 ~ 32006)로 강제 고정 (이때 -200은 0이 됨)
-                temp_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
+                # (2) 모든 값을 안전 범위(0~32006)로 강제 고정 (이때 -200은 0이 됨)
+                clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 
-                # (3) 아까 기억해둔 위치에 -200 복구 (이미지 토큰 부활!)
-                temp_ids[is_image_token] = -200
-                
-                # (4) 적용
-                batch['input_ids'] = temp_ids
+                # (3) 아까 기억해둔 위치에 다시 -200을 덮어씌워 복구
+                batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             # -------------------------------------------------------------------------
             
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
