@@ -205,11 +205,22 @@ class PositionEmbeddingRandom(nn.Module):
         # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
         coords = 2 * coords - 1
 
-        if coords.dtype != self.positional_encoding_gaussian_matrix.dtype:
-            coords = coords.to(self.positional_encoding_gaussian_matrix.dtype)
+        # 🔥 [핵심 수정] 무조건 FP32로 변환하여 계산 (DeepSpeed BF16 강제 변환 방어)
+        # 1. 가우시안 행렬 가져오기
+        matrix = self.positional_encoding_gaussian_matrix
+        
+        # 2. 행렬이 FP32가 아니면 강제로 FP32로 변환 (복사본 생성)
+        if matrix.dtype != torch.float32:
+            matrix = matrix.to(torch.float32)
+            
+        # 3. 입력 좌표도 FP32가 아니면 강제로 FP32로 변환
+        if coords.dtype != torch.float32:
+            coords = coords.to(torch.float32)
 
-        coords = coords @ self.positional_encoding_gaussian_matrix
+        # 4. 안전한 FP32 상태에서 행렬 곱셈 수행
+        coords = coords @ matrix
         coords = 2 * np.pi * coords
+        
         # outputs d_1 x ... x d_n x C shape
         return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
 
