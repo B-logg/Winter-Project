@@ -216,11 +216,10 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         
         bboxes_list.append(bboxes)
         
-        # --- [Fix] 대화 리스트 확장 및 <image> 토큰 강제 삽입 (이중 리스트 대응) ---
+        # --- [Fix] 대화 리스트 정규화 및 <image> 토큰 처리 ---
         import copy
         cur_convs = []
         
-        # conversations가 None이거나 비어있을 경우 방어
         if conversations is None:
             conversations = []
 
@@ -232,27 +231,21 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
                 else:
                     cur_convs.append(copy.deepcopy(c))
         else:
-            # 리스트가 아니면(dict 등) 리스트로 감싸기
             cur_convs = [copy.deepcopy(conversations)]
 
-        # <image> 토큰 강제 주입 로직
+        # <image> 토큰 강제 주입
         if use_mm_start_end and len(cur_convs) > 0:
             first_turn = cur_convs[0]
-            # 딕셔너리인 경우
             if isinstance(first_turn, dict):
                 if DEFAULT_IMAGE_TOKEN not in first_turn.get('value', ''):
-                    # human 턴이면 앞에 붙임
                     if first_turn.get('from') == 'human':
                         first_turn['value'] = DEFAULT_IMAGE_TOKEN + '\n' + first_turn['value']
-                    # human이 아니면(system 등) 그냥 냅두거나, 강제로 붙일 수도 있음. 
-                    # 일단 human일 때만 붙이는게 안전함.
-            
-            # 혹시 문자열인 경우
             elif isinstance(first_turn, str):
                 if DEFAULT_IMAGE_TOKEN not in first_turn:
                     cur_convs[0] = DEFAULT_IMAGE_TOKEN + '\n' + first_turn
 
-        conversation_list.extend(cur_convs)
+        # [🔥🔥🔥 핵심 수정] extend가 아니라 append를 써야 한 덩어리로 들어갑니다!
+        conversation_list.append(cur_convs)
         # ----------------------------------------------------
 
         if masks is not None:
@@ -269,7 +262,7 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
         offset_list.append(cnt)
         inferences.append(inference)
 
-    # 대화 처리 (치환)
+    # 대화 처리 (치환) - 아래는 기존과 동일
     if use_mm_start_end:
         replace_token = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
         new_conv_list = []
@@ -286,7 +279,7 @@ def custom_collate_fn(batch, tokenizer=None, use_mm_start_end=True, inference=Fa
                     else:
                         new_turn_list.append(turn)
                 new_conv_list.append(new_turn_list)
-            elif isinstance(conv, dict): # 딕셔너리가 바로 온 경우 처리
+            elif isinstance(conv, dict):
                  if "value" in conv:
                     turn_copy = copy.deepcopy(conv)
                     turn_copy["value"] = conv["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
