@@ -402,6 +402,21 @@ def main():
         }
     }
 
+    print("🚑 Emergency Fix: Forcing Gaussian Matrix to FP32...")
+    count_fixed = 0
+    for name, module in model.named_modules():
+        if hasattr(module, "positional_encoding_gaussian_matrix"):
+            # 무조건 FP32로 강제 변환
+            module.positional_encoding_gaussian_matrix = \
+                module.positional_encoding_gaussian_matrix.to(device=device, dtype=torch.float32)
+            print(f"   💊 Fixed: {name} -> FP32")
+            count_fixed += 1
+            
+    if count_fixed == 0:
+        print("⚠️ 경고: Gaussian Matrix를 찾지 못했습니다! 에러가 날 수 있습니다.")
+    else:
+        print(f"✅ 총 {count_fixed}개의 행렬을 FP32로 복구했습니다.")
+
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
             model=model,
             model_parameters=model.parameters(),
