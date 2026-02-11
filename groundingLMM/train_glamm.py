@@ -132,100 +132,138 @@ def find_target_linear_modules(model, exclude_keywords=[]):
 
 def main():
     args = parse_args()
+
+    # 1. GPU 설정
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     
+    # 2. 토크나이저 설정
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
+    temp_config = transformers.AutoConfig.from_pretrained(args.version)
+    max_pos_len = getattr(temp_config, "max_position_embeddings", 4096)
+    tokenizer.model_max_length = max_pos_len
     tokenizer.pad_token = tokenizer.unk_token
+    
+    # Special Tokens
     special_tokens = ['[SEG]', '<bbox>', '<point>', '<p>', '</p>']
     if args.use_mm_start_end:
         special_tokens.extend([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN])
     tokenizer.add_tokens(special_tokens, special_tokens=True)
+    
     args.bbox_token_idx = tokenizer("<bbox>", add_special_tokens=False).input_ids[0]
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
-    # [1] 4-bit 모델 로드 (LLM용)
-    # SAM과 Vision Tower는 skip_modules에 있어서 4bit가 안 되고 원본(FP32/FP16)으로 로드됩니다.
+    # 3. 모델 로드 (4-bit)
     skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
                     "text_hidden_fcs", "region_encoder", "lm_head", "embed_tokens"]
+    
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
         llm_int8_skip_modules=skip_modules
     )
+
     print(f"Loading GLaMM from {args.version}...")
+    
+    model_kwargs = {
+        "train_mask_decoder": args.train_mask_decoder,
+        "out_dim": args.out_dim,
+        "ce_loss_weight": args.ce_loss_weight,
+        "dice_loss_weight": args.dice_loss_weight,
+        "bce_loss_weight": args.bce_loss_weight,
+        "seg_token_idx": args.seg_token_idx,
+        "vision_pretrained": args.vision_pretrained,
+        "vision_tower": args.vision_tower,
+        "use_mm_start_end": args.use_mm_start_end,
+        "mm_vision_select_layer": -2,
+        "with_region": True
+    }
+    
     model = GLaMMForCausalLM.from_pretrained(
-        args.version, quantization_config=bnb_config, torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True, device_map = {"": args.local_rank},
-        train_mask_decoder=args.train_mask_decoder, out_dim=args.out_dim,
-        ce_loss_weight=args.ce_loss_weight, dice_loss_weight=args.dice_loss_weight,
-        bce_loss_weight=args.bce_loss_weight, seg_token_idx=args.seg_token_idx,
-        vision_pretrained=args.vision_pretrained, vision_tower=args.vision_tower,
-        use_mm_start_end=args.use_mm_start_end, mm_vision_select_layer=-2, with_region=True
+        args.version,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map = {"": args.local_rank},
+        **model_kwargs
     )
 
-    # Embedding Resize
+    # 4. 임베딩 리사이즈
     target_vocab_size = len(tokenizer)
     model.config.vocab_size = target_vocab_size
     if hasattr(model, "model") and hasattr(model.model, "config"):
         model.model.config.vocab_size = target_vocab_size
-    model.resize_token_embeddings(len(tokenizer))
+
+    current_embed = model.get_input_embeddings()
+    if current_embed.weight.shape[0] != target_vocab_size:
+        new_embed = torch.nn.Embedding(target_vocab_size, current_embed.embedding_dim, padding_idx=current_embed.padding_idx)
+        new_embed.to(device=device, dtype=torch.bfloat16)
+        with torch.no_grad():
+            n_copy = min(current_embed.weight.shape[0], target_vocab_size)
+            new_embed.weight[:n_copy] = current_embed.weight[:n_copy]
+        model.set_input_embeddings(new_embed)
+
+    current_head = model.get_output_embeddings()
+    if current_head.out_features != target_vocab_size:
+        new_head = torch.nn.Linear(current_head.in_features, target_vocab_size, bias=False)
+        new_head.to(device=device, dtype=torch.bfloat16)
+        with torch.no_grad():
+            n_copy = min(current_head.out_features, target_vocab_size)
+            new_head.weight[:n_copy, :] = current_head.weight[:n_copy, :]
+        model.set_output_embeddings(new_head)
     
-    # [2] QLoRA Preparation
+    # 5. 모델 전처리
     model = prepare_model_for_kbit_training(model)
 
-    # [3] LoRA 설정 (SAM과 Projector는 제외해야 함 -> FFT니까)
-    # *중요*: vision_tower(CLIP)는 제외하면 안 됨! (User 요청: High rank LoRA)
+    # 6. LoRA 설정
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     target_modules = find_target_linear_modules(model, exclude_keywords)
     
     lora_config = LoraConfig(
-        r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
-        lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
         modules_to_save=["embed_tokens", "lm_head"]
     )
+    
     model = get_peft_model(model, lora_config)
 
-    # [4] Full Finetuning 모듈 Unfreeze (SAM, Projectors)
+    # 7. Unfreeze (SAM 등 학습 모듈 풀기)
     base_glamm = model.base_model.model.model
-    # 4-1. SAM (Grounding Encoder) - Full Finetuning
     if hasattr(base_glamm, "grounding_encoder"):
+        # SAM 전체 학습
         for param in base_glamm.grounding_encoder.parameters():
-            param.requires_grad = True # 전체 학습
-            
-    # 4-2. Projectors - Full Finetuning
+            param.requires_grad = True
+        
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
             for param in getattr(base_glamm, mod_name).parameters():
                 param.requires_grad = True
 
     # ==============================================================================
-    # [5] 🔥 [핵심] Hybrid Casting Strategy (충돌 완벽 방지)
+    # 8. [🔥 The Sweep] 4-bit가 아닌 모든 파라미터를 무조건 BFloat16으로 변환
+    #    - Requires_grad 여부 상관없음. 무조건 통일해야 에러가 안 남.
+    #    - 4-bit 파라미터는 dtype이 uint8이므로 이 루프에서 안전하게 걸러짐.
     # ==============================================================================
-    print("🚑 EXECUTING HYBRID TYPE CASTING...")
-
-    # (A) Full Finetuning 모듈 (SAM, Projector) -> .to(BF16)
-    # 얘네는 4-bit가 아니므로 .to()를 써서 모듈 전체를 확실하게 변환합니다.
-    modules_to_cast = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
-    for mod_name in modules_to_cast:
-        if hasattr(base_glamm, mod_name):
-            print(f" -> Casting {mod_name} to BFloat16...")
-            getattr(base_glamm, mod_name).to(device=device, dtype=torch.bfloat16)
-
-    # (B) LoRA 어댑터 (CLIP & LLM) -> param.data.to(BF16)
-    # LLM이 4-bit라 .to()를 쓰면 죽습니다. 파라미터 데이터만 콕 집어서 바꿉니다.
-    print(" -> Casting Float32 LoRA parameters to BFloat16...")
+    print("🚑 THE SWEEP: Converting ALL non-4bit params to BFloat16...")
     count_casted = 0
+    
     for name, param in model.named_parameters():
-        # 학습해야 하는데 Float32인 것들 (대부분 LoRA)
-        if param.requires_grad and param.dtype == torch.float32:
+        # uint8(4-bit)이 아니고, 이미 bf16이 아니라면 -> 무조건 변환
+        if param.dtype not in [torch.uint8, torch.int8, torch.bfloat16]:
             param.data = param.data.to(torch.bfloat16)
             count_casted += 1
-    print(f" -> Manually casted {count_casted} LoRA parameters.")
+            
+    print(f"✅ Swept & Casted {count_casted} parameters to BFloat16.")
 
-    # (C) SAM Gaussian Matrix 복구 (FP32 필수)
+    # (필수) SAM Gaussian Matrix는 FP32 유지
     count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
@@ -234,67 +272,130 @@ def main():
     print(f"✅ Reset {count_reset} Gaussian matrices to FP32.")
     # ==============================================================================
 
-    # [6] 데이터셋 로드
+    # 9. 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
     train_dataset = ForestDataset(
-        json_path=args.dataset_path, image_folder=args.image_folder,
-        tokenizer=tokenizer, image_processor=CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336"),
+        json_path=args.dataset_path,
+        image_folder=args.image_folder,
+        tokenizer=tokenizer,
+        image_processor=CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336"),
         model_args=args
     )
-    collate_fn = partial(custom_collate_fn, tokenizer=tokenizer, use_mm_start_end=args.use_mm_start_end, local_rank=args.local_rank, inference=False)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, collate_fn=collate_fn, pin_memory=True)
+    
+    collate_fn = partial(
+        custom_collate_fn, 
+        tokenizer=tokenizer, 
+        use_mm_start_end=args.use_mm_start_end, 
+        local_rank=args.local_rank,
+        inference=False
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.workers, 
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
 
-    # [7] DeepSpeed Init
+    # 10. DeepSpeed 설정
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": { "type": "AdamW", "params": { "lr": args.lr, "weight_decay": 0.0, "betas": [0.9, 0.95] } },
-        "scheduler": { "type": "WarmupDecayLR", "params": { "total_num_steps": args.epochs * len(train_loader), "warmup_min_lr": 0, "warmup_max_lr": args.lr, "warmup_num_steps": 100 } },
+        "optimizer": {
+            "type": "AdamW",
+            "params": { "lr": args.lr, "weight_decay": 0.0, "betas": [0.9, 0.95] }
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": args.epochs * len(train_loader),
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": 100
+            }
+        },
         "bf16": { "enabled": True },
-        "zero_optimization": { "stage": 2, "contiguous_gradients": True, "overlap_comm": True, "reduce_scatter": True, "reduce_bucket_size": 5e8, "allgather_bucket_size": 5e8 }
+        "zero_optimization": {
+            "stage": 2,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8
+        }
     }
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
+
+    model_engine, optimizer, _, scheduler = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config=ds_config
+        )
     
-    # [8] 학습 루프
+    # 11. 학습 루프
     print("Starting Training Loop")
     global_step = 0
     final_vocab_size = len(tokenizer) 
-    if args.local_rank == 0: writer = SummaryWriter(args.output_dir)
+
+    if args.local_rank == 0:
+        writer = SummaryWriter(args.output_dir)
     
     for epoch in range(args.epochs):
         model_engine.train()
         progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=(args.local_rank != 0))
+        
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
-            # --- 데이터 무결성 ---
+            # =================================================================
+            # 🔥 데이터 무결성 보정 (스마트 클램핑 + Offset 초기화)
+            # =================================================================
+            
+            # [1] 정답지(Labels) 정화
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
-            
-            # --- Offset 초기화 ---
+
+            # [2] 데이터 길이 안전 절삭
+            safe_max_len = 2500  
+            if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
+                batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
+                if 'labels' in batch:
+                    batch['labels'] = batch['labels'][:, :safe_max_len]
+                if 'attention_masks' in batch:
+                    batch['attention_masks'] = batch['attention_masks'][:, :safe_max_len]
+                elif 'attention_mask' in batch:
+                    batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
+
+            # [3] Offset 강제 초기화
             if 'input_ids' in batch:
                 bsz = batch['input_ids'].shape[0]
                 batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
 
-            # --- Segmentation Mask ---
+            # [4] Segmentation Mask 재계산
             if 'input_ids' in batch and args.seg_token_idx is not None:
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
-                if new_seg_mask.any(): batch['seg_token_mask'] = new_seg_mask
-                else: 
+                if new_seg_mask.any():
+                    batch['seg_token_mask'] = new_seg_mask
+                else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
 
-            # --- Smart Clamping ---
+            # [5] 스마트 클램핑 (이미지 토큰 보호 + 쓰레기 값 제거)
             if 'input_ids' in batch:
                 is_image_token = (batch['input_ids'] == -200)
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             
-            if "global_enc_images" in batch: batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
-            if "grounding_enc_images" in batch: batch["grounding_enc_images"] = batch["grounding_enc_images"].bfloat16()
+            # [6] 입력 이미지 자료형 보장 (중요)
+            if "global_enc_images" in batch and batch["global_enc_images"] is not None:
+                batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
+            if "grounding_enc_images" in batch and batch["grounding_enc_images"] is not None:
+                batch["grounding_enc_images"] = batch["grounding_enc_images"].bfloat16()
                 
             outputs = model_engine(**batch)
             loss = outputs['loss']
+            
             model_engine.backward(loss)
             model_engine.step()
             
@@ -304,9 +405,11 @@ def main():
                 writer.add_scalar("Train/LR", current_lr, global_step)
                 if 'ce_loss' in outputs: writer.add_scalar("Train/CE_Loss", outputs['ce_loss'].item(), global_step)
                 if 'mask_loss' in outputs: writer.add_scalar("Train/Mask_Loss", outputs['mask_loss'].item(), global_step)
+                
             global_step += 1
             
-        if args.local_rank == 0: save_checkpoint(model_engine, args, epoch)
+        if args.local_rank == 0:
+            save_checkpoint(model_engine, args, epoch)
 
 def save_checkpoint(model_engine, args, epoch):
     save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
