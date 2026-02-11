@@ -54,6 +54,12 @@ def print_model_status(model, stage_name):
                 print(f"   - SAM Linear Layer '{name}': weight={mod.weight.dtype}, bias={mod.bias.dtype if mod.bias is not None else 'None'}")
                 break
         
+        # [확인] Gaussian Matrix 상태 확인
+        for name, mod in sam.named_modules():
+            if hasattr(mod, "positional_encoding_gaussian_matrix"):
+                print(f"   - Gaussian Matrix: {mod.positional_encoding_gaussian_matrix.dtype} (Should be bfloat16)")
+                break
+
         # SAM 내부에 LoRA가 있는지 확인
         lora_found = []
         for name, mod in sam.named_modules():
@@ -187,8 +193,6 @@ def find_safe_target_modules(model):
                 target_names.append(name)
     return target_names
 
-
-
 def main():
     args = parse_args()
 
@@ -306,8 +310,7 @@ def main():
             for param in getattr(base_glamm, mod_name).parameters(): param.requires_grad = True
 
     # ==============================================================================
-    # [중요] 🔥 (D) Gaussian Matrix를 BFloat16으로 강제 변환!
-    #        이 코드가 없으면 기본값(FP32)으로 남아서 에러가 납니다.
+    # [🔥 누락되었던 부분 추가!] Gaussian Matrix를 BFloat16으로 강제 변환
     # ==============================================================================
     print("🚑 CASTING: Forcing Gaussian Matrix to BFloat16...")
     for name, module in model.named_modules():
@@ -397,6 +400,15 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
+            # --- [DEBUG] 배치 데이터 상태 확인 (첫 스텝만) ---
+            if global_step == 0 and args.local_rank == 0:
+                print(f"\n{'='*20} [DEBUG: First Batch - Before Casting] {'='*20}")
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        print(f" - Input [{k}]: dtype={v.dtype}, shape={v.shape}")
+                print("="*60 + "\n")
+            # ------------------------------------------------
+
             # [Labels 정화]
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
@@ -425,8 +437,7 @@ def main():
                     if val.dtype != torch.bfloat16:
                         batch[key] = val.to(torch.bfloat16)
             
-            # --- [DEBUG] 배치 데이터 상태 확인 (첫 스텝만) ---
-            # Casting 이후에 확인해야 BF16으로 바뀌었는지 볼 수 있습니다.
+            # --- [DEBUG] 배치 데이터 상태 확인 (Casting 후) ---
             if global_step == 0 and args.local_rank == 0:
                 print(f"\n{'='*20} [DEBUG: First Batch - AFTER Casting] {'='*20}")
                 for k, v in batch.items():
