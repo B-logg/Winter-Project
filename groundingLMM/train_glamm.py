@@ -284,20 +284,39 @@ def main():
                 param.requires_grad = True
 
     # ==============================================================================
-    # 8. [🔥 안전한 강제 변환] module.to() 대신 param.data 사용 (4-bit 충돌 방지)
-    #    - LoRA가 Float32로 생성되므로, 이를 BFloat16으로 직접 바꿉니다.
+    # 8. [🔥 Surgical Casting] LoRA와 일반 모듈만 골라서 .to() 실행 (이게 정답)
+    #    param.data만 바꾸면 모듈 설정이 안 바뀔 수 있고, 
+    #    전체 .to()는 4bit 에러가 나므로, '안전한 모듈'만 찾아서 바꿉니다.
     # ==============================================================================
-    print("🚑 SAFE CASTING: Converting Float32 params to BFloat16 manually...")
-    count_casted = 0
-    for name, param in model.named_parameters():
-        # 학습 대상(LoRA 등)이면서 Float32인 경우만 타겟팅
+    print("🚑 SURGICAL CASTING: Converting specific modules to BFloat16...")
+    
+    # (1) SAM (Grounding Encoder) - 4bit 아님. 안전함.
+    if hasattr(base_glamm, "grounding_encoder"):
+        print(" -> Casting Grounding Encoder (SAM)...")
+        base_glamm.grounding_encoder.to(torch.bfloat16)
+
+    # (2) Projector & FCs - 안전함.
+    if hasattr(base_glamm, "mm_projector"):
+        base_glamm.mm_projector.to(torch.bfloat16)
+    if hasattr(base_glamm, "text_hidden_fcs"):
+        base_glamm.text_hidden_fcs.to(torch.bfloat16)
+        
+    # (3) LoRA Linear 레이어만 찾아서 변환 (Linear4bit는 건드리면 안됨!)
+    print(" -> Casting LoRA Adapter Layers...")
+    lora_count = 0
+    for name, module in model.named_modules():
+        # 이름에 lora가 있고, '진짜' nn.Linear인 경우에만 변환 (Linear4bit는 제외됨)
+        if "lora_" in name and isinstance(module, torch.nn.Linear):
+            module.to(torch.bfloat16)
+            lora_count += 1
+    print(f" -> Casted {lora_count} LoRA Linear layers.")
+
+    # (4) 혹시 모르니 param.data 안전장치 (Float32인 것만)
+    for param in model.parameters():
         if param.requires_grad and param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
-            count_casted += 1
-    
-    print(f"✅ Converted {count_casted} parameters to BFloat16.")
 
-    # [SAM 안전장치] Gaussian Matrix는 FP32 유지 (얘는 BF16이면 안 됨)
+    # (5) SAM Gaussian Matrix는 FP32 복구
     count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
@@ -383,7 +402,7 @@ def main():
             batch = dict_to_cuda(batch)
 
             # =================================================================
-            # 🔥 [Final Fix] 데이터 무결성 & Offset 강제 교정
+            # 🔥 [Final Fix] 데이터 무결성 보정 (스마트 클램핑 + Offset 초기화)
             # =================================================================
             
             # [1] 정답지(Labels) 정화
