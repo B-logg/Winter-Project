@@ -32,36 +32,26 @@ from peft.tuners.lora import LoraLayer
 def print_model_status(model, stage_name):
     print(f"\n{'='*20} [DEBUG: {stage_name}] {'='*20}")
     
-    # 1. Parameter Dtype 통계
     dtypes = {}
     for name, p in model.named_parameters():
         dtype = str(p.dtype)
         dtypes[dtype] = dtypes.get(dtype, 0) + 1
-            
     print(f"📊 Parameter Dtypes Stats: {dtypes}")
     
-    # 2. SAM(Grounding Encoder) 상태 정밀 검사
     base_glamm = model.base_model.model.model if hasattr(model, "base_model") else None
     if base_glamm and hasattr(base_glamm, "grounding_encoder"):
         sam = base_glamm.grounding_encoder
         print(f"🔎 Checking SAM (Grounding Encoder) Internal Dtypes...")
         
-        # Linear 레이어 확인
         for name, mod in sam.named_modules():
             if isinstance(mod, torch.nn.Linear):
                 print(f"   - Linear Layer '{name}': {mod.weight.dtype}")
                 break
         
-        # Gaussian Matrix 확인
-        found_gaussian = False
         for name, buf in sam.named_buffers():
             if "gaussian_matrix" in name:
                 print(f"   - Gaussian Matrix Buffer: {buf.dtype}")
-                found_gaussian = True
                 break
-        if not found_gaussian:
-            print("   ⚠️ Gaussian Matrix Buffer not found by name.")
-
     print("="*60 + "\n")
 
 # =============================================================================
@@ -208,8 +198,6 @@ def main():
         use_mm_start_end=args.use_mm_start_end, mm_vision_select_layer=-2, with_region=True
     )
     model.resize_token_embeddings(len(tokenizer))
-    
-    # [2] QLoRA 준비
     model = prepare_model_for_kbit_training(model)
 
     # [3] LoRA 적용 (Whitelist)
@@ -228,26 +216,29 @@ def main():
     print("🚑 CASTING: Forcing SAM & Projectors to BFloat16...")
     base_glamm = model.base_model.model.model
 
-    # (A) SAM & Projector 전체 모듈 및 버퍼 캐스팅
+    # (A) FFT 대상 모듈 전수 조사 및 강제 BF16 변환
     modules_to_cast = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     for mod_name in modules_to_cast:
         if hasattr(base_glamm, mod_name):
             m = getattr(base_glamm, mod_name)
-            m.to(device=device, dtype=torch.bfloat16)
-            # 모든 버퍼(Gaussian Matrix 등) 강제 BF16 변환
-            for buf_name, buf in m.named_buffers():
-                if buf.dtype == torch.float32:
-                    # 버퍼 데이터 강제 덮어쓰기
-                    buf.data = buf.data.to(torch.bfloat16)
-                    print(f"   -> Forced Buffer '{buf_name}' to bfloat16")
+            # 1. 파라미터 강제 변환
+            for p in m.parameters():
+                if p.dtype != torch.bfloat16:
+                    p.data = p.data.to(torch.bfloat16)
+            # 2. 버퍼(Gaussian Matrix 포함) 강제 변환
+            for b in m.buffers():
+                if b.dtype != torch.bfloat16:
+                    b.data = b.data.to(torch.bfloat16)
+            # 3. 모듈 상태 자체를 BF16으로 (Linear 레이어 설정 등)
+            m.to(torch.bfloat16)
 
     # (B) LoRA 어댑터 캐스팅
     for name, param in model.named_parameters():
         if param.requires_grad and param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
 
-    # (C) [🔥 핵심] SAM Mask Decoder 입력 강제 BF16 Forward Hook
-    # 연산 직전에 모든 텐서 입력을 BF16으로 깎아서 자료형 불일치를 원천 차단합니다.
+    # (C) [🔥 NEW] SAM Mask Decoder 입력 강제 BF16 Forward Hook
+    # 모델 내부에서 생성되어 들어오는 32비트 텐서를 연산 직전에 잡아채서 변환합니다.
     def sam_input_bf16_hook(module, input):
         new_inputs = []
         for i in input:
@@ -258,8 +249,9 @@ def main():
         return tuple(new_inputs)
 
     if hasattr(base_glamm, "grounding_encoder"):
+        # mask_decoder 입구에 갈고리를 겁니다.
         base_glamm.grounding_encoder.mask_decoder.register_forward_pre_hook(sam_input_bf16_hook)
-        print("✅ Forward Hook registered to SAM Mask Decoder.")
+        print("✅ Forward Pre-hook registered to SAM Mask Decoder.")
 
     # (D) Unfreeze
     if hasattr(base_glamm, "grounding_encoder"):
@@ -269,7 +261,6 @@ def main():
             for param in getattr(base_glamm, mod_name).parameters(): param.requires_grad = True
     # ==============================================================================
 
-    # 🔥 [DEBUG] 학습 전 상태 최종 출력
     if args.local_rank == 0:
         print_model_status(model, "Final Check before DeepSpeed Init")
 
@@ -320,7 +311,7 @@ def main():
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             
-            # 🔥 [Input Casting] 모든 Float 입력을 BFloat16으로 변환
+            # 🔥 [Input Casting] 배치 데이터 BF16 변환
             for key, val in batch.items():
                 if isinstance(val, torch.Tensor) and torch.is_floating_point(val):
                     if val.dtype != torch.bfloat16:
@@ -343,6 +334,8 @@ def main():
                 current_lr = model_engine.get_lr()[0]
                 writer.add_scalar("Train/Loss", loss.item(), global_step)
                 writer.add_scalar("Train/LR", current_lr, global_step)
+                if 'ce_loss' in outputs: writer.add_scalar("Train/CE_Loss", outputs['ce_loss'].item(), global_step)
+                if 'mask_loss' in outputs: writer.add_scalar("Train/Mask_Loss", outputs['mask_loss'].item(), global_step)
             global_step += 1
             
         if args.local_rank == 0: save_checkpoint(model_engine, args, epoch)
