@@ -41,17 +41,27 @@ def print_model_status(model, stage_name):
     base_glamm = model.base_model.model.model if hasattr(model, "base_model") else None
     if base_glamm and hasattr(base_glamm, "grounding_encoder"):
         sam = base_glamm.grounding_encoder
-        print(f"🔎 Checking SAM (Grounding Encoder) Internal Dtypes...")
+        print(f"🔎 Checking SAM (Grounding Encoder)...")
         
+        # 1. Linear Weights
         for name, mod in sam.named_modules():
             if isinstance(mod, torch.nn.Linear):
-                print(f"   - Linear Layer '{name}': {mod.weight.dtype}")
+                print(f"   - Linear: {mod.weight.dtype}")
                 break
         
+        # 2. Gaussian Matrix Buffer
+        found = False
         for name, buf in sam.named_buffers():
-            if "gaussian_matrix" in name:
-                print(f"   - Gaussian Matrix Buffer: {buf.dtype}")
-                break
+            if "gaussian" in name:
+                print(f"   - Buffer '{name}': {buf.dtype}")
+                found = True
+        if not found: print("   ⚠️ Gaussian Matrix not found in named_buffers.")
+
+        # 3. Embedding Weights (iou_token, mask_tokens)
+        for name, mod in sam.named_modules():
+            if isinstance(mod, torch.nn.Embedding):
+                print(f"   - Embedding '{name}': {mod.weight.dtype}")
+                
     print("="*60 + "\n")
 
 # =============================================================================
@@ -211,47 +221,63 @@ def main():
     model = get_peft_model(model, lora_config)
 
     # ==============================================================================
-    # [4] 🔥 핵심 캐스팅 및 안전장치 (Type Casting & Forward Hook)
+    # [4] 🔥 Casting & Unfreeze (Monkey Patch 적용)
     # ==============================================================================
     print("🚑 CASTING: Forcing SAM & Projectors to BFloat16...")
     base_glamm = model.base_model.model.model
 
-    # (A) FFT 대상 모듈 전수 조사 및 강제 BF16 변환
+    # (A) 전수 조사 Casting (Buffer 포함)
     modules_to_cast = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     for mod_name in modules_to_cast:
         if hasattr(base_glamm, mod_name):
             m = getattr(base_glamm, mod_name)
-            # 1. 파라미터 강제 변환
+            m.to(device=device, dtype=torch.bfloat16)
+            
+            # 파라미터 강제 변환
             for p in m.parameters():
-                if p.dtype != torch.bfloat16:
-                    p.data = p.data.to(torch.bfloat16)
-            # 2. 버퍼(Gaussian Matrix 포함) 강제 변환
-            for b in m.buffers():
-                if b.dtype != torch.bfloat16:
-                    b.data = b.data.to(torch.bfloat16)
-            # 3. 모듈 상태 자체를 BF16으로 (Linear 레이어 설정 등)
-            m.to(torch.bfloat16)
+                if p.dtype != torch.bfloat16: p.data = p.data.to(torch.bfloat16)
+            
+            # 버퍼(Gaussian Matrix 등) 강제 변환
+            for name, buf in m.named_buffers():
+                if buf.dtype != torch.bfloat16:
+                    buf.data = buf.data.to(torch.bfloat16)
+                    # print(f"   -> Forced Buffer '{name}' to BF16")
 
     # (B) LoRA 어댑터 캐스팅
     for name, param in model.named_parameters():
         if param.requires_grad and param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
 
-    # (C) [🔥 NEW] SAM Mask Decoder 입력 강제 BF16 Forward Hook
-    # 모델 내부에서 생성되어 들어오는 32비트 텐서를 연산 직전에 잡아채서 변환합니다.
-    def sam_input_bf16_hook(module, input):
-        new_inputs = []
-        for i in input:
-            if isinstance(i, torch.Tensor) and torch.is_floating_point(i):
-                new_inputs.append(i.to(torch.bfloat16))
-            else:
-                new_inputs.append(i)
-        return tuple(new_inputs)
-
+    # (C) [🔥 NEW] Monkey Patching (Mask Decoder 입구 봉쇄)
+    #     Hook 대신 forward 함수 자체를 감싸서 확실하게 인자를 가로챕니다.
     if hasattr(base_glamm, "grounding_encoder"):
-        # mask_decoder 입구에 갈고리를 겁니다.
-        base_glamm.grounding_encoder.mask_decoder.register_forward_pre_hook(sam_input_bf16_hook)
-        print("✅ Forward Pre-hook registered to SAM Mask Decoder.")
+        mask_decoder = base_glamm.grounding_encoder.mask_decoder
+        
+        # 원본 forward 함수 보관
+        original_forward = mask_decoder.forward
+        
+        # 래퍼 함수 정의 (무조건 BF16으로 변환해서 전달)
+        def mask_decoder_forward_wrapper(*args, **kwargs):
+            new_args = []
+            for a in args:
+                if isinstance(a, torch.Tensor) and torch.is_floating_point(a):
+                    new_args.append(a.to(torch.bfloat16))
+                else:
+                    new_args.append(a)
+            
+            new_kwargs = {}
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                    new_kwargs[k] = v.to(torch.bfloat16)
+                else:
+                    new_kwargs[k] = v
+                    
+            return original_forward(*new_args, **new_kwargs)
+        
+        # 함수 교체 (Monkey Patch)
+        # bound method를 instance에 할당하여 메소드 오버라이딩
+        mask_decoder.forward = mask_decoder_forward_wrapper
+        print("✅ Monkey Patch applied to SAM Mask Decoder (Force BF16 Inputs).")
 
     # (D) Unfreeze
     if hasattr(base_glamm, "grounding_encoder"):
