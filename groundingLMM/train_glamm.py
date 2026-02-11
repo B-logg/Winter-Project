@@ -187,6 +187,8 @@ def find_safe_target_modules(model):
                 target_names.append(name)
     return target_names
 
+
+
 def main():
     args = parse_args()
 
@@ -215,7 +217,6 @@ def main():
     # 3. 모델 로드 (4-bit)
     skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
                     "text_hidden_fcs", "region_encoder", "lm_head", "embed_tokens"]
-    
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -304,9 +305,16 @@ def main():
         if hasattr(base_glamm, mod_name):
             for param in getattr(base_glamm, mod_name).parameters(): param.requires_grad = True
 
-    # ⚠️ [수정됨] Gaussian Matrix를 FP32로 되돌리는 코드 삭제됨!
-    #    -> SAM 내부 연산을 BF16으로 유지하기 위함.
-    
+    # ==============================================================================
+    # [중요] 🔥 (D) Gaussian Matrix를 BFloat16으로 강제 변환!
+    #        이 코드가 없으면 기본값(FP32)으로 남아서 에러가 납니다.
+    # ==============================================================================
+    print("🚑 CASTING: Forcing Gaussian Matrix to BFloat16...")
+    for name, module in model.named_modules():
+        if hasattr(module, "positional_encoding_gaussian_matrix"):
+            # BF16으로 강제 변환
+            module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(device=device, dtype=torch.bfloat16)
+            print(f"   -> Converted Gaussian Matrix in {name} to {module.positional_encoding_gaussian_matrix.dtype}")
     # ==============================================================================
 
     # 🔥 [DEBUG] 학습 시작 전 모델 상태 최종 점검
@@ -389,15 +397,6 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
-            # --- [DEBUG] 배치 데이터 상태 확인 (첫 스텝만) ---
-            if global_step == 0 and args.local_rank == 0:
-                print(f"\n{'='*20} [DEBUG: First Batch] {'='*20}")
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        print(f" - Input [{k}]: dtype={v.dtype}, shape={v.shape}")
-                print("="*60 + "\n")
-            # ------------------------------------------------
-
             # [Labels 정화]
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
@@ -420,15 +419,21 @@ def main():
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             
-            # ==================================================================
-            # 🔥 [Input Data Casting] 모든 Float 입력을 BFloat16으로 변환
-            #    (이미지뿐만 아니라 region, mask 등 Float32일 수 있는 모든 것을 변환)
-            # ==================================================================
+            # 🔥 [Input Casting] 모든 Float 입력을 BFloat16으로 변환
             for key, val in batch.items():
                 if isinstance(val, torch.Tensor) and torch.is_floating_point(val):
                     if val.dtype != torch.bfloat16:
                         batch[key] = val.to(torch.bfloat16)
-            # ==================================================================
+            
+            # --- [DEBUG] 배치 데이터 상태 확인 (첫 스텝만) ---
+            # Casting 이후에 확인해야 BF16으로 바뀌었는지 볼 수 있습니다.
+            if global_step == 0 and args.local_rank == 0:
+                print(f"\n{'='*20} [DEBUG: First Batch - AFTER Casting] {'='*20}")
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        print(f" - Input [{k}]: dtype={v.dtype}, shape={v.shape}")
+                print("="*60 + "\n")
+            # ------------------------------------------------
                 
             outputs = model_engine(**batch)
             loss = outputs['loss']
@@ -447,6 +452,7 @@ def main():
             
         if args.local_rank == 0:
             save_checkpoint(model_engine, args, epoch)
+
 
 def save_checkpoint(model_engine, args, epoch):
     save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
