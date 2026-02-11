@@ -17,14 +17,15 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.tensorboard import SummaryWriter
 from transformers import BitsAndBytesConfig
 
-#  
 from model.GLaMM import GLaMMForCausalLM 
 from model.llava import conversation as conversation_lib
 from dataset.dataset import custom_collate_fn
 from tools.utils import AverageMeter, ProgressMeter, dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from model.llava.model.language_model.llava_llama import LlamaConfig
-# LoRA 레이어 타입을 확인하기 위해 import
-from peft.tuners.lora import LoraLayer 
+
+# [중요] LoRA 클래스 직접 임포트 (확실한 타입 체크용)
+from peft.tuners.lora import Linear as LoraLinear
+from peft.tuners.lora import LoraLayer
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GLaMM Forest Finetuning")
@@ -176,7 +177,7 @@ def main():
     # [2] QLoRA 준비
     model = prepare_model_for_kbit_training(model)
 
-    # [3] LoRA 적용 (이때 SAM에도 실수로 붙음)
+    # [3] LoRA 적용 (이때 SAM에도 LoRA가 붙어버림)
     exclude_keywords = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     target_modules = find_target_linear_modules(model, exclude_keywords)
     
@@ -188,39 +189,45 @@ def main():
     model = get_peft_model(model, lora_config)
 
     # ==============================================================================
-    # [4] 🔥 [LoRA 박리 수술 (Exorcism)] SAM과 Projector에서 LoRA 제거
-    #     - FFT 대상인 모듈에 붙은 LoRA Wrapper를 벗겨내고 원래 Linear로 복구합니다.
+    # [4] 🔥 [LoRA 완벽 제거 (Exorcism v2)] SAM과 Projector에서 LoRA 제거
+    #     - LoraLayer 뿐만 아니라 LoraLinear 타입까지 확실하게 검사하여 제거
     # ==============================================================================
-    print("🚑 EXORCISM: Stripping LoRA from SAM & Projectors (Restoring FFT)...")
+    print("🚑 EXORCISM v2: Stripping LoRA from SAM & Projectors (Restoring FFT)...")
     
-    def strip_lora_recursively(module):
-        for name, child in module.named_children():
-            # LoRA Layer이면서 원본 레이어(base_layer)가 있는 경우
-            if isinstance(child, LoraLayer) and hasattr(child, "base_layer"):
-                # LoRA 제거하고 원본 Linear로 교체
-                setattr(module, name, child.base_layer)
+    def strip_lora_recursively(parent_module):
+        # 자식 모듈들을 순회하며 LoRA인지 확인
+        for name, child in parent_module.named_children():
+            # LoraLinear(구체적) 또는 LoraLayer(추상적) 인지 확인
+            if isinstance(child, (LoraLinear, LoraLayer)):
+                if hasattr(child, "base_layer"):
+                    print(f"   -> Stripping LoRA from: {name}")
+                    # LoRA 껍데기를 벗기고 원본 Linear로 교체
+                    setattr(parent_module, name, child.base_layer)
             else:
                 # 재귀 호출
                 strip_lora_recursively(child)
 
     base_glamm = model.base_model.model.model
+    
     # (A) SAM (Grounding Encoder) 정화
     if hasattr(base_glamm, "grounding_encoder"):
+        print(" -> Cleaning SAM...")
         strip_lora_recursively(base_glamm.grounding_encoder)
     
     # (B) Projector 정화
+    print(" -> Cleaning Projectors...")
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
             strip_lora_recursively(getattr(base_glamm, mod_name))
             
-    print("✅ LoRA stripped from SAM components.")
+    print("✅ LoRA stripping complete.")
 
     # ==============================================================================
-    # [5] 🔥 [Type Casting] 이제 SAM은 순수 Linear이므로 .to(BF16) 가능
+    # [5] 🔥 [Type Casting] SAM은 이제 순수 Linear이므로 .to(BF16) 가능
     # ==============================================================================
     print("🚑 HYBRID CASTING: Converting modules to BFloat16...")
 
-    # (A) SAM & Projector -> .to(BF16) (이제 LoRA 없음)
+    # (A) SAM & Projector -> .to(BF16) (이제 LoRA 없어서 안전)
     modules_to_cast = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
     for mod_name in modules_to_cast:
         if hasattr(base_glamm, mod_name):
@@ -232,7 +239,7 @@ def main():
         if param.requires_grad and param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
             count_casted += 1
-    print(f"✅ Casted {count_casted} LoRA parameters to BFloat16.")
+    print(f"✅ Casted {count_casted} remaining LoRA parameters to BFloat16.")
 
     # (C) Unfreeze (FFT 대상 학습 활성화)
     if hasattr(base_glamm, "grounding_encoder"):
@@ -249,6 +256,20 @@ def main():
             count_reset += 1
     print(f"✅ Reset {count_reset} Gaussian matrices to FP32.")
     # ==============================================================================
+
+    # [Debug] 최종 확인
+    if args.local_rank == 0:
+        print("\n" + "="*30)
+        print("🔍 FINAL CHECK")
+        found_lora_in_sam = False
+        if hasattr(base_glamm, "grounding_encoder"):
+            for name, mod in base_glamm.grounding_encoder.named_modules():
+                if isinstance(mod, (LoraLinear, LoraLayer)):
+                    print(f"⚠️ STILL FOUND LORA IN SAM: {name}")
+                    found_lora_in_sam = True
+        if not found_lora_in_sam:
+            print("✅ SAM is Clean (No LoRA)")
+        print("="*30 + "\n")
 
     # [6] 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
@@ -287,6 +308,13 @@ def main():
                 batch['labels'][batch['labels'] == -200] = -100
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
             
+            safe_max_len = 2500
+            if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
+                batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
+                if 'labels' in batch: batch['labels'] = batch['labels'][:, :safe_max_len]
+                if 'attention_masks' in batch: batch['attention_masks'] = batch['attention_masks'][:, :safe_max_len]
+                elif 'attention_mask' in batch: batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
+
             if 'input_ids' in batch:
                 bsz = batch['input_ids'].shape[0]
                 batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
