@@ -16,15 +16,13 @@ from torch.utils.data import Dataset, DataLoader
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.tensorboard import SummaryWriter
 from transformers import BitsAndBytesConfig
+import bitsandbytes as bnb # 중요
 
-# 
 from model.GLaMM import GLaMMForCausalLM 
 from model.llava import conversation as conversation_lib
 from dataset.dataset import custom_collate_fn
 from tools.utils import AverageMeter, ProgressMeter, dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from model.llava.model.language_model.llava_llama import LlamaConfig
-from peft.tuners.lora import Linear as LoraLinear
-from peft.tuners.lora import LoraLayer
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GLaMM Forest Finetuning")
@@ -122,6 +120,33 @@ class ForestDataset(Dataset):
             'resize_list': [orig_w, orig_h]
         }
 
+# ==============================================================================
+# 🔥 [핵심 함수] SAM을 제외한 안전한 타겟(LLM, CLIP)만 찾아서 Full Path 리스트 생성
+#    이 함수를 써야 SAM에 LoRA가 붙는 참사를 막을 수 있습니다.
+# ==============================================================================
+def find_safe_target_modules(model):
+    target_names = []
+    # LoRA를 붙이고 싶은 레이어의 끝 이름 (LLM + CLIP)
+    keywords = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    
+    # LoRA를 절대 붙이면 안 되는 경로 (SAM, Projector 등)
+    # 여기에 포함된 단어가 경로에 있으면 무조건 제외합니다.
+    blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
+    
+    for name, module in model.named_modules():
+        # 1. 이름이 타겟 키워드로 끝나는지 확인
+        if any(name.endswith(k) for k in keywords):
+            # 2. 블랙리스트 경로에 포함되는지 확인 (SAM이면 제외)
+            if any(b in name for b in blacklist):
+                continue
+            
+            # 3. 실제 Linear 모듈인지 확인 (Linear 또는 4bit Linear)
+            if isinstance(module, (torch.nn.Linear, bnb.nn.Linear4bit)):
+                # "model.layers.0.self_attn.q_proj" 같은 전체 경로를 추가
+                target_names.append(name)
+                
+    return target_names
+
 def main():
     args = parse_args()
     torch.cuda.set_device(args.local_rank)
@@ -166,11 +191,15 @@ def main():
     # [2] QLoRA 준비
     model = prepare_model_for_kbit_training(model)
 
-    # [3] LoRA 적용 (수동 타겟 지정 - '0', '1' 같은 숫자 제외)
-    # LLM의 주요 Linear Layer들만 지정하여 불필요한 곳에 LoRA가 붙는 것을 1차 방지
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    print(f"🎯 Hardcoded Target Modules: {target_modules}")
+    # ==============================================================================
+    # [3] LoRA 적용 (🔥 중요: Whitelist 방식 사용)
+    #     - find_safe_target_modules 함수가 SAM을 피해 안전한 타겟만 골라줍니다.
+    # ==============================================================================
+    print("🔍 Generating safe LoRA target list (Avoiding SAM)...")
+    target_modules = find_safe_target_modules(model)
+    print(f"✅ Found {len(target_modules)} safe LoRA targets (LLM + CLIP).")
     
+    # 하드코딩된 리스트 대신, 생성된 안전 리스트를 사용합니다.
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
         lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
@@ -179,60 +208,26 @@ def main():
     model = get_peft_model(model, lora_config)
 
     # ==============================================================================
-    # [4] 🔥 [LoRA 박리 (Exorcism)] SAM과 Projector에서 LoRA 제거
+    # [4] 🔥 [Type Casting] 이제 SAM은 순수 Linear이므로 안심하고 BFloat16으로 변환
+    #     - LoRA가 붙지 않았으므로 .to(bf16)을 써도 에러가 안 나고, 자료형이 확실히 바뀝니다.
     # ==============================================================================
-    print("🚑 EXORCISM: Stripping LoRA from SAM & Projectors...")
-    
-    def strip_lora_recursively(parent_module):
-        for name, child in parent_module.named_children():
-            # LoRA Layer인지 확인 (LoraLayer 또는 LoraLinear)
-            if isinstance(child, (LoraLinear, LoraLayer)) or "Lora" in child.__class__.__name__:
-                if hasattr(child, "base_layer"):
-                    # LoRA 제거하고 원본 Linear로 교체
-                    setattr(parent_module, name, child.base_layer)
-                elif hasattr(child, "linear"):
-                    setattr(parent_module, name, child.linear)
-            else:
-                strip_lora_recursively(child)
-
+    print("🚑 CASTING: Converting SAM & Projectors to BFloat16...")
     base_glamm = model.base_model.model.model
-    # (A) SAM 정화
+
+    # (A) SAM & Projector -> .to(BF16)
     if hasattr(base_glamm, "grounding_encoder"):
-        strip_lora_recursively(base_glamm.grounding_encoder)
-    # (B) Projector 정화
+        base_glamm.grounding_encoder.to(device=device, dtype=torch.bfloat16)
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
-            strip_lora_recursively(getattr(base_glamm, mod_name))
-            
-    print("✅ LoRA stripping complete.")
+            getattr(base_glamm, mod_name).to(device=device, dtype=torch.bfloat16)
 
-    # ==============================================================================
-    # [5] 🔥 [Data Casting] SAM의 파라미터 데이터 강제 변환 (가장 확실한 방법)
-    #     module.to() 대신 param.data를 직접 바꿉니다.
-    # ==============================================================================
-    print("🚑 DATA CASTING: Forcing SAM & Projectors parameters to BFloat16...")
-
-    modules_to_cast = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
-    count_sam_casted = 0
-    
-    for mod_name in modules_to_cast:
-        if hasattr(base_glamm, mod_name):
-            module = getattr(base_glamm, mod_name)
-            # 해당 모듈의 모든 파라미터를 순회
-            for param in module.parameters():
-                if param.dtype == torch.float32: # FP32면 강제 변환
-                    param.data = param.data.to(torch.bfloat16)
-                    count_sam_casted += 1
-                    
-    print(f"✅ Casted {count_sam_casted} parameters in SAM/Projectors to BFloat16.")
-
-    # (B) LLM LoRA 어댑터도 캐스팅
-    count_lora_casted = 0
+    # (B) LLM & CLIP의 LoRA -> param.data.to(BF16) (4bit 충돌 방지용)
+    count_casted = 0
     for name, param in model.named_parameters():
         if param.requires_grad and param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
-            count_lora_casted += 1
-    print(f"✅ Casted {count_lora_casted} remaining LoRA parameters to BFloat16.")
+            count_casted += 1
+    print(f"✅ Casted {count_casted} remaining LoRA parameters to BFloat16.")
 
     # (C) Unfreeze (FFT 대상 학습 활성화)
     if hasattr(base_glamm, "grounding_encoder"):
@@ -241,11 +236,24 @@ def main():
         if hasattr(base_glamm, mod_name):
             for param in getattr(base_glamm, mod_name).parameters(): param.requires_grad = True
 
-    # (D) SAM Gaussian Matrix 복구 (FP32 필수)
+    # (D) SAM Gaussian Matrix 복구 (필수)
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
             module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(torch.float32)
     # ==============================================================================
+
+    # [Check] SAM에 LoRA가 없는지 로그로 확인
+    if args.local_rank == 0:
+        print("\n" + "="*40)
+        print("🔍 FINAL CHECK")
+        found_bad = False
+        if hasattr(base_glamm, "grounding_encoder"):
+            for name, mod in base_glamm.grounding_encoder.named_modules():
+                if "Lora" in mod.__class__.__name__:
+                    print(f"⚠️ FOUND LORA IN SAM: {name}")
+                    found_bad = True
+        if not found_bad: print("✅ SAM IS CLEAN (No LoRA attached)")
+        print("="*40 + "\n")
 
     # [6] 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
