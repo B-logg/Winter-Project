@@ -235,42 +235,39 @@ def main():
     
     model = get_peft_model(model, lora_config)
 
-    # 7. Unfreeze (SAM 등 학습 모듈 풀기)
+    # 7. Unfreeze
     base_glamm = model.base_model.model.model
     if hasattr(base_glamm, "grounding_encoder"):
-        # SAM 전체 학습
-        for param in base_glamm.grounding_encoder.parameters():
-            param.requires_grad = True
+        mask_decoder = base_glamm.grounding_encoder.mask_decoder
+        for param in mask_decoder.parameters(): param.requires_grad = True
+        for param in base_glamm.grounding_encoder.image_encoder.parameters(): param.requires_grad = False
         
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
             for param in getattr(base_glamm, mod_name).parameters():
                 param.requires_grad = True
 
-    # ==============================================================================
-    # 8. [🔥 The Sweep] 4-bit가 아닌 모든 파라미터를 무조건 BFloat16으로 변환
-    #    - Requires_grad 여부 상관없음. 무조건 통일해야 에러가 안 남.
-    #    - 4-bit 파라미터는 dtype이 uint8이므로 이 루프에서 안전하게 걸러짐.
-    # ==============================================================================
-    print("🚑 THE SWEEP: Converting ALL non-4bit params to BFloat16...")
-    count_casted = 0
+    # 8. [Surgical Casting] LoRA와 일반 모듈만 변환
+    print("🚑 SURGICAL CASTING: Converting specific modules to BFloat16...")
+    if hasattr(base_glamm, "grounding_encoder"):
+        base_glamm.grounding_encoder.to(torch.bfloat16)
+    if hasattr(base_glamm, "mm_projector"):
+        base_glamm.mm_projector.to(torch.bfloat16)
+    if hasattr(base_glamm, "text_hidden_fcs"):
+        base_glamm.text_hidden_fcs.to(torch.bfloat16)
+    for name, module in model.named_modules():
+        if "lora_" in name and isinstance(module, torch.nn.Linear):
+            module.to(torch.bfloat16)
     
-    for name, param in model.named_parameters():
-        # uint8(4-bit)이 아니고, 이미 bf16이 아니라면 -> 무조건 변환
-        if param.dtype not in [torch.uint8, torch.int8, torch.bfloat16]:
+    # 파라미터 데이터 재확인
+    for param in model.parameters():
+        if param.requires_grad and param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
-            count_casted += 1
-            
-    print(f"✅ Swept & Casted {count_casted} parameters to BFloat16.")
 
-    # (필수) SAM Gaussian Matrix는 FP32 유지
-    count_reset = 0
+    # SAM Gaussian Matrix 복구
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
             module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(torch.float32)
-            count_reset += 1
-    print(f"✅ Reset {count_reset} Gaussian matrices to FP32.")
-    # ==============================================================================
 
     # 9. 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
@@ -333,6 +330,47 @@ def main():
             config=ds_config
         )
     
+    # ==============================================================================
+    # 🔍 [DEBUG] 모델 상태 검문소 (여기서 비트수 확인!)
+    # ==============================================================================
+    if args.local_rank == 0:
+        print("\n" + "="*50)
+        print("🔍 [DEBUG] Checking Model Parameter Data Types...")
+        print("="*50)
+        
+        # 1. LLM (4-bit) 체크
+        print("[1] LLM Layer Check:")
+        found_llm = False
+        for name, module in model.named_modules():
+            if "layers.0.self_attn.q_proj" in name:
+                print(f"   Target: {name}")
+                print(f"   Type: {type(module)}")
+                if hasattr(module, "weight"):
+                    print(f"   Weight Dtype: {module.weight.dtype}") # 4bit면 uint8이어야 함
+                if hasattr(module, "lora_A"):
+                    print(f"   LoRA_A Dtype: {module.lora_A['default'].weight.dtype}") # BF16이어야 함
+                found_llm = True
+                break
+        if not found_llm: print("   ⚠️ Could not find LLM layer to check.")
+
+        # 2. SAM (Mask Decoder) 체크 - 여기가 에러 발생 지점
+        print("\n[2] SAM Mask Decoder Check (Error Spot):")
+        found_sam = False
+        for name, module in model.named_modules():
+            if "mask_decoder" in name and "transformer" in name and isinstance(module, torch.nn.Linear):
+                print(f"   Target: {name}")
+                print(f"   Weight Dtype: {module.weight.dtype}") # BF16이어야 함
+                if hasattr(module, "lora_A"):
+                    print(f"   ⚠️ WARNING: LoRA found in SAM! -> lora_A Dtype: {module.lora_A['default'].weight.dtype}") 
+                else:
+                    print(f"   ✅ No LoRA attached (Correct for FFT)")
+                found_sam = True
+                break # 하나만 확인
+        if not found_sam: print("   ⚠️ Could not find SAM Mask Decoder layer.")
+
+        print("="*50 + "\n")
+    # ==============================================================================
+
     # 11. 학습 루프
     print("Starting Training Loop")
     global_step = 0
@@ -348,16 +386,10 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
-            # =================================================================
-            # 🔥 데이터 무결성 보정 (스마트 클램핑 + Offset 초기화)
-            # =================================================================
-            
-            # [1] 정답지(Labels) 정화
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
 
-            # [2] 데이터 길이 안전 절삭
             safe_max_len = 2500  
             if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
                 batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
@@ -368,12 +400,10 @@ def main():
                 elif 'attention_mask' in batch:
                     batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
 
-            # [3] Offset 강제 초기화
             if 'input_ids' in batch:
                 bsz = batch['input_ids'].shape[0]
                 batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
 
-            # [4] Segmentation Mask 재계산
             if 'input_ids' in batch and args.seg_token_idx is not None:
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
                 if new_seg_mask.any():
@@ -381,13 +411,11 @@ def main():
                 else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
 
-            # [5] 스마트 클램핑 (이미지 토큰 보호 + 쓰레기 값 제거)
             if 'input_ids' in batch:
                 is_image_token = (batch['input_ids'] == -200)
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             
-            # [6] 입력 이미지 자료형 보장 (중요)
             if "global_enc_images" in batch and batch["global_enc_images"] is not None:
                 batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
             if "grounding_enc_images" in batch and batch["grounding_enc_images"] is not None:
