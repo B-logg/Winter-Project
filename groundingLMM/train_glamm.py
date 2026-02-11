@@ -135,102 +135,140 @@ def find_target_linear_modules(model, exclude_keywords=[]):
 
 def main():
     args = parse_args()
+
+    # 1. GPU 설정
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     
+    # 2. 토크나이저 설정
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
     )
+    temp_config = transformers.AutoConfig.from_pretrained(args.version)
+    max_pos_len = getattr(temp_config, "max_position_embeddings", 4096)
+    tokenizer.model_max_length = max_pos_len
     tokenizer.pad_token = tokenizer.unk_token
+    
+    # Special Tokens
     special_tokens = ['[SEG]', '<bbox>', '<point>', '<p>', '</p>']
     if args.use_mm_start_end:
         special_tokens.extend([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN])
     tokenizer.add_tokens(special_tokens, special_tokens=True)
+    
     args.bbox_token_idx = tokenizer("<bbox>", add_special_tokens=False).input_ids[0]
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
-    # [1] 모델 로드
+    # 3. 모델 로드 (4-bit)
     skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
                     "text_hidden_fcs", "region_encoder", "lm_head", "embed_tokens"]
+    
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
         llm_int8_skip_modules=skip_modules
     )
+
     print(f"Loading GLaMM from {args.version}...")
+    
+    model_kwargs = {
+        "train_mask_decoder": args.train_mask_decoder,
+        "out_dim": args.out_dim,
+        "ce_loss_weight": args.ce_loss_weight,
+        "dice_loss_weight": args.dice_loss_weight,
+        "bce_loss_weight": args.bce_loss_weight,
+        "seg_token_idx": args.seg_token_idx,
+        "vision_pretrained": args.vision_pretrained,
+        "vision_tower": args.vision_tower,
+        "use_mm_start_end": args.use_mm_start_end,
+        "mm_vision_select_layer": -2,
+        "with_region": True
+    }
+    
     model = GLaMMForCausalLM.from_pretrained(
-        args.version, quantization_config=bnb_config, torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True, device_map = {"": args.local_rank},
-        train_mask_decoder=args.train_mask_decoder, out_dim=args.out_dim,
-        ce_loss_weight=args.ce_loss_weight, dice_loss_weight=args.dice_loss_weight,
-        bce_loss_weight=args.bce_loss_weight, seg_token_idx=args.seg_token_idx,
-        vision_pretrained=args.vision_pretrained, vision_tower=args.vision_tower,
-        use_mm_start_end=args.use_mm_start_end, mm_vision_select_layer=-2, with_region=True
+        args.version,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map = {"": args.local_rank},
+        **model_kwargs
     )
 
+    # 4. 임베딩 리사이즈
     target_vocab_size = len(tokenizer)
     model.config.vocab_size = target_vocab_size
     if hasattr(model, "model") and hasattr(model.model, "config"):
         model.model.config.vocab_size = target_vocab_size
     model.resize_token_embeddings(len(tokenizer))
     
-    # [2] QLoRA 준비
+    # 5. 모델 전처리 (Gradient Checkpointing 등)
     model = prepare_model_for_kbit_training(model)
 
-    # [3] LoRA 적용 (SAM에도 잘못 붙음)
-    target_modules = find_target_linear_modules(model, exclude_keywords=[])
+    # ==============================================================================
+    # 6. [🔥 중요] LoRA 타겟 수동 지정 (자동 탐색 금지)
+    #    - 자동 탐색을 쓰면 SAM 내부의 숫자('0', '1')가 타겟에 들어가서 LlamaDecoderLayer를 덮으려다 에러남.
+    #    - LLM의 Linear 레이어 이름만 명시적으로 지정합니다.
+    # ==============================================================================
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    print(f"🎯 Hardcoded Target Modules: {target_modules}")
+    
     lora_config = LoraConfig(
-        r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
-        lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
         modules_to_save=["embed_tokens", "lm_head"]
     )
+    
+    # 여기서 에러 안 날 겁니다 (이상한 타겟이 없으므로)
     model = get_peft_model(model, lora_config)
 
     # ==============================================================================
-    # [4] 🔥 [LoRA 강제 적출 (The Surgical Removal)]
-    #     SAM과 Projector 모듈을 순회하면서, LoRA가 붙어있으면 뜯어내고 원본으로 교체
+    # 7. [🔥 LoRA 박리 (Exorcism)] SAM에도 'q_proj'가 있어서 LoRA가 붙었을 수 있음 -> 제거
     # ==============================================================================
-    print("🚑 SURGICAL REMOVAL: Stripping LoRA from SAM & Projectors...")
+    print("🚑 EXORCISM: Stripping accidental LoRA from SAM & Projectors...")
     
-    def strip_lora_from_module(parent_module):
+    def strip_lora_recursively(parent_module):
         for name, child in parent_module.named_children():
-            # 만약 자식이 LoRA 레이어라면 (base_layer를 가지고 있음)
-            if hasattr(child, "base_layer"):
-                # print(f"   -> ✂️ Removing LoRA from: {name}")
-                # LoRA 껍데기를 버리고, 그 안의 base_layer(원본 Linear)를 부모에게 붙임
-                setattr(parent_module, name, child.base_layer)
+            # LoraLinear(구체적) 또는 LoraLayer(추상적) 인지 확인
+            if isinstance(child, (LoraLinear, LoraLayer)) or "Lora" in child.__class__.__name__:
+                if hasattr(child, "base_layer"):
+                    # print(f"   -> Stripping LoRA from: {name}")
+                    setattr(parent_module, name, child.base_layer)
+                elif hasattr(child, "linear"): # 일부 버전 호환
+                    setattr(parent_module, name, child.linear)
             else:
-                # 일반 모듈이면 계속 재귀 탐색
-                strip_lora_from_module(child)
+                strip_lora_recursively(child)
 
     base_glamm = model.base_model.model.model
     
-    # (A) SAM (Grounding Encoder) 청소
+    # (A) SAM 정화
     if hasattr(base_glamm, "grounding_encoder"):
-        print(" -> Cleaning SAM (Grounding Encoder)...")
-        strip_lora_from_module(base_glamm.grounding_encoder)
+        strip_lora_recursively(base_glamm.grounding_encoder)
     
-    # (B) Projector 청소
-    print(" -> Cleaning Projectors...")
+    # (B) Projector 정화
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
-            strip_lora_from_module(getattr(base_glamm, mod_name))
+            strip_lora_recursively(getattr(base_glamm, mod_name))
             
-    print("✅ LoRA removal complete. SAM is now pure.")
+    print("✅ LoRA stripping complete.")
 
     # ==============================================================================
-    # [5] 🔥 [Type Casting] 이제 SAM은 안전하므로 BFloat16으로 변환
+    # 8. [🔥 하이브리드 캐스팅] SAM은 .to(), LoRA는 .data
     # ==============================================================================
-    print("🚑 FINAL CASTING: Ensuring correct dtypes...")
+    print("🚑 HYBRID CASTING: Converting modules to BFloat16...")
 
-    # (A) SAM & Projector -> BFloat16 (LoRA 없어서 안전)
+    # (A) SAM & Projector -> .to(BF16)
     if hasattr(base_glamm, "grounding_encoder"):
         base_glamm.grounding_encoder.to(device=device, dtype=torch.bfloat16)
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
         if hasattr(base_glamm, mod_name):
             getattr(base_glamm, mod_name).to(device=device, dtype=torch.bfloat16)
 
-    # (B) LLM & CLIP의 LoRA -> BFloat16 (param.data 사용)
+    # (B) LLM LoRA -> param.data
     count_casted = 0
     for name, param in model.named_parameters():
         if param.requires_grad and param.dtype == torch.float32:
@@ -238,7 +276,7 @@ def main():
             count_casted += 1
     print(f"✅ Casted {count_casted} remaining LoRA parameters to BFloat16.")
 
-    # (C) Unfreeze (FFT 대상 학습 활성화)
+    # (C) Unfreeze
     if hasattr(base_glamm, "grounding_encoder"):
         for param in base_glamm.grounding_encoder.parameters(): param.requires_grad = True
     for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
@@ -251,69 +289,105 @@ def main():
             module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(torch.float32)
     # ==============================================================================
 
-    # [Debug] 최종 확인
-    if args.local_rank == 0:
-        print("\n" + "="*40)
-        print("🔍 FINAL CHECK")
-        found_lora_in_sam = False
-        if hasattr(base_glamm, "grounding_encoder"):
-            for name, mod in base_glamm.grounding_encoder.named_modules():
-                # 여전히 base_layer 속성이 있거나 Lora 클래스라면 실패한 것
-                if hasattr(mod, "base_layer") or "Lora" in mod.__class__.__name__:
-                    print(f"⚠️ STILL FOUND LORA IN SAM: {name} ({type(mod)})")
-                    found_lora_in_sam = True
-        
-        if not found_lora_in_sam:
-            print("✅ SAM is Clean (Pure Linear Layers confirmed)")
-        else:
-            print("❌ SAM still has LoRA.")
-        print("="*40 + "\n")
-
-    # [6] 데이터셋 로드
+    # 9. 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
     train_dataset = ForestDataset(
-        json_path=args.dataset_path, image_folder=args.image_folder,
-        tokenizer=tokenizer, image_processor=CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336"),
+        json_path=args.dataset_path,
+        image_folder=args.image_folder,
+        tokenizer=tokenizer,
+        image_processor=CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336"),
         model_args=args
     )
-    collate_fn = partial(custom_collate_fn, tokenizer=tokenizer, use_mm_start_end=args.use_mm_start_end, local_rank=args.local_rank, inference=False)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, collate_fn=collate_fn, pin_memory=True)
+    
+    collate_fn = partial(
+        custom_collate_fn, 
+        tokenizer=tokenizer, 
+        use_mm_start_end=args.use_mm_start_end, 
+        local_rank=args.local_rank,
+        inference=False
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.workers, 
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
 
-    # [7] DeepSpeed Init
+    # 10. DeepSpeed 설정
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": { "type": "AdamW", "params": { "lr": args.lr, "weight_decay": 0.0, "betas": [0.9, 0.95] } },
-        "scheduler": { "type": "WarmupDecayLR", "params": { "total_num_steps": args.epochs * len(train_loader), "warmup_min_lr": 0, "warmup_max_lr": args.lr, "warmup_num_steps": 100 } },
+        "optimizer": {
+            "type": "AdamW",
+            "params": { "lr": args.lr, "weight_decay": 0.0, "betas": [0.9, 0.95] }
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": args.epochs * len(train_loader),
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": 100
+            }
+        },
         "bf16": { "enabled": True },
-        "zero_optimization": { "stage": 2, "contiguous_gradients": True, "overlap_comm": True, "reduce_scatter": True, "reduce_bucket_size": 5e8, "allgather_bucket_size": 5e8 }
+        "zero_optimization": {
+            "stage": 2,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8
+        }
     }
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
+
+    model_engine, optimizer, _, scheduler = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config=ds_config
+        )
     
-    # [8] 학습 루프
+    # 11. 학습 루프
     print("Starting Training Loop")
     global_step = 0
     final_vocab_size = len(tokenizer) 
-    if args.local_rank == 0: writer = SummaryWriter(args.output_dir)
+
+    if args.local_rank == 0:
+        writer = SummaryWriter(args.output_dir)
     
     for epoch in range(args.epochs):
         model_engine.train()
         progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=(args.local_rank != 0))
+        
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
                 batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
-            
+
+            safe_max_len = 2500  
+            if 'input_ids' in batch and batch['input_ids'].shape[1] > safe_max_len:
+                batch['input_ids'] = batch['input_ids'][:, :safe_max_len]
+                if 'labels' in batch:
+                    batch['labels'] = batch['labels'][:, :safe_max_len]
+                if 'attention_masks' in batch:
+                    batch['attention_masks'] = batch['attention_masks'][:, :safe_max_len]
+                elif 'attention_mask' in batch:
+                    batch['attention_mask'] = batch['attention_mask'][:, :safe_max_len]
+
             if 'input_ids' in batch:
                 bsz = batch['input_ids'].shape[0]
                 batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
 
             if 'input_ids' in batch and args.seg_token_idx is not None:
                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
-                if new_seg_mask.any(): batch['seg_token_mask'] = new_seg_mask
-                else: 
+                if new_seg_mask.any():
+                    batch['seg_token_mask'] = new_seg_mask
+                else:
                     if 'seg_token_mask' in batch: del batch['seg_token_mask']
 
             if 'input_ids' in batch:
@@ -321,11 +395,14 @@ def main():
                 clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             
-            if "global_enc_images" in batch: batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
-            if "grounding_enc_images" in batch: batch["grounding_enc_images"] = batch["grounding_enc_images"].bfloat16()
+            if "global_enc_images" in batch and batch["global_enc_images"] is not None:
+                batch["global_enc_images"] = batch["global_enc_images"].bfloat16()
+            if "grounding_enc_images" in batch and batch["grounding_enc_images"] is not None:
+                batch["grounding_enc_images"] = batch["grounding_enc_images"].bfloat16()
                 
             outputs = model_engine(**batch)
             loss = outputs['loss']
+            
             model_engine.backward(loss)
             model_engine.step()
             
@@ -335,9 +412,32 @@ def main():
                 writer.add_scalar("Train/LR", current_lr, global_step)
                 if 'ce_loss' in outputs: writer.add_scalar("Train/CE_Loss", outputs['ce_loss'].item(), global_step)
                 if 'mask_loss' in outputs: writer.add_scalar("Train/Mask_Loss", outputs['mask_loss'].item(), global_step)
+                
             global_step += 1
             
-        if args.local_rank == 0: save_checkpoint(model_engine, args, epoch)
+        if args.local_rank == 0:
+            save_checkpoint(model_engine, args, epoch)
+
+
+def save_checkpoint(model_engine, args, epoch):
+    save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 1. LoRA Adapters 저장
+    model_engine.module.save_pretrained(save_path)
+    
+    # 2. Non-LoRA Trainable Weights 저장 (Mask Decoder 등)
+    print(f"Saving non-LoRA weights to {save_path}...")
+    non_lora_state = {}
+    for name, param in model_engine.module.named_parameters():
+        if param.requires_grad and "lora_" not in name:
+            non_lora_state[name] = param.cpu()
+            
+    torch.save(non_lora_state, os.path.join(save_path, "non_lora_trainables.bin"))
+    print("Save complete.")
+
+if __name__ == "__main__":
+    main()
 
 def save_checkpoint(model_engine, args, epoch):
     save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
