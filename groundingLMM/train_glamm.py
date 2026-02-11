@@ -22,6 +22,8 @@ from model.llava import conversation as conversation_lib
 from dataset.dataset import custom_collate_fn
 from tools.utils import AverageMeter, ProgressMeter, dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from model.llava.model.language_model.llava_llama import LlamaConfig
+
+# [중요] LoRA 레이어 식별을 위한 import
 from peft.tuners.lora import Linear as LoraLinear
 from peft.tuners.lora import LoraLayer
 
@@ -175,10 +177,8 @@ def main():
     # [2] QLoRA 준비
     model = prepare_model_for_kbit_training(model)
 
-    # [3] LoRA 적용 (이때 SAM에도 LoRA가 붙어버림)
-    # exclude_keywords가 잘 안 먹히는 경우가 많아서, 일단 다 붙이고 나중에 뗄겁니다.
-    target_modules = find_target_linear_modules(model, exclude_keywords=[]) 
-    
+    # [3] LoRA 적용 (SAM에도 잘못 붙음)
+    target_modules = find_target_linear_modules(model, exclude_keywords=[])
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
         lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
@@ -187,52 +187,50 @@ def main():
     model = get_peft_model(model, lora_config)
 
     # ==============================================================================
-    # [4] 🔥 [LoRA 광역 박리 (Global Exorcism)] 키워드 기반으로 확실하게 제거
-    #     - 모델 구조를 몰라도 'grounding'이나 'mask_decoder'가 들어간 곳은 무조건 복구
+    # [4] 🔥 [LoRA 강제 적출 (The Surgical Removal)]
+    #     SAM과 Projector 모듈을 순회하면서, LoRA가 붙어있으면 뜯어내고 원본으로 교체
     # ==============================================================================
-    print("🚑 GLOBAL EXORCISM: Searching and Destroying LoRA in SAM/Projectors...")
+    print("🚑 SURGICAL REMOVAL: Stripping LoRA from SAM & Projectors...")
     
-    # LoRA 제거 함수 (재귀)
-    def recursive_strip_lora(module, module_name=""):
-        for name, child in module.named_children():
-            full_name = f"{module_name}.{name}" if module_name else name
-            
-            # (1) SAM이나 Projector 관련 모듈인지 확인 (키워드 매칭)
-            is_fft_target = any(k in full_name for k in ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder"])
-            
-            # (2) LoRA 레이어인지 확인
-            is_lora = isinstance(child, (LoraLinear, LoraLayer)) or "Lora" in child.__class__.__name__
-            
-            if is_fft_target and is_lora:
-                if hasattr(child, "base_layer"):
-                    print(f"   -> ✂️ Stripping LoRA from: {full_name}")
-                    setattr(module, name, child.base_layer) # 원본 Linear로 교체
-                elif hasattr(child, "linear"): # 일부 버전에선 linear 속성
-                    print(f"   -> ✂️ Stripping LoRA from: {full_name}")
-                    setattr(module, name, child.linear)
+    def strip_lora_from_module(parent_module):
+        for name, child in parent_module.named_children():
+            # 만약 자식이 LoRA 레이어라면 (base_layer를 가지고 있음)
+            if hasattr(child, "base_layer"):
+                # print(f"   -> ✂️ Removing LoRA from: {name}")
+                # LoRA 껍데기를 버리고, 그 안의 base_layer(원본 Linear)를 부모에게 붙임
+                setattr(parent_module, name, child.base_layer)
             else:
-                recursive_strip_lora(child, full_name)
+                # 일반 모듈이면 계속 재귀 탐색
+                strip_lora_from_module(child)
 
-    # 모델 전체를 돌면서 키워드가 포함된 곳의 LoRA를 제거
-    recursive_strip_lora(model)
-    print("✅ LoRA stripping complete.")
+    base_glamm = model.base_model.model.model
+    
+    # (A) SAM (Grounding Encoder) 청소
+    if hasattr(base_glamm, "grounding_encoder"):
+        print(" -> Cleaning SAM (Grounding Encoder)...")
+        strip_lora_from_module(base_glamm.grounding_encoder)
+    
+    # (B) Projector 청소
+    print(" -> Cleaning Projectors...")
+    for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
+        if hasattr(base_glamm, mod_name):
+            strip_lora_from_module(getattr(base_glamm, mod_name))
+            
+    print("✅ LoRA removal complete. SAM is now pure.")
 
     # ==============================================================================
-    # [5] 🔥 [Type Casting] SAM은 이제 순수 Linear이므로 .to(BF16) 가능
+    # [5] 🔥 [Type Casting] 이제 SAM은 안전하므로 BFloat16으로 변환
     # ==============================================================================
-    print("🚑 HYBRID CASTING: Converting modules to BFloat16...")
+    print("🚑 FINAL CASTING: Ensuring correct dtypes...")
 
-    # (A) 키워드 기반으로 SAM & Projector 모듈 찾아서 .to(BF16)
-    # 모델 구조가 복잡해도 키워드로 찾아서 바꿈
-    for name, module in model.named_modules():
-        if any(k in name for k in ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder"]):
-            # 이미 변환된 상위 모듈의 하위일 수 있으므로 try-except
-            try:
-                module.to(device=device, dtype=torch.bfloat16)
-            except:
-                pass
+    # (A) SAM & Projector -> BFloat16 (LoRA 없어서 안전)
+    if hasattr(base_glamm, "grounding_encoder"):
+        base_glamm.grounding_encoder.to(device=device, dtype=torch.bfloat16)
+    for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
+        if hasattr(base_glamm, mod_name):
+            getattr(base_glamm, mod_name).to(device=device, dtype=torch.bfloat16)
 
-    # (B) LLM & CLIP에 남은 LoRA -> param.data.to(BF16)
+    # (B) LLM & CLIP의 LoRA -> BFloat16 (param.data 사용)
     count_casted = 0
     for name, param in model.named_parameters():
         if param.requires_grad and param.dtype == torch.float32:
@@ -241,35 +239,35 @@ def main():
     print(f"✅ Casted {count_casted} remaining LoRA parameters to BFloat16.")
 
     # (C) Unfreeze (FFT 대상 학습 활성화)
-    print("🔓 Unfreezing SAM and Projectors...")
-    for name, param in model.named_parameters():
-        if any(k in name for k in ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]):
-            param.requires_grad = True
+    if hasattr(base_glamm, "grounding_encoder"):
+        for param in base_glamm.grounding_encoder.parameters(): param.requires_grad = True
+    for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
+        if hasattr(base_glamm, mod_name):
+            for param in getattr(base_glamm, mod_name).parameters(): param.requires_grad = True
 
     # (D) SAM Gaussian Matrix 복구
-    count_reset = 0
     for name, module in model.named_modules():
         if hasattr(module, "positional_encoding_gaussian_matrix"):
             module.positional_encoding_gaussian_matrix = module.positional_encoding_gaussian_matrix.to(torch.float32)
-            count_reset += 1
-    print(f"✅ Reset {count_reset} Gaussian matrices to FP32.")
     # ==============================================================================
 
-    # [Debug] 최종 확인 (로그에 이거 뜨는지 꼭 확인하세요!)
+    # [Debug] 최종 확인
     if args.local_rank == 0:
-        print("\n" + "="*50)
+        print("\n" + "="*40)
         print("🔍 FINAL CHECK")
         found_lora_in_sam = False
-        for name, mod in model.named_modules():
-            if "mask_decoder" in name and isinstance(mod, (LoraLinear, LoraLayer)):
-                print(f"⚠️ [CRITICAL] STILL FOUND LORA IN SAM: {name}")
-                found_lora_in_sam = True
+        if hasattr(base_glamm, "grounding_encoder"):
+            for name, mod in base_glamm.grounding_encoder.named_modules():
+                # 여전히 base_layer 속성이 있거나 Lora 클래스라면 실패한 것
+                if hasattr(mod, "base_layer") or "Lora" in mod.__class__.__name__:
+                    print(f"⚠️ STILL FOUND LORA IN SAM: {name} ({type(mod)})")
+                    found_lora_in_sam = True
         
         if not found_lora_in_sam:
-            print("✅ SAM is Clean (No LoRA found in mask_decoder)")
+            print("✅ SAM is Clean (Pure Linear Layers confirmed)")
         else:
-            print("❌ SAM still has LoRA. Exorcism Failed.")
-        print("="*50 + "\n")
+            print("❌ SAM still has LoRA.")
+        print("="*40 + "\n")
 
     # [6] 데이터셋 로드
     print(f"Loading Dataset from {args.dataset_path}")
