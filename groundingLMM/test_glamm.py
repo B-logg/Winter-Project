@@ -146,9 +146,11 @@ class ForestTestDataset(Dataset):
 def main():
     from peft import PeftModel
     import torch
+    import re
 
     args = parse_args()
     
+    # 원본 모델 경로 (환경에 맞게 수정 확인)
     BASE_MODEL_PATH = "checkpoints/GLaMM-GCG"
 
     # 1. 모델 로드 (Base Model + LoRA + Non-LoRA 병합)
@@ -185,34 +187,46 @@ def main():
         model.load_state_dict(cleaned_state_dict, strict=False)
 
     # ---------------------------------------------------------------------
-    # 🚨 [궁극의 강제 변환 로직] 데이터 타입 불일치(Dtype Mismatch) 해결
+    # 🚨 [데이터 타입 일치화 전략] 모든 부품을 BFloat16으로 통일
     # ---------------------------------------------------------------------
     print(">>> Forcing all model parameters and buffers to BFloat16...")
     model = model.cuda()
-    model = model.bfloat16() # 1차 전체 변환
+    model = model.bfloat16() # 전체 1차 변환
 
-    # 모델 내부 파라미터 전수 조사 및 강제 변환
+    # 모델 내부 파라미터 및 버퍼 전수 조사 강제 캐스팅
     for name, param in model.named_parameters():
         if param.is_floating_point() and param.dtype != torch.bfloat16:
             param.data = param.data.to(torch.bfloat16)
-
-    # 모델 내부 버퍼(Buffer) 전수 조사 및 강제 변환
     for name, buffer in model.named_buffers():
         if buffer.is_floating_point() and buffer.dtype != torch.bfloat16:
             buffer.data = buffer.data.to(torch.bfloat16)
 
-    # 비전 타워 및 그라운딩 인코더 개별 확인 (확실한 캐스팅)
+    # 비전 타워 및 그라운딩 인코더 개별 강제 캐스팅
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch.bfloat16, device='cuda')
     model.get_model().grounding_encoder.to(dtype=torch.bfloat16, device='cuda')
+
+    # ✅ [Monkey Patch] SAM Mask Decoder 입구 봉쇄 (Train 코드의 핵심 로직 이식)
+    print("✅ Applying Monkey Patch to SAM Mask Decoder (Force BF16 Inputs)...")
+    base_glamm = model.get_model()
+    if hasattr(base_glamm, "grounding_encoder"):
+        mask_decoder = base_glamm.grounding_encoder.mask_decoder
+        original_forward = mask_decoder.forward
+        
+        def mask_decoder_forward_wrapper(*args, **kwargs):
+            new_args = [a.to(torch.bfloat16) if isinstance(a, torch.Tensor) and torch.is_floating_point(a) else a for a in args]
+            new_kwargs = {k: (v.to(torch.bfloat16) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v) for k, v in kwargs.items()}
+            return original_forward(*new_args, **new_kwargs)
+        
+        mask_decoder.forward = mask_decoder_forward_wrapper
     # ---------------------------------------------------------------------
 
     clip_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(1024)
 
-    # 2. 데이터셋
+    # 2. 데이터셋 (num_workers=0 권장: 디버깅 및 경로 충돌 방지)
     dataset = ForestTestDataset(args.test_json_path, args.image_folder, tokenizer, clip_processor, transform, model.config)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -226,7 +240,7 @@ def main():
     results = []
     
     for batch in tqdm(dataloader):
-        # 데이터 준비 (bfloat16 확인)
+        # 데이터 준비 (bfloat16)
         images = batch['clip_img'].cuda().bfloat16()
         sam_images = batch['sam_img'].cuda().bfloat16()
         input_ids_loss = batch['input_ids_loss'].cuda()
@@ -241,14 +255,15 @@ def main():
                 input_ids=input_ids_loss,
                 labels=labels,
                 images=images,
-                global_enc_images=images, # global_enc_images에 images 전달
+                global_enc_images=images, # 명시적 전달
                 grounding_enc_images=sam_images,
                 bboxes=None,
                 attention_masks=None,
-                masks_list=[gt_masks[0]],
+                masks_list=[gt_masks[0]], # 리스트 형태로 전달
                 label_list=None,
                 resize_list=resize_shape_list,
-                offset=torch.tensor([0, 1]).long().cuda() if batch['input_ids_loss'].shape[0]==1 else None
+                # Batch 1일 때 offset 보정
+                offset=torch.tensor([0, 1]).long().cuda() if input_ids_loss.shape[0] == 1 else None 
             )
             
             if 'loss' in outputs:
@@ -257,7 +272,7 @@ def main():
             if 'ce_loss' in outputs: ce_loss += outputs.ce_loss.item()
             if 'mask_loss' in outputs: mask_loss += outputs.mask_loss.item()
 
-        # (B) Inference
+        # (B) Inference (Generate)
         human_q = batch['human_q'][0]
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
@@ -272,11 +287,13 @@ def main():
         orig_size = [batch['orig_size'][0].numpy(), batch['orig_size'][1].numpy()]
         resize_shape = [batch['resize_shape'][0].numpy(), batch['resize_shape'][1].numpy()]
         
+        # 모델 추론 (evaluate 메소드 사용)
         output_ids, pred_masks = model.evaluate(
             images, sam_images, input_ids_gen, [resize_shape], [orig_size],
             max_tokens_new=512, bboxes=None
         )
         
+        # 결과 파싱
         out_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
         text_out = tokenizer.decode(out_ids, skip_special_tokens=False).split("ASSISTANT: ")[-1]
         cleaned_text = re.sub(r'<.*?>', '', text_out).replace('[SEG]', '').strip()
@@ -292,7 +309,7 @@ def main():
             "pred_masks": rle_masks
         })
 
-    # Loss 및 결과 저장
+    # 최종 결과 보고 및 저장
     if count > 0:
         print("\n" + "="*30)
         print(f" [TEST SET LOSS REPORT]")
