@@ -79,6 +79,16 @@ class ForestTestDataset(Dataset):
         full_prompt = conv.get_prompt()
         
         input_ids_loss = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
+
+        # 토큰 터짐 디버깅
+        # =========================================================
+        if input_ids_loss.shape[1] > 1536:
+            print(f"\n[🚨 토큰 폭발 발견!] 총 토큰 수: {input_ids_loss.shape[1]}")
+            print(f"문제의 파일명: {item['image']}")
+            print(f"문제의 텍스트:\n{full_prompt}\n" + "="*50)
+            # 확인을 위해 여기서 프로그램을 강제로 멈춥니다.
+            raise ValueError("토큰 길이 초과 데이터를 발견하여 중단합니다.")
+        # =========================================================
         
         # --- Labels 생성 (Human 질문 부분은 마스킹 -100) ---
         labels = input_ids_loss.clone()
@@ -191,13 +201,21 @@ def main():
         
         # (A) Loss Calculation (Forward Pass)
         # GLaMM forward는 labels가 있으면 Loss를 반환함
+
+        resize_shape_list = [[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]]
+
         with torch.no_grad():
             outputs = model(
                 input_ids=input_ids_loss,
                 labels=labels,
                 images=images,
+                global_enc_images=None,
                 grounding_enc_images=sam_images,
-                masks=gt_masks,
+                bboxes=None,
+                attention_masks=None, # 배치가 1이므로 padding이 없음
+                masks_list=[gt_masks[0]],
+                label_list=None,
+                resize_list=resize_shape_list,
                 offset=torch.tensor([0, 1]).long().cuda() if batch['input_ids_loss'].shape[0]==1 else None # Batch 1일때 offset 보정
             )
             
