@@ -21,7 +21,7 @@ echo "##################################################"
 echo " PHASE 1: Calculating Test Loss & Generating Output"
 echo "##################################################"
 
-python eval/gcg/test_forest.py \
+python test_glamm.py \
     --hf_model_path $CKPT_PATH \
     --test_json_path $TEST_JSON \
     --image_folder $IMAGE_FOLDER \
@@ -32,7 +32,7 @@ echo "##################################################"
 echo " PHASE 2: Calculating mIoU, AP50, Recall, CIDEr.."
 echo "##################################################"
 
-python eval/gcg/calc_metrics.py \
+python test_metrics.py \
     --pred_path "$RESULT_DIR/test_predictions.json" \
     --gt_path $TEST_JSON \
     --image_folder $IMAGE_FOLDER
