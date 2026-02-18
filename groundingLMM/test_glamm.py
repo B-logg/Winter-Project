@@ -145,6 +145,7 @@ class ForestTestDataset(Dataset):
 
 def main():
     from peft import PeftModel
+    import torch
 
     args = parse_args()
     
@@ -153,7 +154,7 @@ def main():
     # 1. 모델 로드 (Base Model + LoRA + Non-LoRA 병합)
     print(f"Loading Base Model from {BASE_MODEL_PATH}...")
     
-    # (1) 토크나이저는 원본 모델 경로에서 불러옵니다.
+    # (1) 토크나이저 로드
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
@@ -164,35 +165,48 @@ def main():
         train_mask_decoder=True 
     )
     
-    # (3) LoRA 가중치 덮어씌우기 (adapter_model.bin)
+    # (3) LoRA 가중치 병합
     print(f"Applying LoRA weights from {args.hf_model_path}...")
     model = PeftModel.from_pretrained(model, args.hf_model_path)
-    model = model.merge_and_unload() # 추론 속도와 안전성을 위해 베이스 모델에 완전히 병합
+    model = model.merge_and_unload() 
     
-    # (4) Non-LoRA 가중치 덮어씌우기 (non_lora_trainables.bin)
-    # Vision-Language Projector 등 별도로 학습된 파라미터 업데이트
+    # (4) Non-LoRA 가중치 덮어씌우기
     non_lora_path = os.path.join(args.hf_model_path, 'non_lora_trainables.bin')
     if os.path.exists(non_lora_path):
         print(f"Loading non-LoRA trainables from {non_lora_path}...")
         non_lora_trainables = torch.load(non_lora_path, map_location='cpu')
         
-        # peft 모듈 특성상 key 이름 앞에 'base_model.model.' 이 붙는 경우가 있어 전처리
         cleaned_state_dict = {}
         for k, v in non_lora_trainables.items():
             if k.startswith('base_model.model.'):
                 cleaned_state_dict[k[17:]] = v
             else:
                 cleaned_state_dict[k] = v
-                
         model.load_state_dict(cleaned_state_dict, strict=False)
 
-    model = model.to(device='cuda', dtype=torch.bfloat16)
-    
+    # ---------------------------------------------------------------------
+    # 🚨 [궁극의 강제 변환 로직] 데이터 타입 불일치(Dtype Mismatch) 해결
+    # ---------------------------------------------------------------------
+    print(">>> Forcing all model parameters and buffers to BFloat16...")
+    model = model.cuda()
+    model = model.bfloat16() # 1차 전체 변환
+
+    # 모델 내부 파라미터 전수 조사 및 강제 변환
+    for name, param in model.named_parameters():
+        if param.is_floating_point() and param.dtype != torch.bfloat16:
+            param.data = param.data.to(torch.bfloat16)
+
+    # 모델 내부 버퍼(Buffer) 전수 조사 및 강제 변환
+    for name, buffer in model.named_buffers():
+        if buffer.is_floating_point() and buffer.dtype != torch.bfloat16:
+            buffer.data = buffer.data.to(torch.bfloat16)
+
+    # 비전 타워 및 그라운딩 인코더 개별 확인 (확실한 캐스팅)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch.bfloat16, device='cuda')
-
     model.get_model().grounding_encoder.to(dtype=torch.bfloat16, device='cuda')
-    
+    # ---------------------------------------------------------------------
+
     clip_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(1024)
 
@@ -209,20 +223,17 @@ def main():
     count = 0
     
     print(">>> Starting Test Loop (Loss Calculation & Inference)...")
-    
     results = []
     
     for batch in tqdm(dataloader):
-        # 데이터 준비
+        # 데이터 준비 (bfloat16 확인)
         images = batch['clip_img'].cuda().bfloat16()
         sam_images = batch['sam_img'].cuda().bfloat16()
         input_ids_loss = batch['input_ids_loss'].cuda()
         labels = batch['labels'].cuda()
-        gt_masks = batch['masks'].cuda().bfloat16() # (B, 1, 1024, 1024)
+        gt_masks = batch['masks'].cuda().bfloat16()
         
-        # (A) Loss Calculation (Forward Pass)
-        # GLaMM forward는 labels가 있으면 Loss를 반환함
-
+        # (A) Loss Calculation
         resize_shape_list = [[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]]
 
         with torch.no_grad():
@@ -230,25 +241,23 @@ def main():
                 input_ids=input_ids_loss,
                 labels=labels,
                 images=images,
-                global_enc_images=images,
+                global_enc_images=images, # global_enc_images에 images 전달
                 grounding_enc_images=sam_images,
                 bboxes=None,
-                attention_masks=None, # 배치가 1이므로 padding이 없음
+                attention_masks=None,
                 masks_list=[gt_masks[0]],
                 label_list=None,
                 resize_list=resize_shape_list,
-                offset=torch.tensor([0, 1]).long().cuda() if batch['input_ids_loss'].shape[0]==1 else None # Batch 1일때 offset 보정
+                offset=torch.tensor([0, 1]).long().cuda() if batch['input_ids_loss'].shape[0]==1 else None
             )
             
-            # Loss 누적
             if 'loss' in outputs:
                 total_loss += outputs.loss.item()
                 count += 1
             if 'ce_loss' in outputs: ce_loss += outputs.ce_loss.item()
             if 'mask_loss' in outputs: mask_loss += outputs.mask_loss.item()
 
-        # (B) Inference (Generate)
-        # 질문만 다시 구성
+        # (B) Inference
         human_q = batch['human_q'][0]
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
@@ -263,18 +272,15 @@ def main():
         orig_size = [batch['orig_size'][0].numpy(), batch['orig_size'][1].numpy()]
         resize_shape = [batch['resize_shape'][0].numpy(), batch['resize_shape'][1].numpy()]
         
-        # 생성
         output_ids, pred_masks = model.evaluate(
             images, sam_images, input_ids_gen, [resize_shape], [orig_size],
             max_tokens_new=512, bboxes=None
         )
         
-        # 텍스트 디코딩
         out_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
         text_out = tokenizer.decode(out_ids, skip_special_tokens=False).split("ASSISTANT: ")[-1]
         cleaned_text = re.sub(r'<.*?>', '', text_out).replace('[SEG]', '').strip()
         
-        # 마스크 인코딩
         rle_masks = []
         if pred_masks is not None and len(pred_masks) > 0:
             pred_masks_tensor = pred_masks[0].cpu() > 0
@@ -286,18 +292,15 @@ def main():
             "pred_masks": rle_masks
         })
 
-    # Loss 출력
-    avg_loss = total_loss / count
-    avg_ce = ce_loss / count
-    avg_mask = mask_loss / count
-    print("\n" + "="*30)
-    print(f" [TEST SET LOSS REPORT]")
-    print(f" - Total Loss: {avg_loss:.4f}")
-    print(f" - CE Loss (Text): {avg_ce:.4f}")
-    print(f" - Mask Loss (Seg): {avg_mask:.4f}")
-    print("="*30 + "\n")
+    # Loss 및 결과 저장
+    if count > 0:
+        print("\n" + "="*30)
+        print(f" [TEST SET LOSS REPORT]")
+        print(f" - Total Loss: {total_loss / count:.4f}")
+        print(f" - CE Loss (Text): {ce_loss / count:.4f}")
+        print(f" - Mask Loss (Seg): {mask_loss / count:.4f}")
+        print("="*30 + "\n")
     
-    # 결과 저장
     save_path = os.path.join(args.output_dir, "test_predictions.json")
     with open(save_path, 'w') as f:
         json.dump(results, f)
