@@ -250,6 +250,8 @@ def main():
         # (A) Loss Calculation
         resize_shape_list = [[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]]
 
+        dummy_label_list = [torch.zeros(1).to(input_ids_loss.device)]
+
         with torch.no_grad():
             outputs = model(
                 input_ids=input_ids_loss,
@@ -260,7 +262,7 @@ def main():
                 bboxes=None,
                 attention_masks=None,
                 masks_list=[gt_masks[0]], # 리스트 형태로 전달
-                label_list=None,
+                label_list=dummy_label_list,
                 resize_list=resize_shape_list,
                 # Batch 1일 때 offset 보정
                 offset=torch.tensor([0, 1]).long().cuda() if input_ids_loss.shape[0] == 1 else None 
