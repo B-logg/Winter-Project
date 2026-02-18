@@ -251,6 +251,7 @@ def main():
         gt_masks = batch['masks'].cuda().bfloat16()
         
         # (A) Loss Calculation
+        print(f"[{batch['id'][0]}] Loss 계산 중...")
         resize_shape_list = [[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]]
 
         with torch.no_grad():
@@ -278,8 +279,7 @@ def main():
                 mask_loss += outputs['mask_loss'].item()
 
         # (B) Inference (Generate)
-
-        """
+        print(f"[{batch['id'][0]}] 텍스트 및 마스크 생성 중...")
         human_q = batch['human_q'][0]
 
         if len(human_q) > 1000:
@@ -297,11 +297,22 @@ def main():
         
         orig_size = [batch['orig_size'][0].numpy(), batch['orig_size'][1].numpy()]
         resize_shape = [batch['resize_shape'][0].numpy(), batch['resize_shape'][1].numpy()]
+
+        model.get_model().get_vision_tower().to(torch.bfloat16) 
+        model.get_model().grounding_encoder.to(torch.bfloat16)
         
         # 모델 추론 (evaluate 메소드 사용)
         output_ids, pred_masks = model.evaluate(
-            images, sam_images, input_ids_gen, [resize_shape], [orig_size],
-            max_tokens_new=512, bboxes=None
+            images,
+            sam_images, 
+            input_ids_gen, 
+            [resize_shape], 
+            [orig_size],
+            max_tokens_new=512, 
+            bboxes=None,
+            do_sample=False,
+            num_beams=1,
+            use_cache=True
         )
         
         # 결과 파싱
@@ -320,7 +331,11 @@ def main():
             "pred_masks": rle_masks
         })
 
-    """
+        print(f"[{batch['id'][0]}] 처리 완료.")
+    
+    del outputs, output_ids, pred_masks, input_ids_gen, images, sam_images
+    torch.cuda.empty_cache() # 강제로 GPU 메모리 파편화 정리
+
 
     # 최종 결과 보고 및 저장
     if count > 0:
