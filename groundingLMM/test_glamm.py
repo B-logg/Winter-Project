@@ -33,14 +33,32 @@ class ForestLossDataset(Dataset):
     def preprocess_image(self, image_path):
         image_np = cv2.imread(image_path)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-        image_clip = self.image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
+        
+        # 1. SAM용 리사이즈 (긴 쪽을 1024로)
         image_sam = self.transform.apply_image(image_np)
         resize_shape = image_sam.shape[:2]
-        image_sam = torch.from_numpy(image_sam).permute(2, 0, 1).float()
+        
+        # 2. 1024x1024가 되도록 부족한 부분을 0으로 채움 (Padding)
+        h, w = resize_shape
+        pad_h = 1024 - h
+        pad_w = 1024 - w
+        
+        # (top, bottom, left, right) 순서로 패딩 추가
+        image_sam_padded = cv2.copyMakeBorder(
+            image_sam, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+        )
+        
+        # 3. 텐서 변환 및 정규화
+        image_sam_tensor = torch.from_numpy(image_sam_padded).permute(2, 0, 1).float()
+        
         pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
         pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
-        image_sam = (image_sam - pixel_mean) / pixel_std
-        return image_clip, image_sam, resize_shape
+        image_sam_tensor = (image_sam_tensor - pixel_mean) / pixel_std
+        
+        # CLIP용 이미지는 프로세서가 알아서 처리하므로 유지
+        image_clip = self.image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
+        
+        return image_clip, image_sam_tensor, resize_shape
 
     def __getitem__(self, idx):
         item = self.data[idx]
