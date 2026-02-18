@@ -50,6 +50,8 @@ class ForestLossDataset(Dataset):
         human_q = item['conversations'][0]['value']
         gpt_a = item['conversations'][1]['value']
         
+        clean_q = human_q.replace(DEFAULT_IMAGE_TOKEN, "").replace("<image>", "").strip()
+
         conv = conversation_lib.conv_templates["llava_v1"].copy()
         conv.messages = []
         q_text = DEFAULT_IMAGE_TOKEN + "\n" + human_q
