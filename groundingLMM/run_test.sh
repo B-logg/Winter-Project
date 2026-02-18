@@ -7,7 +7,7 @@ PROJ_ROOT=/shared/home/naislab/학부연구생/bosung/Winter-Project
 CKPT_PATH="$PROJ_ROOT/checkpoints/GLaMM-Forest-A40-4GPU/checkpoint-epoch-3"
 
 # 테스트 데이터셋 (val.json 대신 test.json 사용)
-TEST_JSON="$PROJ_ROOT/datasets/datasets/test.json"
+TEST_JSON="$PROJ_ROOT/datasets/datasets/val.json"
 IMAGE_FOLDER="$PROJ_ROOT/datasets/datasets"
 
 # 결과 저장 폴더

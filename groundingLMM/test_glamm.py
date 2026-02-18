@@ -71,7 +71,8 @@ class ForestTestDataset(Dataset):
         conv.messages = []
         
         # 질문 구성
-        q_text = f"The {DEFAULT_IMAGE_TOKEN} provides an overview of the picture.\n" + human_q
+        q_text = f"The {DEFAULT_IMAGE_TOKEN} provides an overview of the picture.\n" + human_q # 수정 필요
+        
         q_text = q_text.replace(DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN)
         conv.append_message(conv.roles[0], q_text)
         conv.append_message(conv.roles[1], gpt_a) # 답변 포함
