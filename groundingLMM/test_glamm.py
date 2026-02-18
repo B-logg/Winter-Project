@@ -82,7 +82,7 @@ class ForestTestDataset(Dataset):
 
         # 토큰 터짐 디버깅
         # =========================================================
-        if input_ids_loss.shape[1] > 1536:
+        if input_ids_loss.shape[0] > 1536:
             print(f"\n[🚨 토큰 폭발 발견!] 총 토큰 수: {input_ids_loss.shape[1]}")
             print(f"문제의 파일명: {item['image']}")
             print(f"문제의 텍스트:\n{full_prompt}\n" + "="*50)
