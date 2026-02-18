@@ -187,7 +187,7 @@ def main():
         else:
             conv = conversation_lib.conv_templates[args.conv_type].copy()
             conv.messages = []
-            q_text = DEFAULT_IMAGE_TOKEN + "\n" + batch['human_q'][0]
+            q_text = DEFAULT_IMAGE_TOKEN + "\n" + batch['human_q'][0] + " Answer in one short sentence."
             conv.append_message(conv.roles[0], q_text)
             conv.append_message(conv.roles[1], "")
             prompt = conv.get_prompt()
@@ -198,7 +198,7 @@ def main():
                     images, sam_images, input_ids_gen, 
                     [[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]], 
                     [[batch['orig_size'][0].item(), batch['orig_size'][1].item()]],
-                    max_tokens_new=128, bboxes=None
+                    max_tokens_new=5, bboxes=None
                 )
             
             out_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
