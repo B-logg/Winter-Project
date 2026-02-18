@@ -190,6 +190,8 @@ def main():
     
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch.bfloat16, device='cuda')
+
+    model.get_model().grounding_encoder.to(dtype=torch.bfloat16, device='cuda')
     
     clip_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(1024)
