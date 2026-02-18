@@ -3,8 +3,6 @@ import cv2
 import json
 import torch
 import argparse
-import re
-import numpy as np
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, CLIPImageProcessor
@@ -12,20 +10,18 @@ from model.GLaMM import GLaMMForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.SAM.utils.transforms import ResizeLongestSide
-from tools.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-from eval.utils import mask_to_rle_pytorch, coco_encode_rle
+from tools.utils import DEFAULT_IMAGE_TOKEN
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="GLaMM Test with Loss")
+    parser = argparse.ArgumentParser(description="GLaMM Test Loss Only")
     parser.add_argument("--hf_model_path", required=True, help="Path to checkpoint")
     parser.add_argument("--test_json_path", required=True, help="Path to test.json")
     parser.add_argument("--image_folder", required=True, help="Image folder")
     parser.add_argument("--output_dir", required=True, help="Result save dir")
-    parser.add_argument("--conv_type", default="llava_v1")
     return parser.parse_args()
 
-class ForestTestDataset(Dataset):
-    def __init__(self, json_path, image_folder, tokenizer, image_processor, transform, model_config):
+class ForestLossDataset(Dataset):
+    def __init__(self, json_path, image_folder, tokenizer, image_processor, transform):
         with open(json_path, 'r') as f: self.data = json.load(f)
         self.image_folder = image_folder
         self.tokenizer = tokenizer
@@ -37,7 +33,6 @@ class ForestTestDataset(Dataset):
     def preprocess_image(self, image_path):
         image_np = cv2.imread(image_path)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-        orig_size = image_np.shape[:2]
         image_clip = self.image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
         image_sam = self.transform.apply_image(image_np)
         resize_shape = image_sam.shape[:2]
@@ -45,45 +40,40 @@ class ForestTestDataset(Dataset):
         pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
         pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
         image_sam = (image_sam - pixel_mean) / pixel_std
-        return image_clip, image_sam, orig_size, resize_shape
+        return image_clip, image_sam, resize_shape
 
     def __getitem__(self, idx):
         item = self.data[idx]
         image_path = os.path.join(self.image_folder, item['image'])
-        clip_img, sam_img, orig_size, resize_shape = self.preprocess_image(image_path)
+        clip_img, sam_img, resize_shape = self.preprocess_image(image_path)
         
         human_q = item['conversations'][0]['value']
         gpt_a = item['conversations'][1]['value']
         
         conv = conversation_lib.conv_templates["llava_v1"].copy()
         conv.messages = []
-        # 🚨 IndexError 방지: 특수 토큰을 직접 조립하지 않고 표준 토큰만 사용
         q_text = DEFAULT_IMAGE_TOKEN + "\n" + human_q
         conv.append_message(conv.roles[0], q_text)
         conv.append_message(conv.roles[1], gpt_a)
         full_prompt = conv.get_prompt()
         
-        input_ids_loss = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
+        input_ids = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
 
-        is_skipped = False
-        if input_ids_loss.shape[0] > 1536:
-            is_skipped = True
-            dummy_q = "이 사진의 탄소 저장량을 분석해줘."
-            dummy_a = "데이터가 너무 길어 분석을 생략합니다. [SEG]"
-            conv = conversation_lib.conv_templates["llava_v1"].copy()
+        # 🚨 스킵 로직: 너무 긴 데이터는 가짜 데이터로 대체하여 OOM 방지
+        if input_ids.shape[0] > 1536:
             conv.messages = []
-            conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + dummy_q)
-            conv.append_message(conv.roles[1], dummy_a)
-            full_prompt = conv.get_prompt()
-            input_ids_loss = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
+            conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + "이 사진을 분석해줘.")
+            conv.append_message(conv.roles[1], "데이터 초과로 스킵합니다. [SEG]")
+            input_ids = tokenizer_image_token(conv.get_prompt(), self.tokenizer, return_tensors='pt')
         
-        labels = input_ids_loss.clone()
+        labels = input_ids.clone()
         sep = "ASSISTANT: "
         parts = full_prompt.split(sep)
         if len(parts) >= 2:
             len_context = len(tokenizer_image_token(parts[0] + sep, self.tokenizer))
             labels[:len_context-1] = -100
         
+        # GT Mask 로드
         gt_mask = torch.zeros((1024, 1024)).float()
         mask_path = item.get('mask_path', None)
         if mask_path:
@@ -97,15 +87,12 @@ class ForestTestDataset(Dataset):
 
         return {
             "id": item['id'],
-            "human_q": human_q,
             "clip_img": clip_img,
             "sam_img": sam_img,
-            "input_ids_loss": input_ids_loss,
+            "input_ids": input_ids,
             "labels": labels,
             "masks": gt_mask,
-            "orig_size": orig_size,
-            "resize_shape": resize_shape,
-            "is_skipped": is_skipped
+            "resize_shape": resize_shape
         }
 
 def main():
@@ -117,24 +104,13 @@ def main():
     tokenizer.pad_token = tokenizer.unk_token
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     
-    model = GLaMMForCausalLM.from_pretrained(
-        BASE_MODEL_PATH, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, seg_token_idx=seg_token_idx,
-        train_mask_decoder=True 
-    )
-    
+    model = GLaMMForCausalLM.from_pretrained(BASE_MODEL_PATH, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, seg_token_idx=seg_token_idx)
     model = PeftModel.from_pretrained(model, args.hf_model_path)
-    model = model.merge_and_unload() 
+    model = model.merge_and_unload().cuda().bfloat16()
     
-    non_lora_path = os.path.join(args.hf_model_path, 'non_lora_trainables.bin')
-    if os.path.exists(non_lora_path):
-        non_lora_trainables = torch.load(non_lora_path, map_location='cpu')
-        cleaned_state_dict = {k[17:] if k.startswith('base_model.model.') else k: v for k, v in non_lora_trainables.items()}
-        model.load_state_dict(cleaned_state_dict, strict=False)
-
-    model = model.cuda().bfloat16()
     model.ce_loss_weight, model.dice_loss_weight, model.bce_loss_weight = 1.0, 0.5, 2.0
 
-    # ✅ Monkey Patch 적용
+    # Monkey Patch 적용 (SAM 입력 BF16 보장)
     base_glamm = model.get_model()
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
@@ -145,84 +121,43 @@ def main():
             return original_forward(*new_args, **new_kwargs)
         mask_decoder.forward = mask_decoder_forward_wrapper
 
-    dataset = ForestTestDataset(args.test_json_path, args.image_folder, tokenizer, CLIPImageProcessor.from_pretrained(model.config.vision_tower), ResizeLongestSide(1024), model.config)
+    dataset = ForestLossDataset(args.test_json_path, args.image_folder, tokenizer, CLIPImageProcessor.from_pretrained(model.config.vision_tower), ResizeLongestSide(1024))
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    total_loss, ce_loss, mask_loss, count, results = 0.0, 0.0, 0.0, 0, []
+    total_loss, ce_loss, mask_loss, count = 0.0, 0.0, 0.0, 0
     
-    print(">>> Starting Test Loop...")
+    print(">>> Starting Test Loss Calculation...")
     for batch in tqdm(dataloader):
-        image_id = batch['id'][0]
-        is_skipped = batch['is_skipped'][0]
-        
         images = batch['clip_img'].cuda().bfloat16()
         sam_images = batch['sam_img'].cuda().bfloat16()
-        
-        # 🚨 IndexError 방지: batch_size=1이므로 [1, L] 형태로 확실히 차원 유지
-        input_ids_loss = batch['input_ids_loss'].cuda()
-        if input_ids_loss.dim() == 1: input_ids_loss = input_ids_loss.unsqueeze(0)
-        
+        input_ids = batch['input_ids'].cuda()
+        if input_ids.dim() == 1: input_ids = input_ids.unsqueeze(0)
         labels = batch['labels'].cuda()
         if labels.dim() == 1: labels = labels.unsqueeze(0)
-        
         gt_masks = batch['masks'].cuda().bfloat16()
         
-        # (A) Loss Calculation
         with torch.no_grad():
             outputs = model(
-                input_ids=input_ids_loss, labels=labels, images=images, global_enc_images=images,
+                input_ids=input_ids, labels=labels, images=images, global_enc_images=images,
                 grounding_enc_images=sam_images, masks_list=[gt_masks[0]], label_list=[gt_masks[0]],
                 resize_list=[[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]],
-                offset=torch.tensor([0, 1]).long().cuda(),
-                bboxes=None, attention_masks=None
+                offset=torch.tensor([0, 1]).long().cuda(), bboxes=None, attention_masks=None
             )
             if 'loss' in outputs:
                 total_loss += outputs['loss'].item()
-                count += 1
                 ce_loss += outputs.get('ce_loss', torch.tensor(0)).item()
                 mask_loss += outputs.get('mask_loss', torch.tensor(0)).item()
-
-        # (B) Inference
-        if is_skipped:
-            cleaned_text, rle_masks = "Inference skipped due to length.", []
-        else:
-            conv = conversation_lib.conv_templates[args.conv_type].copy()
-            conv.messages = []
-            q_text = DEFAULT_IMAGE_TOKEN + "\n" + batch['human_q'][0]
-            conv.append_message(conv.roles[0], q_text)
-            conv.append_message(conv.roles[1], "")
-            prompt = conv.get_prompt()
-            input_ids_gen = tokenizer_image_token(prompt, tokenizer, return_tensors='pt').unsqueeze(0).cuda()
-            
-            with torch.no_grad():
-                # 🚨 종료 토큰 부재 대응: max_tokens_new를 적절히(64~80) 제한하여 무한 루프 방지
-                output_ids, pred_masks = model.evaluate(
-                    images, sam_images, input_ids_gen, 
-                    [[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]], 
-                    [[batch['orig_size'][0].item(), batch['orig_size'][1].item()]],
-                    max_tokens_new=64, bboxes=None
-                )
-            
-            out_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
-            text_out = tokenizer.decode(out_ids, skip_special_tokens=False).split("ASSISTANT: ")[-1]
-            cleaned_text = re.sub(r'<.*?>', '', text_out).replace('[SEG]', '').strip()
-            
-            # 종료 토큰이 없으므로 생성된 텍스트가 잘렸을 확률이 큼 (후처리 로직 유지)
-            rle_masks = [coco_encode_rle(m) for m in mask_to_rle_pytorch(pred_masks[0].cpu() > 0)] if pred_masks is not None else []
-
-        results.append({"image_id": image_id, "caption": cleaned_text, "pred_masks": rle_masks})
+                count += 1
         
-        # 🚨 메모리 해제 필수 (A100 파편화 방지)
-        del images, sam_images, input_ids_loss, labels, gt_masks
-        if 'outputs' in locals(): del outputs
+        del images, sam_images, input_ids, labels, gt_masks, outputs
         torch.cuda.empty_cache()
 
     if count > 0:
-        print(f"\n [TEST SET LOSS] Total: {total_loss/count:.4f} | CE: {ce_loss/count:.4f} | Mask: {mask_loss/count:.4f}")
-    
-    with open(os.path.join(args.output_dir, "test_predictions.json"), 'w') as f:
-        json.dump(results, f)
-    print(f"✅ Predictions saved to {args.output_dir}")
+        print("\n" + "="*40)
+        print(f" [FINAL TEST RESULTS]")
+        print(f" - Average Loss: {total_loss/count:.4f}")
+        print(f" - Text (CE) Loss: {ce_loss/count:.4f}")
+        print(f" - Mask (Seg) Loss: {mask_loss/count:.4f}")
+        print("="*40)
 
 if __name__ == "__main__": main()
