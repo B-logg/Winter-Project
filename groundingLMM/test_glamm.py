@@ -268,10 +268,12 @@ def main():
             )
             
             if 'loss' in outputs:
-                total_loss += outputs.loss.item()
+                total_loss += outputs['loss'].item()
                 count += 1
-            if 'ce_loss' in outputs: ce_loss += outputs.ce_loss.item()
-            if 'mask_loss' in outputs: mask_loss += outputs.mask_loss.item()
+            if 'ce_loss' in outputs: 
+                ce_loss += outputs['ce_loss'].item()
+            if 'mask_loss' in outputs: 
+                mask_loss += outputs['mask_loss'].item()
 
         # (B) Inference (Generate)
         human_q = batch['human_q'][0]
