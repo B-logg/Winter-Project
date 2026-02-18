@@ -228,7 +228,7 @@ def main():
                 input_ids=input_ids_loss,
                 labels=labels,
                 images=images,
-                global_enc_images=None,
+                global_enc_images=images,
                 grounding_enc_images=sam_images,
                 bboxes=None,
                 attention_masks=None, # 배치가 1이므로 padding이 없음
