@@ -277,7 +277,13 @@ def main():
                 mask_loss += outputs['mask_loss'].item()
 
         # (B) Inference (Generate)
+
+        """
         human_q = batch['human_q'][0]
+
+        if len(human_q) > 1000:
+            human_q = "이 항공 사진에서 붉은 박스로 표시된 나무들의 탄소 저장량을 분석해줘."
+
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
         q_text = f"The {DEFAULT_IMAGE_TOKEN} provides an overview of the picture.\n" + human_q
@@ -312,6 +318,8 @@ def main():
             "caption": cleaned_text,
             "pred_masks": rle_masks
         })
+
+    """
 
     # 최종 결과 보고 및 저장
     if count > 0:
