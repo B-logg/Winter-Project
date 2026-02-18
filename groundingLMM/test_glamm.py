@@ -115,18 +115,49 @@ class ForestTestDataset(Dataset):
         }
 
 def main():
+    from peft import PeftModel
+
     args = parse_args()
     
-    # 1. 모델 로드
-    print(f"Loading Model from {args.hf_model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model_path, use_fast=False)
+    BASE_MODEL_PATH = "checkpoints/GLaMM-GCG"
+
+    # 1. 모델 로드 (Base Model + LoRA + Non-LoRA 병합)
+    print(f"Loading Base Model from {BASE_MODEL_PATH}...")
+    
+    # (1) 토크나이저는 원본 모델 경로에서 불러옵니다.
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     
+    # (2) 베이스 모델 뼈대 불러오기
     model = GLaMMForCausalLM.from_pretrained(
-        args.hf_model_path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, seg_token_idx=seg_token_idx,
-        train_mask_decoder=True # Loss 계산을 위해 켜둠
-    ).cuda()
+        BASE_MODEL_PATH, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, seg_token_idx=seg_token_idx,
+        train_mask_decoder=True 
+    )
+    
+    # (3) LoRA 가중치 덮어씌우기 (adapter_model.bin)
+    print(f"Applying LoRA weights from {args.hf_model_path}...")
+    model = PeftModel.from_pretrained(model, args.hf_model_path)
+    model = model.merge_and_unload() # 추론 속도와 안전성을 위해 베이스 모델에 완전히 병합
+    
+    # (4) Non-LoRA 가중치 덮어씌우기 (non_lora_trainables.bin)
+    # Vision-Language Projector 등 별도로 학습된 파라미터 업데이트
+    non_lora_path = os.path.join(args.hf_model_path, 'non_lora_trainables.bin')
+    if os.path.exists(non_lora_path):
+        print(f"Loading non-LoRA trainables from {non_lora_path}...")
+        non_lora_trainables = torch.load(non_lora_path, map_location='cpu')
+        
+        # peft 모듈 특성상 key 이름 앞에 'base_model.model.' 이 붙는 경우가 있어 전처리
+        cleaned_state_dict = {}
+        for k, v in non_lora_trainables.items():
+            if k.startswith('base_model.model.'):
+                cleaned_state_dict[k[17:]] = v
+            else:
+                cleaned_state_dict[k] = v
+                
+        model.load_state_dict(cleaned_state_dict, strict=False)
+
+    model = model.cuda()
     
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch.bfloat16, device='cuda')
