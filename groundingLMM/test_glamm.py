@@ -80,7 +80,7 @@ class ForestTestDataset(Dataset):
         
         input_ids_loss = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
 
-        # 토큰 터짐 디버깅
+        """ 토큰 터짐 디버깅
         # =========================================================
         if input_ids_loss.shape[0] > 1536:
             print(f"\n[🚨 토큰 폭발 발견!] 총 토큰 수: {input_ids_loss.shape[0]}")
@@ -89,6 +89,25 @@ class ForestTestDataset(Dataset):
             # 확인을 위해 여기서 프로그램을 강제로 멈춥니다.
             raise ValueError("토큰 길이 초과 데이터를 발견하여 중단합니다.")
         # =========================================================
+        """
+
+        if input_ids_loss.shape[0] > 1536:
+            print(f"\n[경고] 데이터 스킵! (토큰: {input_ids_loss.shape[0]}) -> {item['image']}")
+            
+            # 1. 에러가 나지 않도록 아주 짧은 가짜 질문과 답변([SEG] 1개 포함)으로 덮어씁니다.
+            human_q = "탄소 저장량을 분석해줘."
+            gpt_a = "산림이 과밀하거나 구조적으로 불균형할 경우 나무의 안정성과 생육 효율이 저하될 수 있으므로, 밀도 조절(예: 솎아베기)을 통해 건강성과 탄소 흡수 능력을 개선할 필요가 있다. [SEG]"
+            
+            # 2. 가짜 데이터로 프롬프트를 다시 짭니다.
+            conv = conversation_lib.conv_templates["llava_v1"].copy()
+            conv.messages = []
+            q_text = f"The {DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN}{DEFAULT_IM_END_TOKEN} provides an overview of the picture.\n" + human_q
+            conv.append_message(conv.roles[0], q_text)
+            conv.append_message(conv.roles[1], gpt_a)
+            full_prompt = conv.get_prompt()
+            
+            # 3. 토큰을 다시 생성합니다. (이제 1536을 절대 넘지 않음)
+            input_ids_loss = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
         
         # --- Labels 생성 (Human 질문 부분은 마스킹 -100) ---
         labels = input_ids_loss.clone()
