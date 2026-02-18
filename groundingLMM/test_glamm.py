@@ -308,7 +308,7 @@ def main():
             input_ids_gen, 
             [resize_shape], 
             [orig_size],
-            max_tokens_new=512, 
+            max_tokens_new=128, 
             bboxes=None,
         )
         
