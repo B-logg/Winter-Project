@@ -54,7 +54,7 @@ class ForestLossDataset(Dataset):
 
         conv = conversation_lib.conv_templates["llava_v1"].copy()
         conv.messages = []
-        q_text = DEFAULT_IMAGE_TOKEN + "\n" + human_q
+        q_text = DEFAULT_IMAGE_TOKEN + "\n" + clean_q
         conv.append_message(conv.roles[0], q_text)
         conv.append_message(conv.roles[1], gpt_a)
         full_prompt = conv.get_prompt()
