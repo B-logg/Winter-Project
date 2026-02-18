@@ -310,9 +310,6 @@ def main():
             [orig_size],
             max_tokens_new=512, 
             bboxes=None,
-            do_sample=False,
-            num_beams=1,
-            use_cache=True
         )
         
         # 결과 파싱
