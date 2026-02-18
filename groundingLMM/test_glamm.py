@@ -101,7 +101,8 @@ class ForestTestDataset(Dataset):
             # 2. 가짜 데이터로 프롬프트를 다시 짭니다.
             conv = conversation_lib.conv_templates["llava_v1"].copy()
             conv.messages = []
-            q_text = f"The {DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN}{DEFAULT_IM_END_TOKEN} provides an overview of the picture.\n" + human_q
+
+            q_text = DEFAULT_IMAGE_TOKEN + "\n" + human_q
             conv.append_message(conv.roles[0], q_text)
             conv.append_message(conv.roles[1], gpt_a)
             full_prompt = conv.get_prompt()
