@@ -214,6 +214,8 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
     def _process_hidden_states(self, output_hidden_states, seg_token_mask, offset, infer=False):
         hidden_states = [self.model.text_hidden_fcs[0](output_hidden_states[-1])]
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+        if last_hidden_state.dim() == 2 and seg_token_mask.dim() == 2:
+            seg_token_mask = seg_token_mask.squeeze(0)
         pred_embeddings = last_hidden_state[seg_token_mask]
         seg_token_counts = seg_token_mask.int().sum(-1)
 
