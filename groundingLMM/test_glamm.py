@@ -57,6 +57,7 @@ class ForestTestDataset(Dataset):
         
         conv = conversation_lib.conv_templates["llava_v1"].copy()
         conv.messages = []
+        # 🚨 IndexError 방지: 특수 토큰을 직접 조립하지 않고 표준 토큰만 사용
         q_text = DEFAULT_IMAGE_TOKEN + "\n" + human_q
         conv.append_message(conv.roles[0], q_text)
         conv.append_message(conv.roles[1], gpt_a)
@@ -64,12 +65,11 @@ class ForestTestDataset(Dataset):
         
         input_ids_loss = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
 
-        # 🚨 스킵 판단 (1536 토큰 초과 시 가짜 데이터로 대체)
         is_skipped = False
         if input_ids_loss.shape[0] > 1536:
             is_skipped = True
             dummy_q = "이 사진의 탄소 저장량을 분석해줘."
-            dummy_a = "산림이 과밀하거나 구조적으로 불균형할 경우 나무의 안정성과 생육 효율이 저하될 수 있으므로, 밀도 조절(예: 솎아베기)을 통해 건강성과 탄소 흡수 능력을 개선할 필요가 있다. [SEG]"
+            dummy_a = "데이터가 너무 길어 분석을 생략합니다. [SEG]"
             conv = conversation_lib.conv_templates["llava_v1"].copy()
             conv.messages = []
             conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + dummy_q)
@@ -134,11 +134,6 @@ def main():
     model = model.cuda().bfloat16()
     model.ce_loss_weight, model.dice_loss_weight, model.bce_loss_weight = 1.0, 0.5, 2.0
 
-    for name, param in model.named_parameters():
-        if param.is_floating_point(): param.data = param.data.to(torch.bfloat16)
-    for name, buffer in model.named_buffers():
-        if buffer.is_floating_point(): buffer.data = buffer.data.to(torch.bfloat16)
-
     # ✅ Monkey Patch 적용
     base_glamm = model.get_model()
     if hasattr(base_glamm, "grounding_encoder"):
@@ -163,17 +158,24 @@ def main():
         
         images = batch['clip_img'].cuda().bfloat16()
         sam_images = batch['sam_img'].cuda().bfloat16()
+        
+        # 🚨 IndexError 방지: batch_size=1이므로 [1, L] 형태로 확실히 차원 유지
         input_ids_loss = batch['input_ids_loss'].cuda()
+        if input_ids_loss.dim() == 1: input_ids_loss = input_ids_loss.unsqueeze(0)
+        
         labels = batch['labels'].cuda()
+        if labels.dim() == 1: labels = labels.unsqueeze(0)
+        
         gt_masks = batch['masks'].cuda().bfloat16()
         
-        # (A) Loss Calculation (Teacher Forcing)
+        # (A) Loss Calculation
         with torch.no_grad():
             outputs = model(
                 input_ids=input_ids_loss, labels=labels, images=images, global_enc_images=images,
                 grounding_enc_images=sam_images, masks_list=[gt_masks[0]], label_list=[gt_masks[0]],
                 resize_list=[[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]],
-                offset=torch.tensor([0, 1]).long().cuda(), bboxes=None, attention_masks=None
+                offset=torch.tensor([0, 1]).long().cuda(),
+                bboxes=None, attention_masks=None
             )
             if 'loss' in outputs:
                 total_loss += outputs['loss'].item()
@@ -181,40 +183,46 @@ def main():
                 ce_loss += outputs.get('ce_loss', torch.tensor(0)).item()
                 mask_loss += outputs.get('mask_loss', torch.tensor(0)).item()
 
-        # (B) Inference (Autoregressive Generation)
+        # (B) Inference
         if is_skipped:
-            cleaned_text, rle_masks = "Content too long - Inference skipped.", []
+            cleaned_text, rle_masks = "Inference skipped due to length.", []
         else:
             conv = conversation_lib.conv_templates[args.conv_type].copy()
             conv.messages = []
-            q_text = DEFAULT_IMAGE_TOKEN + "\n" + batch['human_q'][0] + " Answer in one short sentence."
+            q_text = DEFAULT_IMAGE_TOKEN + "\n" + batch['human_q'][0]
             conv.append_message(conv.roles[0], q_text)
             conv.append_message(conv.roles[1], "")
             prompt = conv.get_prompt()
             input_ids_gen = tokenizer_image_token(prompt, tokenizer, return_tensors='pt').unsqueeze(0).cuda()
             
             with torch.no_grad():
+                # 🚨 종료 토큰 부재 대응: max_tokens_new를 적절히(64~80) 제한하여 무한 루프 방지
                 output_ids, pred_masks = model.evaluate(
                     images, sam_images, input_ids_gen, 
                     [[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]], 
                     [[batch['orig_size'][0].item(), batch['orig_size'][1].item()]],
-                    max_tokens_new=5, bboxes=None
+                    max_tokens_new=64, bboxes=None
                 )
             
             out_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
             text_out = tokenizer.decode(out_ids, skip_special_tokens=False).split("ASSISTANT: ")[-1]
             cleaned_text = re.sub(r'<.*?>', '', text_out).replace('[SEG]', '').strip()
+            
+            # 종료 토큰이 없으므로 생성된 텍스트가 잘렸을 확률이 큼 (후처리 로직 유지)
             rle_masks = [coco_encode_rle(m) for m in mask_to_rle_pytorch(pred_masks[0].cpu() > 0)] if pred_masks is not None else []
 
         results.append({"image_id": image_id, "caption": cleaned_text, "pred_masks": rle_masks})
         
-        # 🚨 메모리 해제
-        del images, sam_images, input_ids_loss, labels, gt_masks, outputs
+        # 🚨 메모리 해제 필수 (A100 파편화 방지)
+        del images, sam_images, input_ids_loss, labels, gt_masks
+        if 'outputs' in locals(): del outputs
         torch.cuda.empty_cache()
 
-    # 결과 출력 및 저장
     if count > 0:
         print(f"\n [TEST SET LOSS] Total: {total_loss/count:.4f} | CE: {ce_loss/count:.4f} | Mask: {mask_loss/count:.4f}")
-    with open(os.path.join(args.output_dir, "test_predictions.json"), 'w') as f: json.dump(results, f)
+    
+    with open(os.path.join(args.output_dir, "test_predictions.json"), 'w') as f:
+        json.dump(results, f)
+    print(f"✅ Predictions saved to {args.output_dir}")
 
 if __name__ == "__main__": main()
