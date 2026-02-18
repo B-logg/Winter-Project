@@ -186,7 +186,7 @@ def main():
                 
         model.load_state_dict(cleaned_state_dict, strict=False)
 
-    model = model.cuda()
+    model = model.to(device='cuda', dtype=torch.bfloat16)
     
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch.bfloat16, device='cuda')
