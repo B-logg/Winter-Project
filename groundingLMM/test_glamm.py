@@ -241,6 +241,7 @@ def main():
     results = []
     
     for batch in tqdm(dataloader):
+        print(f"\n[로그] 현재 처리 중인 이미지: {batch['id'][0]}")
         # 데이터 준비 (bfloat16)
         images = batch['clip_img'].cuda().bfloat16()
         sam_images = batch['sam_img'].cuda().bfloat16()
