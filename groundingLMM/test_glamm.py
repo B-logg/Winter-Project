@@ -186,12 +186,13 @@ def main():
                 cleaned_state_dict[k] = v
         model.load_state_dict(cleaned_state_dict, strict=False)
 
-    # ---------------------------------------------------------------------
-    # 🚨 [데이터 타입 일치화 전략] 모든 부품을 BFloat16으로 통일
-    # ---------------------------------------------------------------------
-    print(">>> Forcing all model parameters and buffers to BFloat16...")
     model = model.cuda()
     model = model.bfloat16() # 전체 1차 변환
+
+    print("✅ Setting Loss weights...")
+    model.ce_loss_weight = 1.0
+    model.dice_loss_weight = 0.5
+    model.bce_loss_weight = 2.0
 
     # 모델 내부 파라미터 및 버퍼 전수 조사 강제 캐스팅
     for name, param in model.named_parameters():
