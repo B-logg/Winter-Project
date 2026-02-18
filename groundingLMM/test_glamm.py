@@ -173,7 +173,7 @@ def main():
                 input_ids=input_ids_loss, labels=labels, images=images, global_enc_images=images,
                 grounding_enc_images=sam_images, masks_list=[gt_masks[0]], label_list=[gt_masks[0]],
                 resize_list=[[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]],
-                offset=torch.tensor([0, 1]).long().cuda(), bboxes=None, attention_mask=None
+                offset=torch.tensor([0, 1]).long().cuda(), bboxes=None, attention_masks=None
             )
             if 'loss' in outputs:
                 total_loss += outputs['loss'].item()
