@@ -20,9 +20,9 @@ torch.cuda.empty_cache()
 
 print("[1/5] 모델 및 토크나이저 로드")
 
-# 토크나이저 로드 (단어 사전 크기 에러 방지를 위해 <grounding> 제거)
+# 🚨 에러 원인 해결: 제로샷 베이스 모델이므로 <grounding> 토큰을 반드시 포함해야 합니다!
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-special_tokens = ["[SEG]", "<p>", "</p>"]
+special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"] 
 tokenizer.add_tokens(special_tokens, special_tokens=True)
 sp_limit = tokenizer.sp_model.get_piece_size()
 
@@ -40,10 +40,10 @@ model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 # 2. 모델 GPU 이동 및 몽키 패치 & 무한 추론 방지 설정
 # ==========================================================
 print("[2/5] 모델 CUDA(GPU) 이동 및 추론 설정 적용")
-model.to("cuda") # 🚨 RoPE 보호를 위해 전체 bfloat16 캐스팅 금지
+model.to("cuda") 
 model.eval()
 
-# 💡 [핵심 해결책] evaluate 함수가 거부하는 설정들을 모델 엔진에 직접 강제 주입!
+# 💡 무한 추론(Hanging) 방지를 위한 텍스트 생성 반복 억제 설정 강제 주입
 model.generation_config.temperature = 0.2
 model.generation_config.do_sample = True
 model.generation_config.repetition_penalty = 1.2
@@ -131,7 +131,8 @@ print("[5/5] 결과 분석 및 이미지 시각화 중")
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>"}
+# 🚨 <grounding> 매핑 복구
+special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>", 32007: "<grounding>"}
 
 raw_tokens = []
 clean_tokens = []
