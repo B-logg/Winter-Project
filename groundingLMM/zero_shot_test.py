@@ -118,7 +118,7 @@ with torch.inference_mode():
         input_ids=input_ids, 
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
-        max_tokens_new=150, # 🚨 하드웨어 강제 컷: 무한 대기를 원천 차단합니다.
+        max_tokens_new=30,
     )
 
 # ==========================================================
