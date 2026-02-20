@@ -7,8 +7,9 @@ from model.GLaMM import GLaMMForCausalLM
 from model.llava.conversation import conv_templates
 from model.llava.mm_utils import tokenizer_image_token
 
-
+# ==========================================================
 # 1. 경로 및 환경 설정
+# ==========================================================
 model_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
 image_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/test.png")
 output_image_path = "final_carbon_analysis_result.png"
@@ -17,11 +18,11 @@ output_image_path = "final_carbon_analysis_result.png"
 gc.collect()
 torch.cuda.empty_cache()
 
-print(f"[1/5] 모델 및 토크나이저 로드")
+print("[1/5] 모델 및 토크나이저 로드")
 
-# 토크나이저 로드 및 특수 토큰 설정
+# 토크나이저 로드 (단어 사전 크기 에러 방지를 위해 <grounding> 제거)
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"]
+special_tokens = ["[SEG]", "<p>", "</p>"]
 tokenizer.add_tokens(special_tokens, special_tokens=True)
 sp_limit = tokenizer.sp_model.get_piece_size()
 
@@ -35,12 +36,35 @@ model = GLaMMForCausalLM.from_pretrained(
 model.resize_token_embeddings(len(tokenizer))
 model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
-# 2. 모델 GPU 이동
-print("[2/5] 모델 CUDA(GPU) 이동 완료")
-model.to("cuda")
+# ==========================================================
+# 2. 모델 GPU 이동 및 몽키 패치 적용 (무한 추론 & 타입 충돌 방지)
+# ==========================================================
+print("[2/5] 모델 CUDA(GPU) 이동 및 몽키 패치 적용")
+model.to("cuda") # 🚨 RoPE 보호를 위해 전체 bfloat16 캐스팅 금지
 model.eval()
 
+# 특정 모듈만 콕 집어서 bfloat16 캐스팅
+base_glamm = model.get_model() if hasattr(model, "get_model") else model.base_model
+modules_to_cast = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
+for mod_name in modules_to_cast:
+    if hasattr(base_glamm, mod_name):
+        getattr(base_glamm, mod_name).to(device="cuda", dtype=torch.bfloat16)
+
+# SAM Mask Decoder 내부 Float32 충돌 방지용 Monkey Patch
+if hasattr(base_glamm, "grounding_encoder"):
+    mask_decoder = base_glamm.grounding_encoder.mask_decoder
+    original_forward = mask_decoder.forward
+    
+    def mask_decoder_forward_wrapper(*args, **kwargs):
+        new_args = [a.to(torch.bfloat16) if isinstance(a, torch.Tensor) and torch.is_floating_point(a) else a for a in args]
+        new_kwargs = {k: (v.to(torch.bfloat16) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v) for k, v in kwargs.items()}
+        return original_forward(*new_args, **new_kwargs)
+        
+    mask_decoder.forward = mask_decoder_forward_wrapper
+
+# ==========================================================
 # 3. 데이터 전처리
+# ==========================================================
 print("[3/5] 탄소 흡수원 이미지 전처리")
 raw_image = Image.open(image_path).convert("RGB")
 
@@ -54,11 +78,13 @@ sam_image_tensor = torch.from_numpy(np.array(sam_image_res)).permute(2, 0, 1).fl
 sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).view(3,1,1)) / 
                     torch.tensor([58.395, 57.12, 57.375]).view(3,1,1)).unsqueeze(0).to("cuda", dtype=torch.bfloat16)
 
+# ==========================================================
 # 4. 복합 환경 분석 추론
+# ==========================================================
 print("[4/5] 추론")
 conv = conv_templates["vicuna_v1"].copy()
 
-# 환경 분석 전문가용 프롬프트
+# 영어 프롬프트 적용
 prompt = (
     "You are an expert in forest ecology and the carbon cycle. Identify the trees in the forest image and estimate the carbon storage of the area. Write an analysis report strictly following the steps below:\n"
     "Step 1: Use <p> tags to describe the overall terrain and stand density (how densely the trees are packed) in detail.\n"
@@ -68,20 +94,17 @@ prompt = (
     "Compile this information into a structured report.\n"
 )
 
-
 conv.append_message(conv.roles[0], "<image>\n" + prompt)
 
-# Prefilling: 모델이 대화를 끝내지 못하게 답변의 시작 부분을 강제로 지정합니다.
+# 영어 Prefilling
 forced_prefix = "Based on my expert ecological analysis of this scene, <p>"
 conv.append_message(conv.roles[1], forced_prefix)
 
 input_prompt = conv.get_prompt()
-# 마지막의 </s> 태그를 제거하여 모델이 자연스럽게 이어쓰게 함
 if input_prompt.endswith("</s>"):
     input_prompt = input_prompt[:-4]
 
 input_ids = tokenizer_image_token(input_prompt, tokenizer, -200, return_tensors='pt').unsqueeze(0).to("cuda")
-
 
 with torch.inference_mode():
     output_ids, pred_masks = model.evaluate(
@@ -90,17 +113,18 @@ with torch.inference_mode():
         input_ids=input_ids, 
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
-        max_tokens_new=256,
-    )
+        max_new_tokens=256, 
 
+# ==========================================================
 # 5. 결과 분석 및 시각화 저장
+# ==========================================================
+
 print("[5/5] 결과 분석 및 이미지 시각화 중")
 
-# 질문 길이를 제외한 순수 생성 부분 추출
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>", 32007: "<grounding>"}
+special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>"}
 
 raw_tokens = []
 clean_tokens = []
@@ -108,7 +132,6 @@ clean_tokens = []
 for tid in response_ids:
     if tid < sp_limit:
         try:
-            # SentencePiece 공백 문자(\u2581) 처리
             txt = tokenizer.sp_model.IdToPiece(int(tid)).replace('\u2581', ' ')
             raw_tokens.append(txt)
             clean_tokens.append(txt)
@@ -116,12 +139,10 @@ for tid in response_ids:
     else:
         tag = special_map.get(tid, f"[ID_{tid}]")
         raw_tokens.append(f" {tag} ")
-        # 가독성 버전용 변환
         if tag == "<p>": clean_tokens.append("<p>")
         elif tag == "[SEG]": clean_tokens.append("[SEG]")
         elif tag == "</p>": clean_tokens.append("</p>")
 
-# 최종 리포트 조립
 final_raw = forced_prefix + "".join(raw_tokens).strip()
 final_clean = forced_prefix.replace("<p>", "\n") + "".join(clean_tokens).replace("  ", " ").strip()
 
@@ -131,7 +152,6 @@ print("="*70 + "\n")
 print(final_clean)
 print("="*70 + "\n")
 
-# 시각화 저장 로직
 if pred_masks is not None and len(pred_masks) > 0:
     vis_image = np.array(raw_image).astype(np.float32)
     for i, mask in enumerate(pred_masks[0]):
@@ -142,6 +162,6 @@ if pred_masks is not None and len(pred_masks) > 0:
             vis_image[:, :, c] = np.where(mask_np, vis_image[:, :, c] * 0.5 + color[c] * 0.5, vis_image[:, :, c])
     
     Image.fromarray(vis_image.astype(np.uint8)).save(output_image_path)
-    print(f"텍스트 출력 및 '{output_image_path}' 저장 완료.")
+    print(f"✅ 텍스트 출력 및 '{output_image_path}' 시각화 저장 완료.")
 else:
-    print("마스크 생성 실패")
+    print("⚠️ 마스크 생성 실패")
