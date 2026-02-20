@@ -10,8 +10,8 @@ from model.llava.mm_utils import tokenizer_image_token
 # 165.246.141.105
 
 # 1. 경로 및 환경 설정
-model_path = os.path.expanduser("~/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
-image_path = os.path.expanduser("~/Winter-Project/groundingLMM/test_image/test.png")
+model_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
+image_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/test_image/test.png")
 output_image_path = "final_carbon_analysis_result.png"
 
 # GPU 메모리 최적화
