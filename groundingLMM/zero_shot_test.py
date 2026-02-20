@@ -7,7 +7,6 @@ from model.GLaMM import GLaMMForCausalLM
 from model.llava.conversation import conv_templates
 from model.llava.mm_utils import tokenizer_image_token
 
-# 165.246.141.105
 
 # 1. 경로 및 환경 설정
 model_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
@@ -91,7 +90,7 @@ with torch.inference_mode():
         input_ids=input_ids, 
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
-        max_tokens_new=1024,
+        max_tokens_new=256,
     )
 
 # 5. 결과 분석 및 시각화 저장
