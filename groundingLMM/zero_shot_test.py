@@ -35,10 +35,23 @@ model = GLaMMForCausalLM.from_pretrained(
 model.resize_token_embeddings(len(tokenizer))
 model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
-# 2. 모델 GPU 이동
-print("[2/5] 모델 CUDA(GPU) 이동 완료")
-model.to("cuda")
+# 2. 모델 GPU 이동 및 타입 강제 캐스팅
+print("[2/5] 모델 CUDA(GPU) 이동 및 BFloat16 캐스팅 완료")
+model.bfloat16().to("cuda") # 전체 모델과 버퍼를 확실하게 bfloat16으로 캐스팅
 model.eval()
+
+# SAM Mask Decoder 내부 bfloat16 충돌 방지 패치 (추가 필수)
+base_glamm = model.get_model() if hasattr(model, "get_model") else model.base_model
+if hasattr(base_glamm, "grounding_encoder"):
+    mask_decoder = base_glamm.grounding_encoder.mask_decoder
+    original_forward = mask_decoder.forward
+    
+    def mask_decoder_forward_wrapper(*args, **kwargs):
+        new_args = [a.to(torch.bfloat16) if isinstance(a, torch.Tensor) and torch.is_floating_point(a) else a for a in args]
+        new_kwargs = {k: (v.to(torch.bfloat16) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v) for k, v in kwargs.items()}
+        return original_forward(*new_args, **new_kwargs)
+        
+    mask_decoder.forward = mask_decoder_forward_wrapper
 
 # 3. 데이터 전처리
 print("[3/5] 탄소 흡수원 이미지 전처리")
