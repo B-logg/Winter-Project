@@ -22,7 +22,7 @@ print(f"[1/5] 모델 및 토크나이저 로드 및 파인튜닝 가중치 병�
 
 # 토크나이저 로드 및 특수 토큰 설정
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"]
+special_tokens = ["[SEG]", "<p>", "</p>"]
 tokenizer.add_tokens(special_tokens, special_tokens=True)
 sp_limit = tokenizer.sp_model.get_piece_size()
 seg_token_id = tokenizer.convert_tokens_to_ids("[SEG]")
@@ -114,7 +114,7 @@ print("[5/5] 결과 분석 및 이미지 시각화 중")
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>", 32007: "<grounding>"}
+special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>"}
 
 raw_tokens = []
 clean_tokens = []
