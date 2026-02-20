@@ -35,23 +35,10 @@ model = GLaMMForCausalLM.from_pretrained(
 model.resize_token_embeddings(len(tokenizer))
 model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
-# 2. 모델 GPU 이동 및 타입 강제 캐스팅
-print("[2/5] 모델 CUDA(GPU) 이동 및 BFloat16 캐스팅 완료")
-model.bfloat16().to("cuda") # 전체 모델과 버퍼를 확실하게 bfloat16으로 캐스팅
+# 2. 모델 GPU 이동
+print("[2/5] 모델 CUDA(GPU) 이동 완료")
+model.to("cuda")
 model.eval()
-
-# SAM Mask Decoder 내부 bfloat16 충돌 방지 패치 (추가 필수)
-base_glamm = model.get_model() if hasattr(model, "get_model") else model.base_model
-if hasattr(base_glamm, "grounding_encoder"):
-    mask_decoder = base_glamm.grounding_encoder.mask_decoder
-    original_forward = mask_decoder.forward
-    
-    def mask_decoder_forward_wrapper(*args, **kwargs):
-        new_args = [a.to(torch.bfloat16) if isinstance(a, torch.Tensor) and torch.is_floating_point(a) else a for a in args]
-        new_kwargs = {k: (v.to(torch.bfloat16) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v) for k, v in kwargs.items()}
-        return original_forward(*new_args, **new_kwargs)
-        
-    mask_decoder.forward = mask_decoder_forward_wrapper
 
 # 3. 데이터 전처리
 print("[3/5] 탄소 흡수원 이미지 전처리")
@@ -73,13 +60,14 @@ conv = conv_templates["vicuna_v1"].copy()
 
 # 환경 분석 전문가용 프롬프트
 prompt = (
-    "당신은 산림 생태 및 탄소 순환 전문가입니다. 산림 이미지에서 나무들을 식별하고, 해당 구역의 탄소 저장량을 추론하세요. 다음 단계를 엄격히 따라 분석 보고서를 작성하세요.\n"
-    "1단계: <p> 태그를 사용하여 전체적인 지형, 임분 밀도(나무의 빽빽한 정도) 상세히 묘사하세요.\n"
-    "2단계: 화면에 보이는 수종(활엽수, 침엽수 등)을 분류하고, 잎의 색상과 수관(Canopy)의 크기를 바탕으로 수목의 건강 상태를 평가하세요.\n"
-    "3단계: 관찰된 수관의 크기와 밀도를 기반으로 이 식생의 총 탄소 저장량을 논리적으로 추론하여 수치나 등급으로 제시하세요.\n"
-    "4단계: 산림 이미지에서 식별 가능한 모든 나무에 대해, 나무의 특징을 짧게 묘사한 직후 반드시 [SEG] 토큰을 삽입하세요."
-    "해당 내용을 보고서로 작성하세요.\n"
+    "You are an expert in forest ecology and the carbon cycle. Identify the trees in the forest image and estimate the carbon storage of the area. Write an analysis report strictly following the steps below:\n"
+    "Step 1: Use <p> tags to describe the overall terrain and stand density (how densely the trees are packed) in detail.\n"
+    "Step 2: Classify the visible tree species (e.g., broadleaf, coniferous) and evaluate their health condition based on leaf color and canopy size.\n"
+    "Step 3: Based on the observed canopy size and density, logically infer the total carbon storage of this vegetation and present it as a specific numerical value or a grade.\n"
+    "Step 4: For every identifiable tree in the forest image, briefly describe its characteristics and immediately insert the [SEG] token right after the description.\n"
+    "Compile this information into a structured report.\n"
 )
+
 
 conv.append_message(conv.roles[0], "<image>\n" + prompt)
 
@@ -94,7 +82,6 @@ if input_prompt.endswith("</s>"):
 
 input_ids = tokenizer_image_token(input_prompt, tokenizer, -200, return_tensors='pt').unsqueeze(0).to("cuda")
 
-# 
 
 with torch.inference_mode():
     output_ids, pred_masks = model.evaluate(
@@ -103,7 +90,7 @@ with torch.inference_mode():
         input_ids=input_ids, 
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
-        max_tokens_new=128,
+        max_tokens_new=256,
     )
 
 # 5. 결과 분석 및 시각화 저장
