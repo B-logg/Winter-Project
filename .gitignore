@@ -25,6 +25,7 @@ test.py
 *.jpeg
 !groundingLMM/test_image/
 !groundingLMM/test_image/*
+!test.png
 *.json
 !datasets/INaturalist/l1_prepare_data.json
 datasets/INaturalist/all_tree_ids.txt
