@@ -86,11 +86,11 @@ conv = conv_templates["vicuna_v1"].copy()
 
 # 영어 프롬프트 적용
 prompt = (
-    "You are an expert in forest ecology and the carbon cycle. Identify the trees in the forest image and estimate the carbon storage of the area. Write an analysis report strictly following the steps below:\n"
-    "Step 1: Use <p> tags to describe the overall terrain and stand density (how densely the trees are packed) in detail.\n"
-    "Step 2: Classify the visible tree species (e.g., broadleaf, coniferous) and evaluate their health condition based on leaf color and canopy size.\n"
-    "Step 3: Based on the observed canopy size and density, logically infer the total carbon storage of this vegetation and present it as a specific numerical value or a grade.\n"
-    "Step 4: For every identifiable tree in the forest image, briefly describe its characteristics and immediately insert the [SEG] token right after the description.\n"
+    "You are an expert in forest ecology and the carbon cycle. Estimate the carbon storage of the area. Write an analysis report strictly following the steps below:\n"
+    "Step 1: Use <p> tags to describe the overall terrain and stand density in detail.\n"
+    "Step 2: Classify the visible tree species and evaluate their health condition.\n"
+    "Step 3: Logically infer the total carbon storage of this vegetation.\n"
+    "Step 4: Identify major tree clusters or canopy groups in the forest image rather than individual trees. Briefly describe each cluster's characteristics and immediately insert the [SEG] token right after the description.\n"
     "Compile this information into a structured report.\n"
 )
 
