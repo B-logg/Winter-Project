@@ -20,20 +20,16 @@ torch.cuda.empty_cache()
 
 print("[1/5] 모델 및 토크나이저 로드")
 
-# 🚨 에러 원인 해결: 제로샷 베이스 모델이므로 <grounding> 토큰을 반드시 포함해야 합니다!
+# 🚨 해결: 이미 훈련된 모델이므로 토큰 강제 추가 및 리사이즈 코드를 완전히 삭제합니다!
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"] 
-tokenizer.add_tokens(special_tokens, special_tokens=True)
-sp_limit = tokenizer.sp_model.get_piece_size()
+sp_limit = tokenizer.sp_model.get_piece_size() if hasattr(tokenizer, 'sp_model') else len(tokenizer)
 
 # 모델 로드
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16, 
-    low_cpu_mem_usage=True,
-    seg_token_idx=tokenizer.convert_tokens_to_ids("[SEG]")
+    low_cpu_mem_usage=True
 )
-model.resize_token_embeddings(len(tokenizer))
 model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
 # ==========================================================
@@ -43,10 +39,15 @@ print("[2/5] 모델 CUDA(GPU) 이동 및 추론 설정 적용")
 model.to("cuda") 
 model.eval()
 
-# 💡 무한 추론(Hanging) 방지를 위한 텍스트 생성 반복 억제 설정 강제 주입
-model.generation_config.temperature = 0.2
-model.generation_config.do_sample = True
-model.generation_config.repetition_penalty = 1.2
+# RoPE(위치 정보) 손상 복구: inv_freq 버퍼를 float32로 유지
+for name, buffer in model.named_buffers():
+    if "inv_freq" in name:
+        buffer.data = buffer.data.to(torch.float32)
+
+# 💡 multinomial 에러 차단 & 무한 루프 완벽 방지
+model.generation_config.do_sample = False          # 무작위 샘플링 끄기 (multinomial 에러 원천 차단)
+model.generation_config.repetition_penalty = 1.2   # 단어 반복 억제
+model.generation_config.no_repeat_ngram_size = 3   # 동일한 구절(3단어) 무한 반복 원천 차단
 model.generation_config.eos_token_id = tokenizer.eos_token_id 
 model.generation_config.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
@@ -75,11 +76,9 @@ if hasattr(base_glamm, "grounding_encoder"):
 print("[3/5] 탄소 흡수원 이미지 전처리")
 raw_image = Image.open(image_path).convert("RGB")
 
-# CLIP용 전처리
 image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
 image_tensor = image_processor.preprocess(raw_image, return_tensors="pt")["pixel_values"].to("cuda", dtype=torch.bfloat16)
 
-# SAM용 전처리
 sam_image_res = raw_image.resize((1024, 1024))
 sam_image_tensor = torch.from_numpy(np.array(sam_image_res)).permute(2, 0, 1).float()
 sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).view(3,1,1)) / 
@@ -91,7 +90,6 @@ sam_image_tensor = ((sam_image_tensor - torch.tensor([123.675, 116.28, 103.53]).
 print("[4/5] 추론")
 conv = conv_templates["vicuna_v1"].copy()
 
-# 영어 프롬프트 적용
 prompt = (
     "You are an expert in forest ecology and the carbon cycle. Estimate the carbon storage of the area. Write an analysis report strictly following the steps below:\n"
     "Step 1: Use <p> tags to describe the overall terrain and stand density in detail.\n"
@@ -103,7 +101,6 @@ prompt = (
 
 conv.append_message(conv.roles[0], "<image>\n" + prompt)
 
-# 영어 Prefilling
 forced_prefix = "Based on my expert ecological analysis of this scene, <p>"
 conv.append_message(conv.roles[1], forced_prefix)
 
@@ -131,7 +128,7 @@ print("[5/5] 결과 분석 및 이미지 시각화 중")
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-# 🚨 <grounding> 매핑 복구
+# 모델이 알고 있는 원본 매핑 복구
 special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>", 32007: "<grounding>"}
 
 raw_tokens = []
