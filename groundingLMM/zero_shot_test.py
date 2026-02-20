@@ -118,7 +118,7 @@ with torch.inference_mode():
         input_ids=input_ids, 
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
-        max_tokens_new=30,
+        max_tokens_new=15,
     )
 
 # ==========================================================
