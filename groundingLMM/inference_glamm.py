@@ -9,9 +9,9 @@ from model.llava.conversation import conv_templates
 from model.llava.mm_utils import tokenizer_image_token
 
 # 1. 경로 및 환경 설정
-model_path = os.path.expanduser("~/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
-lora_path = os.path.expanduser("~/Winter-Project/checkpoints/GLaMM-Forest-A40-4GPU/checkpoint-epoch-3")
-image_path = os.path.expanduser("~/Winter-Project/groundingLMM/test_image/test.png") # 테스트 이미지
+model_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
+lora_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/checkpoints/GLaMM-Forest-A40-4GPU/checkpoint-epoch-3")
+image_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/test_image/test.png") # 테스트 이미지
 output_image_path = "final_carbon_analysis_result.png"
 
 # GPU 메모리 최적화
