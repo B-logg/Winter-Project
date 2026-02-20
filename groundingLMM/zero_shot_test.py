@@ -37,11 +37,18 @@ model.resize_token_embeddings(len(tokenizer))
 model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
 # ==========================================================
-# 2. 모델 GPU 이동 및 몽키 패치 적용 (무한 추론 & 타입 충돌 방지)
+# 2. 모델 GPU 이동 및 몽키 패치 & 무한 추론 방지 설정
 # ==========================================================
-print("[2/5] 모델 CUDA(GPU) 이동 및 몽키 패치 적용")
+print("[2/5] 모델 CUDA(GPU) 이동 및 추론 설정 적용")
 model.to("cuda") # 🚨 RoPE 보호를 위해 전체 bfloat16 캐스팅 금지
 model.eval()
+
+# 💡 [핵심 해결책] evaluate 함수가 거부하는 설정들을 모델 엔진에 직접 강제 주입!
+model.generation_config.temperature = 0.2
+model.generation_config.do_sample = True
+model.generation_config.repetition_penalty = 1.2
+model.generation_config.eos_token_id = tokenizer.eos_token_id 
+model.generation_config.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
 # 특정 모듈만 콕 집어서 bfloat16 캐스팅
 base_glamm = model.get_model() if hasattr(model, "get_model") else model.base_model
@@ -115,10 +122,10 @@ with torch.inference_mode():
         orig_sizes=[raw_image.size[::-1]], 
         max_tokens_new=256, 
     )
+
 # ==========================================================
 # 5. 결과 분석 및 시각화 저장
 # ==========================================================
-
 print("[5/5] 결과 분석 및 이미지 시각화 중")
 
 input_token_len = input_ids.shape[1]
