@@ -20,13 +20,12 @@ torch.cuda.empty_cache()
 
 print("[1/5] 모델 및 토크나이저 로드")
 
-# 🚨 질문자님의 원본 로드 코드 복구 (이게 정답이었습니다!)
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
 special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"]
 tokenizer.add_tokens(special_tokens, special_tokens=True)
 sp_limit = tokenizer.sp_model.get_piece_size()
 
-# 모델 로드 (seg_token_idx 파라미터 복구)
+# 모델 로드
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16, 
@@ -43,15 +42,13 @@ print("[2/5] 모델 CUDA(GPU) 이동 및 추론 설정 적용")
 model.to("cuda") 
 model.eval()
 
-# RoPE(위치 정보) 손상 복구
+# RoPE(위치 정보) 손상 복구: NaN 에러 방지용
 for name, buffer in model.named_buffers():
     if "inv_freq" in name:
         buffer.data = buffer.data.to(torch.float32)
 
-# 💡 [핵심] multinomial 에러 차단 & 무한 루프 완벽 방지
-model.generation_config.do_sample = False          # 무작위 샘플링 끄기 (multinomial 에러 차단)
-model.generation_config.repetition_penalty = 1.2   # 단어 반복 억제
-model.generation_config.no_repeat_ngram_size = 3   # 앵무새 반복 무한 루프 원천 차단
+# 💡 multinomial 에러 및 -200 인덱스 충돌 원천 차단
+model.generation_config.do_sample = False  # 무작위 샘플링 끄기 (결정론적 생성)
 model.generation_config.eos_token_id = tokenizer.eos_token_id 
 model.generation_config.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
@@ -121,7 +118,7 @@ with torch.inference_mode():
         input_ids=input_ids, 
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
-        max_tokens_new=256, 
+        max_tokens_new=150, # 🚨 하드웨어 강제 컷: 무한 대기를 원천 차단합니다.
     )
 
 # ==========================================================
