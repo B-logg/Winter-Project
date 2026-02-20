@@ -11,7 +11,7 @@ from model.llava.mm_utils import tokenizer_image_token
 
 # 1. 경로 및 환경 설정
 model_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG")
-image_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/test_image/test.png")
+image_path = os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/test.png")
 output_image_path = "final_carbon_analysis_result.png"
 
 # GPU 메모리 최적화
@@ -61,11 +61,12 @@ conv = conv_templates["vicuna_v1"].copy()
 
 # 환경 분석 전문가용 프롬프트
 prompt = (
-    "As an expert ecologist, perform a comprehensive environmental carbon assessment for this image.\n"
-    "Step 1. Analyze the terrain and soil moisture in a long, descriptive paragraph using <p> tags.\n"
-    "Step 2. Identify all plant species and evaluate their health and drought stress.\n"
-    "Step 3. Calculate the carbon sequestration potential of this vegetation.\n"
-    "Step 4. Crucially, insert the [SEG] token exactly for every tree or plant you identify."
+    "당신은 산림 생태 및 탄소 순환 전문가입니다. 산림 이미지에서 나무들을 식별하고, 해당 구역의 탄소 저장량을 추론하세요. 다음 단계를 엄격히 따라 분석 보고서를 작성하세요.\n"
+    "1단계: <p> 태그를 사용하여 전체적인 지형, 임분 밀도(나무의 빽빽한 정도) 상세히 묘사하세요.\n"
+    "2단계: 화면에 보이는 수종(활엽수, 침엽수 등)을 분류하고, 잎의 색상과 수관(Canopy)의 크기를 바탕으로 수목의 건강 상태를 평가하세요.\n"
+    "3단계: 관찰된 수관의 크기와 밀도를 기반으로 이 식생의 총 탄소 저장량을 논리적으로 추론하여 수치나 등급으로 제시하세요.\n"
+    "4단계: 산림 이미지에서 식별 가능한 모든 나무에 대해, 나무의 특징을 짧게 묘사한 직후 반드시 [SEG] 토큰을 삽입하세요."
+    "해당 내용을 보고서로 작성하세요.\n"
 )
 
 conv.append_message(conv.roles[0], "<image>\n" + prompt)
