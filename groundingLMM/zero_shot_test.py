@@ -20,16 +20,20 @@ torch.cuda.empty_cache()
 
 print("[1/5] 모델 및 토크나이저 로드")
 
-# 🚨 해결: 이미 훈련된 모델이므로 토큰 강제 추가 및 리사이즈 코드를 완전히 삭제합니다!
+# 🚨 질문자님의 원본 로드 코드 복구 (이게 정답이었습니다!)
 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-sp_limit = tokenizer.sp_model.get_piece_size() if hasattr(tokenizer, 'sp_model') else len(tokenizer)
+special_tokens = ["[SEG]", "<p>", "</p>", "<grounding>"]
+tokenizer.add_tokens(special_tokens, special_tokens=True)
+sp_limit = tokenizer.sp_model.get_piece_size()
 
-# 모델 로드
+# 모델 로드 (seg_token_idx 파라미터 복구)
 model = GLaMMForCausalLM.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16, 
-    low_cpu_mem_usage=True
+    low_cpu_mem_usage=True,
+    seg_token_idx=tokenizer.convert_tokens_to_ids("[SEG]")
 )
+model.resize_token_embeddings(len(tokenizer))
 model.config.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
 # ==========================================================
@@ -39,15 +43,15 @@ print("[2/5] 모델 CUDA(GPU) 이동 및 추론 설정 적용")
 model.to("cuda") 
 model.eval()
 
-# RoPE(위치 정보) 손상 복구: inv_freq 버퍼를 float32로 유지
+# RoPE(위치 정보) 손상 복구
 for name, buffer in model.named_buffers():
     if "inv_freq" in name:
         buffer.data = buffer.data.to(torch.float32)
 
-# 💡 multinomial 에러 차단 & 무한 루프 완벽 방지
-model.generation_config.do_sample = False          # 무작위 샘플링 끄기 (multinomial 에러 원천 차단)
+# 💡 [핵심] multinomial 에러 차단 & 무한 루프 완벽 방지
+model.generation_config.do_sample = False          # 무작위 샘플링 끄기 (multinomial 에러 차단)
 model.generation_config.repetition_penalty = 1.2   # 단어 반복 억제
-model.generation_config.no_repeat_ngram_size = 3   # 동일한 구절(3단어) 무한 반복 원천 차단
+model.generation_config.no_repeat_ngram_size = 3   # 앵무새 반복 무한 루프 원천 차단
 model.generation_config.eos_token_id = tokenizer.eos_token_id 
 model.generation_config.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
@@ -128,7 +132,6 @@ print("[5/5] 결과 분석 및 이미지 시각화 중")
 input_token_len = input_ids.shape[1]
 response_ids = output_ids[0][input_token_len:].cpu().tolist()
 
-# 모델이 알고 있는 원본 매핑 복구
 special_map = {32004: "[SEG]", 32005: "<p>", 32006: "</p>", 32007: "<grounding>"}
 
 raw_tokens = []
