@@ -104,7 +104,7 @@ with torch.inference_mode():
         input_ids=input_ids, 
         resize_list=[raw_image.size[::-1]],
         orig_sizes=[raw_image.size[::-1]], 
-        max_tokens_new=128,
+        max_tokens_new=10,
     )
 
 # 5. 결과 분석 및 시각화 저장
