@@ -226,6 +226,11 @@ def main():
                 is_image_token = (batch['input_ids'] == -200)
                 clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
+            
+            # 실수형(float 32) 텐서인 이미지, 마스크를 모두 BF16으로 변환 -> DataLoader에서 전처리하여 나온 이미지와 마스크는 기본적으로 float32
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                    batch[k] = v.to(torch.bfloat16)
 
             outputs = model_engine(**batch)
             loss = outputs['loss']
@@ -253,6 +258,10 @@ def main():
                     is_image_token = (batch['input_ids'] == -200)
                     clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
                     batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
+
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                        batch[k] = v.to(torch.bfloat16)
 
                 outputs = model_engine(**batch)
                 val_loss_sum += outputs['loss'].item()
