@@ -28,9 +28,9 @@ def parse_args():
     parser.add_argument("--version", default="MBZUAI/GLaMM-GranD-Pretrained")
     
     # 학습용 JSON
-    parser.add_argument("--dataset_path", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/datasets/glamm_train.json"))
-    parser.add_argument("--image_folder", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/datasets/images"))
-    parser.add_argument("--output_dir", type=str, default="./checkpoints/glamm_forest_optimal")
+    parser.add_argument("--dataset_path", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/glamm_train.json"))
+    parser.add_argument("--image_folder", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/images"))
+    parser.add_argument("--output_dir", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints"))
     
     # 하이퍼파라미터
     parser.add_argument("--model_max_length", default=2048, type=int)
@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
     parser.add_argument("--bce_loss_weight", default=2.0, type=float)
     
-    parser.add_argument("--vision_pretrained", default="./checkpoints/sam_vit_h_4b8939.pth", type=str)
+    parser.add_argument("--vision_pretrained", default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints"), type=str)
     parser.add_argument("--vision_tower", default="openai/clip-vit-large-patch14-336", type=str)
     
     parser.add_argument("--deepspeed", type=str, default=None)
@@ -91,6 +91,7 @@ class ForestDataset(Dataset):
         mask_paths = item.get('mask_path', [])
         mask_list = []
         for mp in mask_paths:
+            mp_expanded = os.path.expanduser(mp)
             mask_np = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
             if mask_np is not None:
                 mask_resized = cv2.resize(mask_np, (1024, 1024), interpolation=cv2.INTER_NEAREST)

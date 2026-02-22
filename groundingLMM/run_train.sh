@@ -6,7 +6,7 @@ echo "Starting DeepSpeed Training on 3 GPUs"
 
 # 절대 경로 변수 세팅
 BASE_DIR="$HOME/학부연구생/bosung/Winter-Project/groundingLMM"
-DATA_DIR="$BASE_DIR/dataset/datasets"
+DATA_DIR="$BASE_DIR/dataset"
 CHK_DIR="$BASE_DIR/checkpoints"
 
 BASE_MODEL_PATH="$CHK_DIR/GLaMM-GCG"
