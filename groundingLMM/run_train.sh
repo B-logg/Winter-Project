@@ -34,3 +34,4 @@ echo "Training finished successfully!"
 
 # nohup ./run_train.sh > train_log.txt 2>&1 &
 # tail -f train_log.txt
+# tmux attach-session -t <session number>
