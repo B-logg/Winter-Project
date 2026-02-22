@@ -12,7 +12,7 @@ CHK_DIR="$BASE_DIR/checkpoints"
 BASE_MODEL_PATH="$CHK_DIR/GLaMM-GCG"
 OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned"
 
-deepspeed --num_gpus=3 train_glamm_optimal.py \
+deepspeed --num_gpus=3 train_glamm.py \
     --deepspeed deepspeed_config.json \
     --version "$BASE_MODEL_PATH" \
     --dataset_path "$DATA_DIR/glamm_train.json" \
