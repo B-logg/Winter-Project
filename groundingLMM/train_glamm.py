@@ -219,8 +219,18 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
+            if 'input_ids' in batch:
+                bsz = batch['input_ids'].shape(0)
+                batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
+
+                if args.seg_token_idx is not None:
+                    new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
+                    if new_seg_mask.any():
+                        batch['seg_token_mask'] = new_seg_mask
+
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
+                batch['labels'][(batch['labels'] >= len(tokenizer)) &(batch['labels'] != -100)] = -100
                 
             if 'input_ids' in batch:
                 is_image_token = (batch['input_ids'] == -200)
@@ -252,8 +262,20 @@ def main():
         with torch.no_grad(): # 역전파(기울기 계산) 비활성화하여 메모리 절약 및 속도 향상
             for batch in val_progress:
                 batch = dict_to_cuda(batch)
+
+                if 'input_ids' in batch:
+                    bsz = batch['input_ids'].shape(0)
+                    batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
+
+                    if args.seg_token_idx is not None:
+                        new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
+                        if new_seg_mask.any():
+                            batch['seg_token_mask'] = new_seg_mask
                 
-                if 'labels' in batch: batch['labels'][batch['labels'] == -200] = -100
+                if 'labels' in batch:
+                    batch['labels'][batch['labels'] == -200] = -100
+                    batch['labels'][(batch['labels'] >= len(tokenizer)) &(batch['labels'] != -100)] = -100
+
                 if 'input_ids' in batch:
                     is_image_token = (batch['input_ids'] == -200)
                     clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
