@@ -16,7 +16,7 @@ deepspeed --num_gpus=3 train_glamm.py \
     --deepspeed deepspeed_config.json \
     --version "$BASE_MODEL_PATH" \
     --dataset_path "$DATA_DIR/glamm_train.json" \
-    --image_folder "$DATA_DIR/images" \
+    --image_folder "$DATA_DIR/glamm_images_train" \
     --vision_pretrained "$CHK_DIR/sam_vit_h_4b8939.pth" \
     --vision_tower "openai/clip-vit-large-patch14-336" \
     --output_dir "$OUTPUT_DIR" \
@@ -30,3 +30,7 @@ deepspeed --num_gpus=3 train_glamm.py \
     --lora_alpha 256
 
 echo "Training finished successfully!"
+
+
+# nohup ./run_train.sh > train_log.txt 2>&1 &
+# tail -f train_log.txt
