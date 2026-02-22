@@ -114,13 +114,14 @@ class ForestDataset(Dataset):
         }
 
 def find_all_linear_names(model):
-    target_names = set()
+    target_names = []
+    # SAM 등 시각 모듈에는 절대 LoRA가 붙지 못하게 차단
     blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder", "vision_tower"]
     for name, module in model.named_modules():
         if isinstance(module, (torch.nn.Linear, bnb.nn.Linear4bit)):
             if not any(b in name for b in blacklist):
-                target_names.add(name.split('.')[-1])
-    return list(target_names)
+                target_names.append(name) # 이름 끝이 아닌 전체 경로(Full Name)를 유지
+    return target_names
 
 # 3. 메인 학습 및 검증 루프
 def main():
@@ -177,12 +178,31 @@ def main():
     )
     model = get_peft_model(model, lora_config)
 
+
     base_model = model.base_model.model.model
     for mod_name in ["grounding_encoder", "mm_projector", "text_hidden_fcs"]:
         if hasattr(base_model, mod_name):
             module = getattr(base_model, mod_name)
             module.to(device=device, dtype=torch.bfloat16) 
-            for param in module.parameters(): param.requires_grad = True
+            
+            for param in module.parameters(): 
+                param.requires_grad = True
+            
+            for name, buf in module.named_buffers():
+                if buf.dtype != torch.bfloat16 and torch.is_floating_point(buf):
+                    buf.data = buf.data.to(torch.bfloat16)
+    
+    # 몽키 패치: SAM Mask decoder 입구에서 무조건 BF16으로 변환
+    if hasattr(base_model, "grounding_encoder"):
+        mask_decoder = base_model.grounding_encoder.mask_decoder
+        original_forward = mask_decoder.forward
+
+        def mask_decoder_forward_wrapper(*args, **kwargs):
+            new_args = [a.to(torch.bfloat16) if isinstance(a, torch.Tensor) and torch.is_floating_point(a) else a for a in args]
+            new_kwargs = {k: v.to(torch.bfloat16) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v for k, v in kwargs.items()}
+            return original_forward(*new_args, **new_kwargs)
+
+        mask_decoder.forward = mask_decoder_forward_wrapper
 
     # [D] DataLoader 설정
     image_processor = CLIPImageProcessor.from_pretrained(args.vision_tower)
