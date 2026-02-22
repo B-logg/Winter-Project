@@ -80,8 +80,8 @@ class ForestDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        image_path = item['image'] 
-        
+        image_path = os.path.expanduser(item['image']) # expanduser: 홈 디렉토리 반환
+
         image = Image.open(image_path).convert('RGB')
         orig_w, orig_h = image.size
         
