@@ -80,7 +80,9 @@ class ForestDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        image_path = os.path.expanduser(item['image']) # expanduser: 홈 디렉토리 반환
+        
+        raw_image_path = item['image'].strip()
+        image_path = raw_image_path.replace('~', '/shared/home/naislab')
 
         image = Image.open(image_path).convert('RGB')
         orig_w, orig_h = image.size
@@ -91,8 +93,10 @@ class ForestDataset(Dataset):
         mask_paths = item.get('mask_path', [])
         mask_list = []
         for mp in mask_paths:
-            mp_expanded = os.path.expanduser(mp)
-            mask_np = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+            raw_mp = mp.strip()
+            mp_expanded = raw_mp.replace('~', '/shared/home/naislab')
+
+            mask_np = cv2.imread(mp_expanded, cv2.IMREAD_GRAYSCALE)
             if mask_np is not None:
                 mask_resized = cv2.resize(mask_np, (1024, 1024), interpolation=cv2.INTER_NEAREST)
                 binary_mask = (mask_resized > 0).astype(np.float32)
