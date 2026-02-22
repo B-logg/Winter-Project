@@ -219,8 +219,11 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
+
+            # seg_token_mask: [SEG] 토큰 위치 마스크
+            # offset: 시퀀스 내 토큰 위치 인덱스
             if 'input_ids' in batch:
-                bsz = batch['input_ids'].shape(0)
+                bsz = batch['input_ids'].shape[0]
                 batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
 
                 if args.seg_token_idx is not None:
@@ -264,7 +267,7 @@ def main():
                 batch = dict_to_cuda(batch)
 
                 if 'input_ids' in batch:
-                    bsz = batch['input_ids'].shape(0)
+                    bsz = batch['input_ids'].shape[0]
                     batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
 
                     if args.seg_token_idx is not None:
