@@ -45,6 +45,10 @@ def parse_args():
     parser.add_argument("--lora_r", default=128, type=int)
     parser.add_argument("--lora_alpha", default=256, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
+
+    parser.add_argument("--ce_loss_weight", default=1.0, type=float)
+    parser.add_argument("--dice_loss_weight", default=0.5, type=float)
+    parser.add_argument("--bce_loss_weight", default=2.0, type=float)
     
     parser.add_argument("--vision_pretrained", default="./checkpoints/sam_vit_h_4b8939.pth", type=str)
     parser.add_argument("--vision_tower", default="openai/clip-vit-large-patch14-336", type=str)
