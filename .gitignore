@@ -34,6 +34,8 @@ datasets/NEON/NEON_dataset
 L3_Final_Output/
 L3_Work_Dir/
 
+!deepspeed_config.json
+
 # 파이썬 및 시스템 캐시
 __pycache__/
 *.pyc

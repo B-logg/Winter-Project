@@ -1,377 +1,268 @@
 import os
-import sys
-import time
 import json
 import tqdm
 import cv2
 import torch
+import random
 import argparse
 import deepspeed
 import numpy as np
-from transformers import CLIPImageProcessor
-import transformers
-from functools import partial
 from PIL import Image
+from functools import partial
 from torch.utils.data import Dataset, DataLoader
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.tensorboard import SummaryWriter
-from transformers import BitsAndBytesConfig
+
+import transformers
+from transformers import CLIPImageProcessor, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import bitsandbytes as bnb
 
 from model.GLaMM import GLaMMForCausalLM 
-from model.llava import conversation as conversation_lib
 from dataset.dataset import custom_collate_fn
-from tools.utils import AverageMeter, ProgressMeter, dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from model.llava.model.language_model.llava_llama import LlamaConfig
-from peft.tuners.lora import Linear as LoraLinear
-from peft.tuners.lora import LoraLayer
+from tools.utils import dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-# =============================================================================
-# 🕵️‍♂️ [디버깅 도우미] 모델/데이터 상태 출력
-# =============================================================================
-def print_model_status(model, stage_name):
-    print(f"\n{'='*20} [DEBUG: {stage_name}] {'='*20}")
-    
-    dtypes = {}
-    for name, p in model.named_parameters():
-        dtype = str(p.dtype)
-        dtypes[dtype] = dtypes.get(dtype, 0) + 1
-    print(f"📊 Parameter Dtypes Stats: {dtypes}")
-    
-    base_glamm = model.base_model.model.model if hasattr(model, "base_model") else None
-    if base_glamm and hasattr(base_glamm, "grounding_encoder"):
-        sam = base_glamm.grounding_encoder
-        print(f"🔎 Checking SAM (Grounding Encoder)...")
-        
-        # 1. Linear Weights
-        for name, mod in sam.named_modules():
-            if isinstance(mod, torch.nn.Linear):
-                print(f"   - Linear: {mod.weight.dtype}")
-                break
-        
-        # 2. Gaussian Matrix Buffer
-        found = False
-        for name, buf in sam.named_buffers():
-            if "gaussian" in name:
-                print(f"   - Buffer '{name}': {buf.dtype}")
-                found = True
-        if not found: print("   ⚠️ Gaussian Matrix not found in named_buffers.")
 
-        # 3. Embedding Weights (iou_token, mask_tokens)
-        for name, mod in sam.named_modules():
-            if isinstance(mod, torch.nn.Embedding):
-                print(f"   - Embedding '{name}': {mod.weight.dtype}")
-                
-    print("="*60 + "\n")
-
-# =============================================================================
-
+# 1. 인자 및 경로 설정
 def parse_args():
-    parser = argparse.ArgumentParser(description="GLaMM Forest Finetuning")
+    parser = argparse.ArgumentParser(description="Optimal GLaMM Forest Finetuning")
     parser.add_argument("--version", default="MBZUAI/GLaMM-GranD-Pretrained")
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to train.json")
-    parser.add_argument("--eval_data_path", type=str, default=None)
-    parser.add_argument("--image_folder", type=str, required=True)
+    
+    # 학습용 JSON
+    parser.add_argument("--dataset_path", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/datasets/glamm_train.json"))
+    parser.add_argument("--image_folder", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/datasets/glamm_images_train"))
+    parser.add_argument("--output_dir", type=str, default="./checkpoints/glamm_forest_optimal")
+    
+    # 하이퍼파라미터
     parser.add_argument("--model_max_length", default=2048, type=int)
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--epochs", default=5, type=int)
     parser.add_argument("--batch_size", default=2, type=int)
-    parser.add_argument("--grad_accumulation_steps", default=1, type=int)
+    parser.add_argument("--grad_accumulation_steps", default=2, type=int)
     parser.add_argument("--lr", default=2e-4, type=float)
     parser.add_argument("--workers", default=4, type=int)
-    parser.add_argument("--print_freq", default=10, type=int)
-    parser.add_argument("--output_dir", default="./checkpoints", type=str)
+    parser.add_argument("--val_ratio", default=0.05, type=float, help="학습 데이터 내 검증(Val) 데이터 비율 (기본 5%)")
+    
     parser.add_argument("--lora_r", default=128, type=int)
     parser.add_argument("--lora_alpha", default=256, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
-    parser.add_argument("--ce_loss_weight", default=1.0, type=float)
-    parser.add_argument("--dice_loss_weight", default=0.5, type=float)
-    parser.add_argument("--bce_loss_weight", default=2.0, type=float)
+    
     parser.add_argument("--vision_pretrained", default="./checkpoints/sam_vit_h_4b8939.pth", type=str)
-    parser.add_argument("--out_dim", default=256, type=int)
-    parser.add_argument("--train_mask_decoder", action="store_true", default=True)
     parser.add_argument("--vision_tower", default="openai/clip-vit-large-patch14-336", type=str)
-    parser.add_argument("--use_mm_start_end", action="store_true", default=True)
-    parser.add_argument("--conv_type", default="llava_v1", type=str)
-    parser.add_argument("--deepspeed", type=str)
-    parser.add_argument("--deepspeed_config", type=str)
+    
+    parser.add_argument("--deepspeed", type=str, default=None)
+    parser.add_argument("--deepspeed_config", type=str, default=None)
     return parser.parse_args()
 
+# 2. 유연한 데이터셋 클래스 (List 기반)
 class ForestDataset(Dataset):
-    def __init__(self, json_path, image_folder, tokenizer, image_processor, model_args):
+    def __init__(self, data_list, image_folder, tokenizer, image_processor):
+        self.data = data_list
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.image_processor = image_processor
-        self.model_args = model_args
         self.sam_mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
         self.sam_std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
-        with open(json_path, 'r', encoding='utf-8') as f:
-            self.data = json.load(f)
+
     def __len__(self):
         return len(self.data)
+
     def preprocess_for_sam(self, image):
         img_res = image.resize((1024, 1024)) 
         img_np = np.array(img_res)
         if img_np.ndim == 2: img_np = np.stack([img_np]*3, axis=-1)
         elif img_np.shape[2] == 4: img_np = img_np[:, :, :3]
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float()
-        img_tensor = (img_tensor - self.sam_mean) / self.sam_std
-        return img_tensor
+        return (img_tensor - self.sam_mean) / self.sam_std
+
     def __getitem__(self, idx):
         item = self.data[idx]
-        image_file = item['image']
-        image_path = os.path.join(self.image_folder, image_file)
-        try:
-            image = Image.open(image_path).convert('RGB')
-            orig_w, orig_h = image.size
-        except Exception as e:
-            print(f"Error loading image {image_path}: {e}")
-            return self.__getitem__((idx + 1) % len(self))
-        if self.image_processor:
-            clip_image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-        else:
-            clip_image = torch.zeros(3, 336, 336)
+        image_path = item['image'] 
+        
+        image = Image.open(image_path).convert('RGB')
+        orig_w, orig_h = image.size
+        
+        clip_image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
         sam_image = self.preprocess_for_sam(image)
-        mask_path = item.get('mask_path', None)
-        masks = torch.zeros((0, 1024, 1024)).float()
-        if mask_path:
-            if isinstance(mask_path, str): mask_paths = [mask_path]
-            else: mask_paths = mask_path
-            mask_list = []
-            for mp in mask_paths:
-                full_mp = os.path.join(self.image_folder, mp)
-                try:
-                    mask_np = cv2.imread(full_mp, 0)
-                    if mask_np is None: continue
-                    mask_resized = cv2.resize(mask_np, (1024, 1024), interpolation=cv2.INTER_NEAREST)
-                    obj_ids = np.unique(mask_resized)
-                    obj_ids = obj_ids[obj_ids > 0]
-                    if len(obj_ids) > 0:
-                        for obj_id in obj_ids:
-                            binary_mask = (mask_resized == obj_id).astype(np.float32)
-                            mask_tensor = torch.from_numpy(binary_mask)
-                            mask_list.append(mask_tensor)
-                except Exception as e:
-                    print(f"Skipping mask: {e}")
-            if len(mask_list) > 0:
-                masks = torch.stack(mask_list)
+        
+        mask_paths = item.get('mask_path', [])
+        mask_list = []
+        for mp in mask_paths:
+            mask_np = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+            if mask_np is not None:
+                mask_resized = cv2.resize(mask_np, (1024, 1024), interpolation=cv2.INTER_NEAREST)
+                binary_mask = (mask_resized > 0).astype(np.float32)
+                mask_list.append(torch.from_numpy(binary_mask))
+                
+        masks = torch.stack(mask_list) if mask_list else torch.zeros((0, 1024, 1024)).float()
+
         return {
-            'image': clip_image, 'grounding_enc_images': sam_image,
-            'conversations': [item['conversations']], 'image_path': image_path,
-            'masks': masks, 'region': item.get('bboxes', None),
+            'image': clip_image, 
+            'grounding_enc_images': sam_image,
+            'conversations': [item['conversations']], 
+            'image_path': image_path,
+            'masks': masks, 
             'resize_list': [orig_w, orig_h]
         }
 
-def find_safe_target_modules(model):
-    target_names = []
-    keywords = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
+def find_all_linear_names(model):
+    target_names = set()
+    blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder", "vision_tower"]
     for name, module in model.named_modules():
-        if any(name.endswith(k) for k in keywords):
-            if any(b in name for b in blacklist): continue
-            if isinstance(module, (torch.nn.Linear, bnb.nn.Linear4bit)):
-                target_names.append(name)
-    return target_names
+        if isinstance(module, (torch.nn.Linear, bnb.nn.Linear4bit)):
+            if not any(b in name for b in blacklist):
+                target_names.add(name.split('.')[-1])
+    return list(target_names)
 
+# 3. 메인 학습 및 검증 루프
 def main():
     args = parse_args()
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
     
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False
-    )
+    # [A] 데이터 준비 및 Train/Val 동적 분할
+    with open(args.dataset_path, 'r', encoding='utf-8') as f:
+        full_data = json.load(f)
+        
+    random.seed(42)
+    random.shuffle(full_data)
+    
+    val_size = int(len(full_data) * args.val_ratio)
+    val_data = full_data[:val_size]
+    train_data = full_data[val_size:]
+    
+    if args.local_rank == 0:
+        print(f"Dataset Split: Train {len(train_data)} / Val {len(val_data)} (from {args.dataset_path})")
+
+    # Tokenizer 및 모델 세팅
+    tokenizer = transformers.AutoTokenizer.from_pretrained(args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
-    special_tokens = ['[SEG]', '<bbox>', '<point>', '<p>', '</p>']
-    if args.use_mm_start_end:
-        special_tokens.extend([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN])
+    special_tokens = ['[SEG]', '<p>', '</p>', DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN]
     tokenizer.add_tokens(special_tokens, special_tokens=True)
-    args.bbox_token_idx = tokenizer("<bbox>", add_special_tokens=False).input_ids[0]
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
-    # [1] 모델 로드
-    skip_modules = ["vision_tower", "grounding_encoder", "mm_projector", 
-                    "text_hidden_fcs", "region_encoder", "lm_head", "embed_tokens"]
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-        llm_int8_skip_modules=skip_modules
+        llm_int8_skip_modules=["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "lm_head"]
     )
-    print(f"Loading GLaMM from {args.version}...")
+    
     model = GLaMMForCausalLM.from_pretrained(
         args.version, quantization_config=bnb_config, torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True, device_map = {"": args.local_rank},
-        train_mask_decoder=args.train_mask_decoder, out_dim=args.out_dim,
+        low_cpu_mem_usage=True, device_map={"": args.local_rank},
+        train_mask_decoder=True, out_dim=256,
         ce_loss_weight=args.ce_loss_weight, dice_loss_weight=args.dice_loss_weight,
         bce_loss_weight=args.bce_loss_weight, seg_token_idx=args.seg_token_idx,
         vision_pretrained=args.vision_pretrained, vision_tower=args.vision_tower,
-        use_mm_start_end=args.use_mm_start_end, mm_vision_select_layer=-2, with_region=True
+        use_mm_start_end=True, mm_vision_select_layer=-2
     )
+    
     model.resize_token_embeddings(len(tokenizer))
     model = prepare_model_for_kbit_training(model)
 
-    # [3] LoRA 적용 (Whitelist)
-    print("🔍 Generating safe LoRA target list (Avoiding SAM)...")
-    target_modules = find_safe_target_modules(model)
+    # [C] LoRA 및 Unfreeze 설정
+    target_modules = find_all_linear_names(model)
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
         lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
-        modules_to_save=["embed_tokens", "lm_head"]
+        modules_to_save=["embed_tokens", "lm_head"] 
     )
     model = get_peft_model(model, lora_config)
 
-    # ==============================================================================
-    # [4] 🔥 Casting & Unfreeze (Monkey Patch 적용)
-    # ==============================================================================
-    print("🚑 CASTING: Forcing SAM & Projectors to BFloat16...")
-    base_glamm = model.base_model.model.model
+    base_model = model.base_model.model.model
+    for mod_name in ["grounding_encoder", "mm_projector", "text_hidden_fcs"]:
+        if hasattr(base_model, mod_name):
+            module = getattr(base_model, mod_name)
+            module.to(device=device, dtype=torch.bfloat16) 
+            for param in module.parameters(): param.requires_grad = True
 
-    # (A) 전수 조사 Casting (Buffer 포함)
-    modules_to_cast = ["grounding_encoder", "mm_projector", "text_hidden_fcs", "region_encoder"]
-    for mod_name in modules_to_cast:
-        if hasattr(base_glamm, mod_name):
-            m = getattr(base_glamm, mod_name)
-            m.to(device=device, dtype=torch.bfloat16)
-            
-            # 파라미터 강제 변환
-            for p in m.parameters():
-                if p.dtype != torch.bfloat16: p.data = p.data.to(torch.bfloat16)
-            
-            # 버퍼(Gaussian Matrix 등) 강제 변환
-            for name, buf in m.named_buffers():
-                if buf.dtype != torch.bfloat16:
-                    buf.data = buf.data.to(torch.bfloat16)
-                    # print(f"   -> Forced Buffer '{name}' to BF16")
-
-    # (B) LoRA 어댑터 캐스팅
-    for name, param in model.named_parameters():
-        if param.requires_grad and param.dtype == torch.float32:
-            param.data = param.data.to(torch.bfloat16)
-
-    # (C) [🔥 NEW] Monkey Patching (Mask Decoder 입구 봉쇄)
-    #     Hook 대신 forward 함수 자체를 감싸서 확실하게 인자를 가로챕니다.
-    if hasattr(base_glamm, "grounding_encoder"):
-        mask_decoder = base_glamm.grounding_encoder.mask_decoder
-        
-        # 원본 forward 함수 보관
-        original_forward = mask_decoder.forward
-        
-        # 래퍼 함수 정의 (무조건 BF16으로 변환해서 전달)
-        def mask_decoder_forward_wrapper(*args, **kwargs):
-            new_args = []
-            for a in args:
-                if isinstance(a, torch.Tensor) and torch.is_floating_point(a):
-                    new_args.append(a.to(torch.bfloat16))
-                else:
-                    new_args.append(a)
-            
-            new_kwargs = {}
-            for k, v in kwargs.items():
-                if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
-                    new_kwargs[k] = v.to(torch.bfloat16)
-                else:
-                    new_kwargs[k] = v
-                    
-            return original_forward(*new_args, **new_kwargs)
-        
-        # 함수 교체 (Monkey Patch)
-        # bound method를 instance에 할당하여 메소드 오버라이딩
-        mask_decoder.forward = mask_decoder_forward_wrapper
-        print("✅ Monkey Patch applied to SAM Mask Decoder (Force BF16 Inputs).")
-
-    # (D) Unfreeze
-    if hasattr(base_glamm, "grounding_encoder"):
-        for param in base_glamm.grounding_encoder.parameters(): param.requires_grad = True
-    for mod_name in ["mm_projector", "text_hidden_fcs", "region_encoder"]:
-        if hasattr(base_glamm, mod_name):
-            for param in getattr(base_glamm, mod_name).parameters(): param.requires_grad = True
-    # ==============================================================================
-
-    if args.local_rank == 0:
-        print_model_status(model, "Final Check before DeepSpeed Init")
-
-    # [6] 데이터셋 로드
-    print(f"Loading Dataset from {args.dataset_path}")
-    train_dataset = ForestDataset(
-        json_path=args.dataset_path, image_folder=args.image_folder,
-        tokenizer=tokenizer, image_processor=CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336"),
-        model_args=args
-    )
-    collate_fn = partial(custom_collate_fn, tokenizer=tokenizer, use_mm_start_end=args.use_mm_start_end, local_rank=args.local_rank, inference=False)
+    # [D] DataLoader 설정
+    image_processor = CLIPImageProcessor.from_pretrained(args.vision_tower)
+    
+    train_dataset = ForestDataset(train_data, args.image_folder, tokenizer, image_processor)
+    val_dataset = ForestDataset(val_data, args.image_folder, tokenizer, image_processor)
+    
+    collate_fn = partial(custom_collate_fn, tokenizer=tokenizer, use_mm_start_end=True, local_rank=args.local_rank, inference=False)
+    
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, collate_fn=collate_fn, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_fn, pin_memory=True)
 
-    # [7] DeepSpeed Init
+    # [E] DeepSpeed 초기화
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
         "optimizer": { "type": "AdamW", "params": { "lr": args.lr, "weight_decay": 0.0, "betas": [0.9, 0.95] } },
-        "scheduler": { "type": "WarmupDecayLR", "params": { "total_num_steps": args.epochs * len(train_loader), "warmup_min_lr": 0, "warmup_max_lr": args.lr, "warmup_num_steps": 100 } },
+        "scheduler": { "type": "WarmupDecayLR", "params": { "total_num_steps": args.epochs * len(train_loader), "warmup_num_steps": 100 } },
         "bf16": { "enabled": True },
-        "zero_optimization": { "stage": 2, "contiguous_gradients": True, "overlap_comm": True, "reduce_scatter": True, "reduce_bucket_size": 5e8, "allgather_bucket_size": 5e8 }
+        "zero_optimization": { "stage": 2, "overlap_comm": True, "contiguous_gradients": True }
     }
     model_engine, optimizer, _, scheduler = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
     
-    # [8] 학습 루프
-    print("Starting Training Loop")
-    global_step = 0
-    final_vocab_size = len(tokenizer) 
     if args.local_rank == 0: writer = SummaryWriter(args.output_dir)
-    
+    global_step = 0
+
+    # [F] 훈련 및 에포크 검증 루프
     for epoch in range(args.epochs):
+        # 1. Training Loop
         model_engine.train()
-        progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=(args.local_rank != 0))
+        progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [TRAIN]", disable=(args.local_rank != 0))
+        
+        train_loss_sum = 0
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
             if 'labels' in batch:
                 batch['labels'][batch['labels'] == -200] = -100
-                batch['labels'][(batch['labels'] >= final_vocab_size) & (batch['labels'] != -100)] = -100
-            
-            if 'input_ids' in batch:
-                bsz = batch['input_ids'].shape[0]
-                batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
-                if args.seg_token_idx is not None:
-                    new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
-                    if new_seg_mask.any(): batch['seg_token_mask'] = new_seg_mask
-                is_image_token = (batch['input_ids'] == -200)
-                clamped_ids = batch['input_ids'].clamp(0, final_vocab_size - 1)
-                batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
-            
-            # 🔥 [Input Casting] 배치 데이터 BF16 변환
-            for key, val in batch.items():
-                if isinstance(val, torch.Tensor) and torch.is_floating_point(val):
-                    if val.dtype != torch.bfloat16:
-                        batch[key] = val.to(torch.bfloat16)
-
-            # --- [DEBUG] 배치 데이터 상태 확인 (첫 스텝만) ---
-            if global_step == 0 and args.local_rank == 0:
-                print(f"\n{'='*20} [DEBUG: First Batch Types] {'='*20}")
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        print(f" - {k}: {v.dtype}")
-                print("="*60 + "\n")
                 
+            if 'input_ids' in batch:
+                is_image_token = (batch['input_ids'] == -200)
+                clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
+                batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
+
             outputs = model_engine(**batch)
             loss = outputs['loss']
             model_engine.backward(loss)
             model_engine.step()
             
-            if args.local_rank == 0 and step % args.print_freq == 0:
-                current_lr = model_engine.get_lr()[0]
+            train_loss_sum += loss.item()
+            
+            if args.local_rank == 0 and step % 10 == 0:
                 writer.add_scalar("Train/Loss", loss.item(), global_step)
-                writer.add_scalar("Train/LR", current_lr, global_step)
-                if 'ce_loss' in outputs: writer.add_scalar("Train/CE_Loss", outputs['ce_loss'].item(), global_step)
-                if 'mask_loss' in outputs: writer.add_scalar("Train/Mask_Loss", outputs['mask_loss'].item(), global_step)
+                writer.add_scalar("Train/LR", model_engine.get_lr()[0], global_step)
             global_step += 1
             
-        if args.local_rank == 0: save_checkpoint(model_engine, args, epoch)
+        # 2. Validation Loop (에포크 종료 시점)
+        model_engine.eval() # 모델을 평가 모드로 전환 (Dropout 등 비활성화)
+        val_loss_sum = 0
+        val_progress = tqdm.tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [VAL]", disable=(args.local_rank != 0))
+        
+        with torch.no_grad(): # 역전파(기울기 계산) 비활성화하여 메모리 절약 및 속도 향상
+            for batch in val_progress:
+                batch = dict_to_cuda(batch)
+                
+                if 'labels' in batch: batch['labels'][batch['labels'] == -200] = -100
+                if 'input_ids' in batch:
+                    is_image_token = (batch['input_ids'] == -200)
+                    clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
+                    batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
 
-def save_checkpoint(model_engine, args, epoch):
-    save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
-    os.makedirs(save_path, exist_ok=True)
-    model_engine.module.save_pretrained(save_path)
-    non_lora_state = {n: p.cpu() for n, p in model_engine.module.named_parameters() if p.requires_grad and "lora_" not in n}
-    torch.save(non_lora_state, os.path.join(save_path, "non_lora_trainables.bin"))
+                outputs = model_engine(**batch)
+                val_loss_sum += outputs['loss'].item()
+        
+        # 3. 로깅 및 체크포인트 저장
+        if args.local_rank == 0:
+            avg_train_loss = train_loss_sum / len(train_loader)
+            avg_val_loss = val_loss_sum / len(val_loader)
+            
+            print(f"\nEpoch {epoch+1} Results: Train Loss = {avg_train_loss:.4f} | Val Loss = {avg_val_loss:.4f}")
+            writer.add_scalar("Val/Loss_Epoch", avg_val_loss, epoch)
+            
+            save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
+            os.makedirs(save_path, exist_ok=True)
+            model_engine.module.save_pretrained(save_path)
+            
+            non_lora_state = {n: p.cpu() for n, p in model_engine.module.named_parameters() if p.requires_grad and "lora_" not in n}
+            torch.save(non_lora_state, os.path.join(save_path, "non_lora_trainables.bin"))
+            print(f"Checkpoint saved at {save_path}\n")
 
 if __name__ == "__main__":
     main()
