@@ -29,7 +29,7 @@ def parse_args():
     
     # 학습용 JSON
     parser.add_argument("--dataset_path", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/datasets/glamm_train.json"))
-    parser.add_argument("--image_folder", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/datasets/glamm_images_train"))
+    parser.add_argument("--image_folder", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/datasets/images"))
     parser.add_argument("--output_dir", type=str, default="./checkpoints/glamm_forest_optimal")
     
     # 하이퍼파라미터
