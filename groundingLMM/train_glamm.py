@@ -229,46 +229,6 @@ def main():
     if args.local_rank == 0: writer = SummaryWriter(args.output_dir)
     global_step = 0
 
-    if args.local_rank == 0:  # 메인 프로세스에서만 한 번 확인
-        print("\n" + "="*50)
-        print("Starting Sanity Check for VAL logic...")
-        model_engine.eval()
-        with torch.no_grad():
-            try:
-                # val_loader에서 배치 하나만 가져옴
-                tmp_batch = next(iter(val_loader))
-                tmp_batch = dict_to_cuda(tmp_batch)
-                
-                # 1. VAL 루프 전처리 로직 (본 코드와 동일하게 적용)
-                if 'input_ids' in tmp_batch:
-                    bsz = tmp_batch['input_ids'].shape[0]
-                    tmp_batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
-                    
-                    if args.seg_token_idx is not None:
-                        new_seg_mask = (tmp_batch['input_ids'] == args.seg_token_idx)
-                        # [핵심 수정] 에러가 났던 차원 불일치를 해결하는 로직
-                        if new_seg_mask.any():
-                            tmp_batch['seg_token_mask'] = new_seg_mask.view(-1)
-
-                    # ID Clamping 및 전처리 로직
-                    is_image_token = (tmp_batch['input_ids'] == -200)
-                    clamped_ids = tmp_batch['input_ids'].clamp(0, len(tokenizer) - 1)
-                    tmp_batch['input_ids'] = torch.where(is_image_token, tmp_batch['input_ids'], clamped_ids)
-                
-                for k, v in tmp_batch.items():
-                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
-                        tmp_batch[k] = v.to(torch.bfloat16)
-
-                # 2. 모델 포워드 테스트
-                outputs = model_engine(**tmp_batch)
-                print(">>> VAL Logic Check Success! <<<")
-            except Exception as e:
-                print(f">>> VAL Logic Check FAILED: {e}")
-                import traceback
-                traceback.print_exc()
-                exit(1) # 에러나면 바로 종료해서 수정할 수 있게 함
-        print("="*50 + "\n")
-
     # [F] 훈련 및 에포크 검증 루프
     for epoch in range(args.epochs):
         # 1. Training Loop
@@ -278,7 +238,6 @@ def main():
         train_loss_sum = 0
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
-
 
             # seg_token_mask: [SEG] 토큰 위치 마스크
             # offset: 시퀀스 내 토큰 위치 인덱스
@@ -315,49 +274,54 @@ def main():
             if args.local_rank == 0 and step % 10 == 0:
                 writer.add_scalar("Train/Loss", loss.item(), global_step)
                 writer.add_scalar("Train/LR", model_engine.get_lr()[0], global_step)
+
+                progress.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{model_engine.get_lr()[0]:.6f}"})
+
             global_step += 1
             
-        # 2. Validation Loop (에포크 종료 시점)
-        model_engine.eval() # 모델을 평가 모드로 전환 (Dropout 등 비활성화)
-        val_loss_sum = 0
-        val_progress = tqdm.tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [VAL]", disable=(args.local_rank != 0))
+        # # 2. Validation Loop (에포크 종료 시점)
+        # model_engine.eval() # 모델을 평가 모드로 전환 (Dropout 등 비활성화)
+        # val_loss_sum = 0
+        # val_progress = tqdm.tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [VAL]", disable=(args.local_rank != 0))
         
-        with torch.no_grad(): # 역전파(기울기 계산) 비활성화하여 메모리 절약 및 속도 향상
-            for batch in val_progress:
-                batch = dict_to_cuda(batch)
+        # with torch.no_grad(): # 역전파(기울기 계산) 비활성화하여 메모리 절약 및 속도 향상
+        #     for batch in val_progress:
+        #         batch = dict_to_cuda(batch)
 
-                if 'input_ids' in batch:
-                    bsz = batch['input_ids'].shape[0]
-                    batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
+        #         if 'input_ids' in batch:
+        #             bsz = batch['input_ids'].shape[0]
+        #             batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
 
-                    if args.seg_token_idx is not None:
-                        new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
-                        if new_seg_mask.any():
-                            batch['seg_token_mask'] = new_seg_mask.view(-1)
+        #             if args.seg_token_idx is not None:
+        #                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
+        #                 if new_seg_mask.any():
+        #                     batch['seg_token_mask'] = new_seg_mask.view(-1)
                 
-                if 'labels' in batch:
-                    batch['labels'][batch['labels'] == -200] = -100
-                    batch['labels'][(batch['labels'] >= len(tokenizer)) &(batch['labels'] != -100)] = -100
+        #         if 'labels' in batch:
+        #             batch['labels'][batch['labels'] == -200] = -100
+        #             batch['labels'][(batch['labels'] >= len(tokenizer)) &(batch['labels'] != -100)] = -100
 
-                if 'input_ids' in batch:
-                    is_image_token = (batch['input_ids'] == -200)
-                    clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
-                    batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
+        #         if 'input_ids' in batch:
+        #             is_image_token = (batch['input_ids'] == -200)
+        #             clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
+        #             batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
 
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
-                        batch[k] = v.to(torch.bfloat16)
+        #         for k, v in batch.items():
+        #             if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+        #                 batch[k] = v.to(torch.bfloat16)
 
-                outputs = model_engine(**batch)
-                val_loss_sum += outputs['loss'].item()
+        #         outputs = model_engine(**batch)
+        #         val_loss_sum += outputs['loss'].item()
+        
+        
         
         # 3. 로깅 및 체크포인트 저장
         if args.local_rank == 0:
             avg_train_loss = train_loss_sum / len(train_loader)
-            avg_val_loss = val_loss_sum / len(val_loader)
+            # avg_val_loss = val_loss_sum / len(val_loader)
             
-            print(f"\nEpoch {epoch+1} Results: Train Loss = {avg_train_loss:.4f} | Val Loss = {avg_val_loss:.4f}")
-            writer.add_scalar("Val/Loss_Epoch", avg_val_loss, epoch)
+            print(f"\nEpoch {epoch+1} Results: Train Loss = {avg_train_loss:.4f}")
+            # writer.add_scalar("Val/Loss_Epoch", avg_val_loss, epoch)
             
             save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
