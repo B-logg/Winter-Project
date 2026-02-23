@@ -229,6 +229,46 @@ def main():
     if args.local_rank == 0: writer = SummaryWriter(args.output_dir)
     global_step = 0
 
+    if args.local_rank == 0:  # 메인 프로세스에서만 한 번 확인
+        print("\n" + "="*50)
+        print("Starting Sanity Check for VAL logic...")
+        model_engine.eval()
+        with torch.no_grad():
+            try:
+                # val_loader에서 배치 하나만 가져옴
+                tmp_batch = next(iter(val_loader))
+                tmp_batch = dict_to_cuda(tmp_batch)
+                
+                # 1. VAL 루프 전처리 로직 (본 코드와 동일하게 적용)
+                if 'input_ids' in tmp_batch:
+                    bsz = tmp_batch['input_ids'].shape[0]
+                    tmp_batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
+                    
+                    if args.seg_token_idx is not None:
+                        new_seg_mask = (tmp_batch['input_ids'] == args.seg_token_idx)
+                        # [핵심 수정] 에러가 났던 차원 불일치를 해결하는 로직
+                        if new_seg_mask.any():
+                            tmp_batch['seg_token_mask'] = new_seg_mask.view(-1)
+
+                    # ID Clamping 및 전처리 로직
+                    is_image_token = (tmp_batch['input_ids'] == -200)
+                    clamped_ids = tmp_batch['input_ids'].clamp(0, len(tokenizer) - 1)
+                    tmp_batch['input_ids'] = torch.where(is_image_token, tmp_batch['input_ids'], clamped_ids)
+                
+                for k, v in tmp_batch.items():
+                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                        tmp_batch[k] = v.to(torch.bfloat16)
+
+                # 2. 모델 포워드 테스트
+                outputs = model_engine(**tmp_batch)
+                print(">>> VAL Logic Check Success! <<<")
+            except Exception as e:
+                print(f">>> VAL Logic Check FAILED: {e}")
+                import traceback
+                traceback.print_exc()
+                exit(1) # 에러나면 바로 종료해서 수정할 수 있게 함
+        print("="*50 + "\n")
+
     # [F] 훈련 및 에포크 검증 루프
     for epoch in range(args.epochs):
         # 1. Training Loop
@@ -293,7 +333,7 @@ def main():
                     if args.seg_token_idx is not None:
                         new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
                         if new_seg_mask.any():
-                            batch['seg_token_mask'] = new_seg_mask
+                            batch['seg_token_mask'] = new_seg_mask.view(-1)
                 
                 if 'labels' in batch:
                     batch['labels'][batch['labels'] == -200] = -100
