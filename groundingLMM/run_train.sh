@@ -25,7 +25,7 @@ deepspeed --num_gpus=3 train_glamm.py \
     --workers 8 \
     --lr 2e-4 \
     --epochs 4 \
-    --val_ratio 0.05 \
+    --val_ratio 0.00 \
     --lora_r 128 \
     --lora_alpha 256
 
