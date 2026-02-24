@@ -11,8 +11,8 @@ echo "Starting Evaluation with checkpoint: $CHECKPOINT_PATH"
 
 python test_glamm.py \
     --hf_model_path "$CHECKPOINT_PATH" \
-    --test_json_path "/home/sbosung1789/Winter-Project/groundingLMM/dataset/glamm_test.json" \
-    --image_folder "/home/sbosung1789/Winter-Project/groundingLMM/dataset/glamm_images_train" \
+    --test_json_path "/home/sbosung1789/Winter-Project/groundingLMM/dataset/datasets/glamm_test.json" \
+    --image_folder "/home/sbosung1789/Winter-Project/groundingLMM/dataset/datasets/glamm_images_train" \
     --output_dir "./test_results" \
     --batch_size 1
 
