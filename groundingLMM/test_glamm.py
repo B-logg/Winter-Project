@@ -228,6 +228,9 @@ def main():
             # 1. 텍스트 생성
             output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, use_cache=True)
             pred_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+            num_seg_tokens = (output_ids == seg_token_idx).sum().item()
+            offset = torch.tensor([0, num_seg_tokens], dtype=torch.long).cuda()
             
             # 2. 생성된 텍스트 기반으로 마스크 추출 (Forward Pass)
             outputs = model(
@@ -238,7 +241,7 @@ def main():
                 bboxes=None,          
                 labels=None,          
                 attention_masks=torch.ones_like(output_ids),
-                offset=None,          
+                offset=offset,          
                 masks_list=None,      
                 label_list=None,      
                 resize_list=None,     
