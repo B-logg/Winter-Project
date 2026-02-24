@@ -1,26 +1,44 @@
 import os
+import re
 import cv2
 import json
 import torch
 import argparse
+import numpy as np
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, CLIPImageProcessor
+from peft import PeftModel
+
 from model.GLaMM import GLaMMForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.SAM.utils.transforms import ResizeLongestSide
 from tools.utils import DEFAULT_IMAGE_TOKEN
 
+# 1. 평가 지표 라이브러리 (NLG, Regression, Classification)
+from sklearn.metrics import mean_absolute_percentage_error, r2_score, accuracy_score, f1_score
+from scipy.stats import pearsonr
+import nltk
+from nltk.translate.meteor_score import meteor_score
+from pycocoevalcap.cider.cider import Cider
+
+# NLTK Wordnet 다운로드 (METEOR용)
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet')
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="GLaMM Test Loss Only")
+    parser = argparse.ArgumentParser(description="GLaMM Full Evaluation (Text, Mask, Carbon, Species)")
     parser.add_argument("--hf_model_path", required=True, help="Path to checkpoint")
     parser.add_argument("--test_json_path", required=True, help="Path to test.json")
     parser.add_argument("--image_folder", required=True, help="Image folder")
     parser.add_argument("--output_dir", required=True, help="Result save dir")
+    parser.add_argument("--batch_size", default=1, type=int)
     return parser.parse_args()
 
-class ForestLossDataset(Dataset):
+class ForestEvalDataset(Dataset):
     def __init__(self, json_path, image_folder, tokenizer, image_processor, transform):
         with open(json_path, 'r') as f: self.data = json.load(f)
         self.image_folder = image_folder
@@ -34,150 +52,241 @@ class ForestLossDataset(Dataset):
         image_np = cv2.imread(image_path)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
         
-        # 1. SAM용 리사이즈 (긴 쪽을 1024로)
+        # SAM Image
         image_sam = self.transform.apply_image(image_np)
-        resize_shape = image_sam.shape[:2]
-        
-        # 2. 1024x1024가 되도록 부족한 부분을 0으로 채움 (Padding)
-        h, w = resize_shape
-        pad_h = 1024 - h
-        pad_w = 1024 - w
-        
-        # (top, bottom, left, right) 순서로 패딩 추가
-        image_sam_padded = cv2.copyMakeBorder(
-            image_sam, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0)
-        )
-        
-        # 3. 텐서 변환 및 정규화
+        h, w = image_sam.shape[:2]
+        image_sam_padded = cv2.copyMakeBorder(image_sam, 0, 1024-h, 0, 1024-w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
         image_sam_tensor = torch.from_numpy(image_sam_padded).permute(2, 0, 1).float()
-        
-        pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
-        pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
+        pixel_mean, pixel_std = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1), torch.tensor([58.395, 57.12, 57.375]).view(3, 1, 1)
         image_sam_tensor = (image_sam_tensor - pixel_mean) / pixel_std
         
-        # CLIP용 이미지는 프로세서가 알아서 처리하므로 유지
-        image_clip = self.image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
-        
-        return image_clip, image_sam_tensor, resize_shape
+        # CLIP Image
+        clip_img = self.image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0]
+        return clip_img, image_sam_tensor, (h, w)
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        image_path = os.path.join(self.image_folder, item['image'])
-        clip_img, sam_img, resize_shape = self.preprocess_image(image_path)
+        image_path = os.path.join(self.image_folder, item['image'].replace('~', '/shared/home/naislab'))
+        clip_img, sam_img, orig_shape = self.preprocess_image(image_path)
         
         human_q = item['conversations'][0]['value']
-        gpt_a = item['conversations'][1]['value']
-        
+        gt_text = item['conversations'][1]['value']
         clean_q = human_q.replace(DEFAULT_IMAGE_TOKEN, "").replace("<image>", "").strip()
 
         conv = conversation_lib.conv_templates["llava_v1"].copy()
-        conv.messages = []
-        q_text = DEFAULT_IMAGE_TOKEN + "\n" + clean_q
-        conv.append_message(conv.roles[0], q_text)
-        conv.append_message(conv.roles[1], gpt_a)
-        full_prompt = conv.get_prompt()
+        conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + clean_q)
+        conv.append_message(conv.roles[1], None) 
+        input_ids_gen = tokenizer_image_token(conv.get_prompt(), self.tokenizer, return_tensors='pt')
         
-        input_ids = tokenizer_image_token(full_prompt, self.tokenizer, return_tensors='pt')
-
-        # 🚨 스킵 로직: 너무 긴 데이터는 가짜 데이터로 대체하여 OOM 방지
-        if input_ids.shape[0] > 1536:
-            conv.messages = []
-            conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + "이 사진을 분석해줘.")
-            conv.append_message(conv.roles[1], "데이터 초과로 스킵합니다. [SEG]")
-            input_ids = tokenizer_image_token(conv.get_prompt(), self.tokenizer, return_tensors='pt')
+        # GT Masks Load
+        gt_masks = []
+        mask_paths = item.get('mask_path', [])
+        for mp in mask_paths:
+            m = cv2.imread(mp.replace('~', '/shared/home/naislab'), cv2.IMREAD_GRAYSCALE)
+            if m is not None:
+                m = cv2.resize(m, (1024, 1024), interpolation=cv2.INTER_NEAREST)
+                gt_masks.append(torch.from_numpy(m > 0).float())
         
-        labels = input_ids.clone()
-        sep = "ASSISTANT: "
-        parts = full_prompt.split(sep)
-        if len(parts) >= 2:
-            len_context = len(tokenizer_image_token(parts[0] + sep, self.tokenizer))
-            labels[:len_context-1] = -100
-        
-        # GT Mask 로드
-        gt_mask = torch.zeros((1024, 1024)).float()
-        mask_path = item.get('mask_path', None)
-        if mask_path:
-            if isinstance(mask_path, str): mask_path = [mask_path]
-            for mp in mask_path:
-                m = cv2.imread(os.path.join(self.image_folder, mp), 0)
-                if m is not None:
-                    m = cv2.resize(m, (1024, 1024), interpolation=cv2.INTER_NEAREST)
-                    gt_mask = torch.maximum(gt_mask, torch.from_numpy(m).float())
-        gt_mask = (gt_mask > 0).float().unsqueeze(0)
+        gt_masks_tensor = torch.stack(gt_masks) if gt_masks else torch.zeros((0, 1024, 1024)).float()
 
         return {
             "id": item['id'],
             "clip_img": clip_img,
             "sam_img": sam_img,
-            "input_ids": input_ids,
-            "labels": labels,
-            "masks": gt_mask,
-            "resize_shape": resize_shape
+            "input_ids_gen": input_ids_gen,
+            "gt_text": gt_text,
+            "gt_masks": gt_masks_tensor,
+            "orig_shape": orig_shape
         }
 
+# 2. 딕셔너리 파싱 헬퍼 함수 (순서대로 수종-탄소량 쌍 추출)
+def parse_forest_info(text):
+    results = []
+    blocks = text.split('<p>')
+    for block in blocks[1:]: 
+        # 수종 추출
+        species_match = re.search(r'\s*(.*?)\s*</p>', block)
+        species = species_match.group(1).strip() if species_match else "unknown"
+        
+        # 탄소량 추출 (t C 앞의 숫자)
+        tc_match = re.search(r'([\d\.]+)\s*t\s*[Cc]', block)
+        if tc_match:
+            carbon = float(tc_match.group(1))
+        else:
+            nums = re.findall(r"[-+]?\d*\.\d+|\d+", block)
+            carbon = float(nums[-1]) if nums else 0.0
+            
+        results.append({"species": species, "carbon": carbon})
+    return results
+
+# 3. 마스크 지표 (mIoU, Recall, AP50) 계산 함수
+def calculate_mask_metrics(pred_masks, gt_masks):
+    if len(pred_masks) == 0 or len(gt_masks) == 0:
+        return 0.0, 0.0, 0.0
+    
+    pred_masks = pred_masks.cpu().numpy() > 0
+    gt_masks = gt_masks.cpu().numpy() > 0
+    
+    M, N = len(pred_masks), len(gt_masks)
+    iou_matrix = np.zeros((M, N))
+    
+    for i in range(M):
+        for j in range(N):
+            intersection = np.logical_and(pred_masks[i], gt_masks[j]).sum()
+            union = np.logical_or(pred_masks[i], gt_masks[j]).sum()
+            iou_matrix[i, j] = intersection / (union + 1e-6)
+            
+    # 매칭 (Greedy)
+    tp = 0
+    matched_gt = set()
+    iou_sum = 0.0
+    
+    for i in range(M):
+        best_iou, best_gt = 0, -1
+        for j in range(N):
+            if j not in matched_gt and iou_matrix[i, j] > 0.5:
+                if iou_matrix[i, j] > best_iou:
+                    best_iou = iou_matrix[i, j]
+                    best_gt = j
+        if best_gt != -1:
+            tp += 1
+            matched_gt.add(best_gt)
+            iou_sum += best_iou
+
+    recall = tp / N if N > 0 else 0.0
+    ap50 = tp / M if M > 0 else 0.0 # Precision @ IoU 0.5
+    miou = iou_sum / M if M > 0 else 0.0
+    return miou, recall, ap50
+
 def main():
-    from peft import PeftModel
     args = parse_args()
-    BASE_MODEL_PATH = "checkpoints/GLaMM-GCG"
+    BASE_MODEL_PATH = "MBZUAI/GLaMM-GranD-Pretrained"
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     
+    print(">>> Loading Model...")
     model = GLaMMForCausalLM.from_pretrained(BASE_MODEL_PATH, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, seg_token_idx=seg_token_idx)
     model = PeftModel.from_pretrained(model, args.hf_model_path)
     model = model.merge_and_unload().cuda().bfloat16()
     
-    model.ce_loss_weight, model.dice_loss_weight, model.bce_loss_weight = 1.0, 0.5, 2.0
+    non_lora_path = os.path.join(args.hf_model_path, "non_lora_trainables.bin")
+    if os.path.exists(non_lora_path):
+        model.base_model.model.model.load_state_dict(torch.load(non_lora_path, map_location="cpu"), strict=False)
 
-    # Monkey Patch 적용 (SAM 입력 BF16 보장)
     base_glamm = model.get_model()
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
         original_forward = mask_decoder.forward
-        def mask_decoder_forward_wrapper(*args, **kwargs):
-            new_args = [a.to(torch.bfloat16) if isinstance(a, torch.Tensor) and torch.is_floating_point(a) else a for a in args]
-            new_kwargs = {k: (v.to(torch.bfloat16) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v) for k, v in kwargs.items()}
-            return original_forward(*new_args, **new_kwargs)
+        def mask_decoder_forward_wrapper(*a, **k):
+            new_a = [x.to(torch.bfloat16) if isinstance(x, torch.Tensor) and torch.is_floating_point(x) else x for x in a]
+            new_k = {key: (v.to(torch.bfloat16) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v) for key, v in k.items()}
+            return original_forward(*new_a, **new_k)
         mask_decoder.forward = mask_decoder_forward_wrapper
 
-    dataset = ForestLossDataset(args.test_json_path, args.image_folder, tokenizer, CLIPImageProcessor.from_pretrained(model.config.vision_tower), ResizeLongestSide(1024))
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    dataset = ForestEvalDataset(args.test_json_path, args.image_folder, tokenizer, CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336"), ResizeLongestSide(1024))
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    total_loss, ce_loss, mask_loss, count = 0.0, 0.0, 0.0, 0
+    # 지표 저장소
+    gt_carbon_all, pred_carbon_all = [], []
+    gt_species_all, pred_species_all = [], []
     
-    print(">>> Starting Test Loss Calculation...")
-    for batch in tqdm(dataloader):
+    cider_refs, cider_hyps = {}, {}
+    meteor_scores = []
+    
+    miou_list, recall_list, ap50_list = [], [], []
+
+    model.eval()
+    print(">>> Starting Inference & Metric Evaluation...")
+    for step, batch in enumerate(tqdm(dataloader)):
         images = batch['clip_img'].cuda().bfloat16()
         sam_images = batch['sam_img'].cuda().bfloat16()
-        input_ids = batch['input_ids'].cuda()
-        if input_ids.dim() == 1: input_ids = input_ids.unsqueeze(0)
-        labels = batch['labels'].cuda()
-        if labels.dim() == 1: labels = labels.unsqueeze(0)
-        gt_masks = batch['masks'].cuda().bfloat16()
+        input_ids = batch['input_ids_gen'].cuda()
+        gt_masks = batch['gt_masks'][0].cuda() # (N, H, W)
+        
+        gt_text = batch['gt_text'][0]
+        data_id = batch['id'][0]
         
         with torch.no_grad():
-            outputs = model(
-                input_ids=input_ids, labels=labels, images=images, global_enc_images=images,
-                grounding_enc_images=sam_images, masks_list=[gt_masks[0]], label_list=[gt_masks[0]],
-                resize_list=[[batch['resize_shape'][0].item(), batch['resize_shape'][1].item()]],
-                offset=torch.tensor([0, 1]).long().cuda(), bboxes=None, attention_masks=None
-            )
-            if 'loss' in outputs:
-                total_loss += outputs['loss'].item()
-                ce_loss += outputs.get('ce_loss', torch.tensor(0)).item()
-                mask_loss += outputs.get('mask_loss', torch.tensor(0)).item()
-                count += 1
-        
-        del images, sam_images, input_ids, labels, gt_masks, outputs
-        torch.cuda.empty_cache()
+            # 1. 텍스트 생성
+            output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, use_cache=True)
+            pred_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+            
+            # 2. 생성된 텍스트 기반으로 마스크 추출 (Forward Pass)
+            outputs = model(input_ids=output_ids, images=images, global_enc_images=images, grounding_enc_images=sam_images)
+            pred_masks = outputs.pred_masks[0] if 'pred_masks' in outputs and outputs.pred_masks is not None else []
 
-    if count > 0:
-        print("\n" + "="*40)
-        print(f" [FINAL TEST RESULTS]")
-        print(f" - Average Loss: {total_loss/count:.4f}")
-        print(f" - Text (CE) Loss: {ce_loss/count:.4f}")
-        print(f" - Mask (Seg) Loss: {mask_loss/count:.4f}")
-        print("="*40)
+        # 3. 텍스트 기반 딕셔너리 추출 (순서대로)
+        gt_list = parse_forest_info(gt_text)
+        pred_list = parse_forest_info(pred_text)
+
+        # 수종 틀려도 위치가 같으면 탄소량은 비교합니다!
+        for i in range(min(len(gt_list), len(pred_list))):
+            gt_species_all.append(gt_list[i]['species'])
+            pred_species_all.append(pred_list[i]['species'])
+            
+            gt_carbon_all.append(gt_list[i]['carbon'])
+            pred_carbon_all.append(pred_list[i]['carbon'])
+
+        # 4. 텍스트 품질 지표 (METEOR, CIDEr)
+        cider_refs[data_id] = [gt_text]
+        cider_hyps[data_id] = [pred_text]
+        
+        gt_words = nltk.word_tokenize(gt_text)
+        pred_words = nltk.word_tokenize(pred_text)
+        meteor_scores.append(meteor_score([gt_words], pred_words))
+
+        # 5. 세그멘테이션 마스크 지표
+        if len(pred_masks) > 0 and len(gt_masks) > 0:
+            miou, recall, ap50 = calculate_mask_metrics(pred_masks, gt_masks)
+            miou_list.append(miou)
+            recall_list.append(recall)
+            ap50_list.append(ap50)
+
+    # --- 최종 지표 계산 ---
+    # 1. Regression (탄소량: MAPE, R2, Pearson)
+    if len(gt_carbon_all) > 1:
+        gt_arr, pred_arr = np.array(gt_carbon_all), np.array(pred_carbon_all)
+        valid_idx = gt_arr > 0
+        mape = mean_absolute_percentage_error(gt_arr[valid_idx], pred_arr[valid_idx]) * 100 if np.sum(valid_idx) > 0 else 0.0
+        r2 = r2_score(gt_carbon_all, pred_carbon_all)
+        correlation, _ = pearsonr(gt_carbon_all, pred_carbon_all) if np.std(gt_carbon_all) > 0 and np.std(pred_carbon_all) > 0 else (0.0, 0.0)
+    else:
+        mape, r2, correlation = 0.0, 0.0, 0.0
+        
+    # 2. Classification (수종: Accuracy, F1-Score)
+    if len(gt_species_all) > 0:
+        cls_acc = accuracy_score(gt_species_all, pred_species_all) * 100
+        cls_f1 = f1_score(gt_species_all, pred_species_all, average='macro') * 100
+    else:
+        cls_acc, cls_f1 = 0.0, 0.0
+        
+    # 3. NLG (텍스트: CIDEr, METEOR)
+    cider_score, _ = Cider().compute_score(cider_refs, cider_hyps)
+    avg_meteor = np.mean(meteor_scores) if meteor_scores else 0.0
+    
+    # 4. Mask (Seg: mIoU, Recall, AP50)
+    avg_miou = np.mean(miou_list) if miou_list else 0.0
+    avg_recall = np.mean(recall_list) if recall_list else 0.0
+    avg_ap50 = np.mean(ap50_list) if ap50_list else 0.0
+    
+    print("\n" + "="*50)
+    print(" [FINAL BENCHMARK RESULTS]")
+    print(f" [1. Text Generation]")
+    print(f"  - CIDEr Score:       {cider_score:.4f}")
+    print(f"  - METEOR Score:      {avg_meteor:.4f}")
+    print(f" [2. Species Classification]")
+    print(f"  - Accuracy:          {cls_acc:.2f} %")
+    print(f"  - F1-Score (Macro):  {cls_f1:.2f} %")
+    print(f" [3. Carbon Regression]")
+    print(f"  - MAPE:              {mape:.2f} %")
+    print(f"  - R2 Score:          {r2:.4f}")
+    print(f"  - Pearson Cor:       {correlation:.4f}")
+    print(f" [4. Segmentation Mask]")
+    print(f"  - mIoU:              {avg_miou:.4f}")
+    print(f"  - Recall:            {avg_recall:.4f}")
+    print(f"  - AP50:              {avg_ap50:.4f}")
+    print("="*50)
 
 if __name__ == "__main__": main()
