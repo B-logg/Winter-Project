@@ -177,7 +177,19 @@ def main():
     
     non_lora_path = os.path.join(args.hf_model_path, "non_lora_trainables.bin")
     if os.path.exists(non_lora_path):
-        model.base_model.model.model.load_state_dict(torch.load(non_lora_path, map_location="cpu"), strict=False)
+        print("Loading non-LoRA weights")
+        non_lora_state_dict = torch.load(non_lora_path, map_location="cpu")
+        
+        # PEFT로 학습하면서 앞부분에 'base_model.model.' 꼬리표가 붙은 경우 깔끔하게 떼어줍니다.
+        clean_state_dict = {}
+        for k, v in non_lora_state_dict.items():
+            if k.startswith("base_model.model."):
+                clean_state_dict[k.replace("base_model.model.", "")] = v
+            else:
+                clean_state_dict[k] = v
+                
+        # 껍데기가 벗겨진 본체(model)에 직접 가중치를 주입합니다.
+        model.load_state_dict(clean_state_dict, strict=False)
 
     base_glamm = model.get_model()
     if hasattr(base_glamm, "grounding_encoder"):
