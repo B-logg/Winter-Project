@@ -20,6 +20,8 @@ from tools.utils import DEFAULT_IMAGE_TOKEN
 from sklearn.metrics import mean_absolute_percentage_error, r2_score, accuracy_score, f1_score
 from scipy.stats import pearsonr
 import nltk
+nltk.download('punkt')
+nltk.download('punkt_tab')
 from nltk.translate.meteor_score import meteor_score
 from pycocoevalcap.cider.cider import Cider
 
@@ -258,7 +260,7 @@ def main():
                     pred_masks = outputs['pred_masks'][0]
                 else:
                     pred_masks = []
-                    
+
         # 3. 텍스트 기반 딕셔너리 추출
         gt_list = parse_forest_info(gt_text)
         pred_list = parse_forest_info(pred_text)
