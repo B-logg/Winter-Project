@@ -235,6 +235,9 @@ def main():
                 pred_masks = []
             else:
                 offset = [0, num_seg_tokens]
+
+                batch_size = images.shape[0]
+                dummy_sizes = [(1024, 1024)] * batch_size
                 
                 # 2. 생성된 텍스트 기반으로 마스크 추출 (Forward Pass)
                 outputs = model(
@@ -247,8 +250,8 @@ def main():
                     attention_masks=torch.ones_like(output_ids),
                     offset=offset,          
                     masks_list=None,      
-                    label_list=None,      
-                    resize_list=None,     
+                    label_list=dummy_sizes,      
+                    resize_list=dummy_sizes,     
                     inference=True        
                 )
                 pred_masks = outputs.pred_masks[0] if 'pred_masks' in outputs and outputs.pred_masks is not None else []
