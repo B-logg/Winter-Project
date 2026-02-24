@@ -153,11 +153,11 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
             seg_token_mask = self._create_seg_token_mask(input_ids)
 
             # Process hidden states
-            hidden_states, pred_embeddings = self._process_hidden_states(output_hidden_states, seg_token_mask, offset)
+            hidden_states, pred_embeddings = self._process_hidden_states(output_hidden_states, seg_token_mask, offset, infer=inference)
 
             # Generate and post-process masks
             pred_masks = self._generate_and_postprocess_masks(
-                pred_embeddings, image_embeddings, resize_list, label_list
+                pred_embeddings, image_embeddings, resize_list, label_list, infer=inference
             )
 
             if inference:
@@ -245,7 +245,10 @@ class GLaMMForCausalLM(LlavaLlamaForCausalLM):
             if not infer:
                 orig_size = label_list[i].shape[-2:]
             else:
-                orig_size = label_list[i]
+                orig_size = label_list[i] if label_list is not None else (1024, 1024)
+            
+            resize_size = resize_list[i] if resize_list is not None else (1024, 1024)
+            
             # During inference, we have original size list in place of label list
             pred_mask = self.model.grounding_encoder.postprocess_masks(
                 low_res_masks, input_size=resize_list[i], original_size=orig_size, )
