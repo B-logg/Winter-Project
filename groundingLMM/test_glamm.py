@@ -234,7 +234,7 @@ def main():
             if num_seg_tokens == 0:
                 pred_masks = []
             else:
-                offset = torch.tensor([0, num_seg_tokens], dtype=torch.long).cuda()
+                offset = [0, num_seg_tokens]
                 
                 # 2. 생성된 텍스트 기반으로 마스크 추출 (Forward Pass)
                 outputs = model(
