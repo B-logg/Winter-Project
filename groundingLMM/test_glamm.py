@@ -254,8 +254,11 @@ def main():
                     resize_list=dummy_sizes,     
                     inference=True        
                 )
-                pred_masks = outputs.pred_masks[0] if 'pred_masks' in outputs and outputs.pred_masks is not None else []
-
+                if 'pred_masks' in outputs and outputs['pred_masks'] is not None and len(outputs['pred_masks']) > 0:
+                    pred_masks = outputs['pred_masks'][0]
+                else:
+                    pred_masks = []
+                    
         # 3. 텍스트 기반 딕셔너리 추출
         gt_list = parse_forest_info(gt_text)
         pred_list = parse_forest_info(pred_text)
