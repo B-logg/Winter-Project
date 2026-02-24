@@ -46,7 +46,8 @@ class ForestEvalDataset(Dataset):
         self.image_processor = image_processor
         self.transform = transform
         
-    def __len__(self): return len(self.data)
+    def __len__(self): 
+        return len(self.data)
 
     def preprocess_image(self, image_path):
         image_np = cv2.imread(image_path)
@@ -66,7 +67,7 @@ class ForestEvalDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        image_path = os.path.join(self.image_folder, item['image'].replace('~', '/shared/home/naislab'))
+        image_path = os.path.join(self.image_folder, item['image'].replace('~', '/shared/home/sbosung1789'))
         clip_img, sam_img, orig_shape = self.preprocess_image(image_path)
         
         human_q = item['conversations'][0]['value']
@@ -82,7 +83,7 @@ class ForestEvalDataset(Dataset):
         gt_masks = []
         mask_paths = item.get('mask_path', [])
         for mp in mask_paths:
-            m = cv2.imread(mp.replace('~', '/shared/home/naislab'), cv2.IMREAD_GRAYSCALE)
+            m = cv2.imread(mp.replace('~', '/shared/home/sbosung1789'), cv2.IMREAD_GRAYSCALE)
             if m is not None:
                 m = cv2.resize(m, (1024, 1024), interpolation=cv2.INTER_NEAREST)
                 gt_masks.append(torch.from_numpy(m > 0).float())
@@ -122,7 +123,7 @@ def parse_forest_info(text):
 # 3. 마스크 지표 (mIoU, Recall, AP50) 계산 함수
 def calculate_mask_metrics(pred_masks, gt_masks):
     if len(pred_masks) == 0 or len(gt_masks) == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, []
     
     pred_masks = pred_masks.cpu().numpy() > 0
     gt_masks = gt_masks.cpu().numpy() > 0
@@ -130,8 +131,8 @@ def calculate_mask_metrics(pred_masks, gt_masks):
     M, N = len(pred_masks), len(gt_masks)
     iou_matrix = np.zeros((M, N))
     
-    for i in range(M):
-        for j in range(N):
+    for i in range(M): # i: pred_idx
+        for j in range(N): # j: gt_idx
             intersection = np.logical_and(pred_masks[i], gt_masks[j]).sum()
             union = np.logical_or(pred_masks[i], gt_masks[j]).sum()
             iou_matrix[i, j] = intersection / (union + 1e-6)
@@ -140,6 +141,7 @@ def calculate_mask_metrics(pred_masks, gt_masks):
     tp = 0
     matched_gt = set()
     iou_sum = 0.0
+    matched_pairs = [] # (gt_idx, pred_idx) 짝꿍 저장
     
     for i in range(M):
         best_iou, best_gt = 0, -1
@@ -152,21 +154,23 @@ def calculate_mask_metrics(pred_masks, gt_masks):
             tp += 1
             matched_gt.add(best_gt)
             iou_sum += best_iou
+            matched_pairs.append((best_gt, i)) # 정답 인덱스와 예측 인덱스를 묶음!
 
     recall = tp / N if N > 0 else 0.0
     ap50 = tp / M if M > 0 else 0.0 # Precision @ IoU 0.5
     miou = iou_sum / M if M > 0 else 0.0
-    return miou, recall, ap50
+    
+    return miou, recall, ap50, matched_pairs
 
 def main():
     args = parse_args()
-    BASE_MODEL_PATH = "MBZUAI/GLaMM-GranD-Pretrained"
+    BASE_MODEL_PATH = "~/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG"
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     
-    print(">>> Loading Model...")
+    print("Loading Model")
     model = GLaMMForCausalLM.from_pretrained(BASE_MODEL_PATH, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, seg_token_idx=seg_token_idx)
     model = PeftModel.from_pretrained(model, args.hf_model_path)
     model = model.merge_and_unload().cuda().bfloat16()
@@ -198,7 +202,7 @@ def main():
     miou_list, recall_list, ap50_list = [], [], []
 
     model.eval()
-    print(">>> Starting Inference & Metric Evaluation...")
+    print("Starting Inference & Metric Evaluation")
     for step, batch in enumerate(tqdm(dataloader)):
         images = batch['clip_img'].cuda().bfloat16()
         sam_images = batch['sam_img'].cuda().bfloat16()
@@ -217,32 +221,37 @@ def main():
             outputs = model(input_ids=output_ids, images=images, global_enc_images=images, grounding_enc_images=sam_images)
             pred_masks = outputs.pred_masks[0] if 'pred_masks' in outputs and outputs.pred_masks is not None else []
 
-        # 3. 텍스트 기반 딕셔너리 추출 (순서대로)
+        # 3. 텍스트 기반 딕셔너리 추출
         gt_list = parse_forest_info(gt_text)
         pred_list = parse_forest_info(pred_text)
 
-        # 수종 틀려도 위치가 같으면 탄소량은 비교합니다!
-        for i in range(min(len(gt_list), len(pred_list))):
-            gt_species_all.append(gt_list[i]['species'])
-            pred_species_all.append(pred_list[i]['species'])
-            
-            gt_carbon_all.append(gt_list[i]['carbon'])
-            pred_carbon_all.append(pred_list[i]['carbon'])
+        # 4. 세그멘테이션 마스크 지표 및 위치 기반 매칭(IoU)
+        matched_pairs = []
+        if len(pred_masks) > 0 and len(gt_masks) > 0:
+            miou, recall, ap50, matched_pairs = calculate_mask_metrics(pred_masks, gt_masks)
+            miou_list.append(miou)
+            recall_list.append(recall)
+            ap50_list.append(ap50)
 
-        # 4. 텍스트 품질 지표 (METEOR, CIDEr)
+        # 5. 위치(Mask IoU) 기반 수종/탄소량 정확도 측정!
+        for gt_idx, pred_idx in matched_pairs:
+            # 텍스트 내에서 파싱된 정보 개수와 마스크 개수가 일치하는지 안전장치
+            if gt_idx < len(gt_list) and pred_idx < len(pred_list):
+                
+                # 같은 물리적 위치를 짚어냈으므로, 이제 수종과 탄소량을 비교합니다.
+                gt_species_all.append(gt_list[gt_idx]['species'])
+                pred_species_all.append(pred_list[pred_idx]['species'])
+                
+                gt_carbon_all.append(gt_list[gt_idx]['carbon'])
+                pred_carbon_all.append(pred_list[pred_idx]['carbon'])
+
+        # 6. 텍스트 품질 지표 (METEOR, CIDEr)
         cider_refs[data_id] = [gt_text]
         cider_hyps[data_id] = [pred_text]
         
         gt_words = nltk.word_tokenize(gt_text)
         pred_words = nltk.word_tokenize(pred_text)
         meteor_scores.append(meteor_score([gt_words], pred_words))
-
-        # 5. 세그멘테이션 마스크 지표
-        if len(pred_masks) > 0 and len(gt_masks) > 0:
-            miou, recall, ap50 = calculate_mask_metrics(pred_masks, gt_masks)
-            miou_list.append(miou)
-            recall_list.append(recall)
-            ap50_list.append(ap50)
 
     # --- 최종 지표 계산 ---
     # 1. Regression (탄소량: MAPE, R2, Pearson)
@@ -272,18 +281,17 @@ def main():
     avg_ap50 = np.mean(ap50_list) if ap50_list else 0.0
     
     print("\n" + "="*50)
-    print(" [FINAL BENCHMARK RESULTS]")
     print(f" [1. Text Generation]")
     print(f"  - CIDEr Score:       {cider_score:.4f}")
     print(f"  - METEOR Score:      {avg_meteor:.4f}")
-    print(f" [2. Species Classification]")
+    print(f" [\n2. Species Classification]")
     print(f"  - Accuracy:          {cls_acc:.2f} %")
     print(f"  - F1-Score (Macro):  {cls_f1:.2f} %")
-    print(f" [3. Carbon Regression]")
+    print(f" [\n3. Carbon Regression]")
     print(f"  - MAPE:              {mape:.2f} %")
     print(f"  - R2 Score:          {r2:.4f}")
-    print(f"  - Pearson Cor:       {correlation:.4f}")
-    print(f" [4. Segmentation Mask]")
+    print(f"  - Pearson Correlation:       {correlation:.4f}")
+    print(f" [\n4. Segmentation Mask]")
     print(f"  - mIoU:              {avg_miou:.4f}")
     print(f"  - Recall:            {avg_recall:.4f}")
     print(f"  - AP50:              {avg_ap50:.4f}")
