@@ -237,7 +237,7 @@ def main():
                 grounding_enc_images=sam_images,
                 bboxes=None,          
                 labels=None,          
-                attention_masks=None, 
+                attention_masks=torch.ones_like(output_ids),
                 offset=None,          
                 masks_list=None,      
                 label_list=None,      
