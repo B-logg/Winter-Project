@@ -230,7 +230,20 @@ def main():
             pred_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
             
             # 2. 생성된 텍스트 기반으로 마스크 추출 (Forward Pass)
-            outputs = model(input_ids=output_ids, images=images, global_enc_images=images, grounding_enc_images=sam_images)
+            outputs = model(
+                input_ids=output_ids,
+                images=images,
+                global_enc_images=images,
+                grounding_enc_images=sam_images,
+                bboxes=None,          
+                labels=None,          
+                attention_masks=None, 
+                offset=None,          
+                masks_list=None,      
+                label_list=None,      
+                resize_list=None,     
+                inference=True        
+            )
             pred_masks = outputs.pred_masks[0] if 'pred_masks' in outputs and outputs.pred_masks is not None else []
 
         # 3. 텍스트 기반 딕셔너리 추출
