@@ -164,7 +164,7 @@ def calculate_mask_metrics(pred_masks, gt_masks):
 
 def main():
     args = parse_args()
-    BASE_MODEL_PATH = "~/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG"
+    BASE_MODEL_PATH = "/shared/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG"
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
