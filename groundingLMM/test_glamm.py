@@ -230,24 +230,28 @@ def main():
             pred_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
 
             num_seg_tokens = (output_ids == seg_token_idx).sum().item()
-            offset = torch.tensor([0, num_seg_tokens], dtype=torch.long).cuda()
-            
-            # 2. 생성된 텍스트 기반으로 마스크 추출 (Forward Pass)
-            outputs = model(
-                input_ids=output_ids,
-                images=images,
-                global_enc_images=images,
-                grounding_enc_images=sam_images,
-                bboxes=None,          
-                labels=None,          
-                attention_masks=torch.ones_like(output_ids),
-                offset=offset,          
-                masks_list=None,      
-                label_list=None,      
-                resize_list=None,     
-                inference=True        
-            )
-            pred_masks = outputs.pred_masks[0] if 'pred_masks' in outputs and outputs.pred_masks is not None else []
+
+            if num_seg_tokens == 0:
+                pred_masks = []
+            else:
+                offset = torch.tensor([0, num_seg_tokens], dtype=torch.long).cuda()
+                
+                # 2. 생성된 텍스트 기반으로 마스크 추출 (Forward Pass)
+                outputs = model(
+                    input_ids=output_ids,
+                    images=images,
+                    global_enc_images=images,
+                    grounding_enc_images=sam_images,
+                    bboxes=None,          
+                    labels=None,          
+                    attention_masks=torch.ones_like(output_ids),
+                    offset=offset,          
+                    masks_list=None,      
+                    label_list=None,      
+                    resize_list=None,     
+                    inference=True        
+                )
+                pred_masks = outputs.pred_masks[0] if 'pred_masks' in outputs and outputs.pred_masks is not None else []
 
         # 3. 텍스트 기반 딕셔너리 추출
         gt_list = parse_forest_info(gt_text)
