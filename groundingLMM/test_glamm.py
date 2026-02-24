@@ -67,7 +67,7 @@ class ForestEvalDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        image_path = os.path.join(self.image_folder, item['image'].replace('~', '/shared/home/sbosung1789'))
+        image_path = os.path.join(self.image_folder, item['image'].replace('~', '/home/sbosung1789'))
         clip_img, sam_img, orig_shape = self.preprocess_image(image_path)
         
         human_q = item['conversations'][0]['value']
@@ -83,7 +83,7 @@ class ForestEvalDataset(Dataset):
         gt_masks = []
         mask_paths = item.get('mask_path', [])
         for mp in mask_paths:
-            m = cv2.imread(mp.replace('~', '/shared/home/sbosung1789'), cv2.IMREAD_GRAYSCALE)
+            m = cv2.imread(mp.replace('~', '/home/sbosung1789'), cv2.IMREAD_GRAYSCALE)
             if m is not None:
                 m = cv2.resize(m, (1024, 1024), interpolation=cv2.INTER_NEAREST)
                 gt_masks.append(torch.from_numpy(m > 0).float())
@@ -164,7 +164,7 @@ def calculate_mask_metrics(pred_masks, gt_masks):
 
 def main():
     args = parse_args()
-    BASE_MODEL_PATH = "/shared/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG"
+    BASE_MODEL_PATH = "/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG"
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
