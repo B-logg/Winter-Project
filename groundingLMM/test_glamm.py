@@ -238,12 +238,12 @@ def main():
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
             pred_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "").strip()
-
+            valid_input_ids = [tid for tid in input_ids[0].tolist() if tid >= 0]
             all_predictions.append({
                 "image_id": data_id,
                 "gt_text": gt_text,
                 "pred_text": pred_text,
-                "prompt_used": tokenizer.decode(input_ids[0])
+                "prompt_used": tokenizer.decode(valid_input_ids)
             })
 
             num_seg_tokens = (output_ids == seg_token_idx).sum().item()
