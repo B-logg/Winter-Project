@@ -240,7 +240,15 @@ def main():
         
         with torch.no_grad():
             # 1. 텍스트 생성
-            output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, use_cache=True)
+            output_ids = model.generate(
+                inputs=input_ids, 
+                images=images, 
+                max_new_tokens=256, 
+                use_cache=False,
+                repetition_penalty=2.0,
+                do_sample=True,
+                temperature=0.5,
+                pad_token_id=tokenizer.eos_token_id,)
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
             pred_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "").strip()
