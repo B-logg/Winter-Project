@@ -346,8 +346,6 @@ def main():
         pred_words = nltk.word_tokenize(pred_text)
         meteor_scores.append(meteor_score([gt_words], pred_words))
 
-        if step >= 4:
-            break
 
     # --- 최종 지표 계산 ---
     # 1. Regression (탄소량: MAPE, R2, Pearson)
