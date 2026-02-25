@@ -13,7 +13,6 @@ BASE_MODEL_PATH="$CHK_DIR/GLaMM-GCG"
 OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned_2"
 
 deepspeed --num_gpus=3 train_glamm.py \
-    --deepspeed deepspeed_config.json \
     --version "$BASE_MODEL_PATH" \
     --dataset_path "$DATA_DIR/glamm_train.json" \
     --image_folder "$DATA_DIR/glamm_images_train" \
