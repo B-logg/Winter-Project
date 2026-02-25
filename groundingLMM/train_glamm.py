@@ -116,7 +116,7 @@ class ForestDataset(Dataset):
 def find_all_linear_names(model):
     target_names = []
     # SAM 등 시각 모듈에는 절대 LoRA가 붙지 못하게 차단
-    blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder", "vision_tower"]
+    blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder", "vision_tower", "lm_head"]
     for name, module in model.named_modules():
         if isinstance(module, (torch.nn.Linear, bnb.nn.Linear4bit)):
             if not any(b in name for b in blacklist):
@@ -180,7 +180,7 @@ def main():
 
 
     base_model = model.base_model.model.model
-    for mod_name in ["grounding_encoder", "mm_projector", "text_hidden_fcs"]:
+    for mod_name in ["mm_projector", "text_hidden_fcs"]:
         if hasattr(base_model, mod_name):
             module = getattr(base_model, mod_name)
             module.to(device=device, dtype=torch.bfloat16) 
