@@ -177,30 +177,24 @@ def main():
     
     print("Loading Model")
     model = GLaMMForCausalLM.from_pretrained(BASE_MODEL_PATH, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, seg_token_idx=seg_token_idx)
-    model = PeftModel.from_pretrained(model, args.hf_model_path)
-    model = model.merge_and_unload().cuda().bfloat16()
     
+    # 1. PEFT 모델 껍데기 씌우기
+    model = PeftModel.from_pretrained(model, args.hf_model_path)
+    
+    # 2. 핵심: 껍데기를 벗기기(merge) "전에" Non-LoRA 가중치(단어 사전, lm_head 등)를 먼저 끼워 넣기
     non_lora_path = os.path.join(args.hf_model_path, "non_lora_trainables.bin")
     if os.path.exists(non_lora_path):
-        print("Loading non-LoRA weights")
+        print("\nLoading non-LoRA weights...")
         non_lora_state_dict = torch.load(non_lora_path, map_location="cpu")
         
-        # PEFT로 학습하면서 앞부분에 'base_model.model.' 꼬리표가 붙은 경우 깔끔하게 떼어줍니다.
-        clean_state_dict = {}
-        for k, v in non_lora_state_dict.items():
-            if k.startswith("base_model.model."):
-                clean_state_dict[k.replace("base_model.model.", "")] = v
-            else:
-                clean_state_dict[k] = v
-                
-        # 껍데기가 벗겨진 본체(model)에 직접 가중치를 주입합니다.
-        load_info = model.load_state_dict(clean_state_dict, strict=False)
-        
-        # 👉 핵심: 진짜로 가중치가 모델에 장착되었는지 팩트 체크!
-        print(f"\n[Non-LoRA] 정상 로드 완료!")
+        # 이름 바꿀 필요 없이 PEFT 모델 상태에서 그대로 로드
+        load_info = model.load_state_dict(non_lora_state_dict, strict=False)
+        print(f"[Non-LoRA] 장착 완료! (남은 잉여 부품: {len(load_info.unexpected_keys)}개)")
         if len(load_info.unexpected_keys) > 0:
-            print(f"[경고] 로드 실패한 잉여 가중치 개수: {len(load_info.unexpected_keys)}개")
-            print(f"예시: {list(load_info.unexpected_keys)[:3]}")
+            print(f"잉여 부품 목록: {list(load_info.unexpected_keys)[:3]}")
+
+    # 3. 가중치가 모두 완벽하게 결합된 상태에서 껍데기 벗기고 GPU로 올리기
+    model = model.merge_and_unload().cuda().bfloat16()
 
     base_glamm = model.get_model()
     if hasattr(base_glamm, "grounding_encoder"):
