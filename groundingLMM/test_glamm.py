@@ -25,6 +25,8 @@ nltk.download('punkt_tab')
 from nltk.translate.meteor_score import meteor_score
 from pycocoevalcap.cider.cider import Cider
 
+# 추론 결과 저장하기 -> 추론 결과 직접 살펴봐야겠음.
+
 # NLTK Wordnet 다운로드 (METEOR용)
 try:
     nltk.data.find('corpora/wordnet')
@@ -94,6 +96,7 @@ class ForestEvalDataset(Dataset):
 
         return {
             "id": item['id'],
+            "image_path": image_path,
             "clip_img": clip_img,
             "sam_img": sam_img,
             "input_ids_gen": input_ids_gen,
@@ -215,6 +218,8 @@ def main():
     
     miou_list, recall_list, ap50_list = [], [], []
 
+    all_predictions = []
+
     model.eval()
     print("Starting Inference & Metric Evaluation")
     for step, batch in enumerate(tqdm(dataloader)):
@@ -225,11 +230,18 @@ def main():
         
         gt_text = batch['gt_text'][0]
         data_id = batch['id'][0]
+        image_path = batch['image_path'][0]
         
         with torch.no_grad():
             # 1. 텍스트 생성
             output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, use_cache=True)
             pred_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+            all_predictions.append({
+                "image_id": data_id,
+                "gt_text": gt_text,
+                "pred_text": pred_text
+            })
 
             num_seg_tokens = (output_ids == seg_token_idx).sum().item()
 
@@ -260,6 +272,39 @@ def main():
                     pred_masks = outputs['pred_masks'][0]
                 else:
                     pred_masks = []
+
+                if len(pred_masks) > 0:
+                    vis_dir = os.path.join(args.output_dir, "vis_results") # 저장할 폴더 이름
+                    os.makedirs(vis_dir, exist_ok=True)
+                    
+                    # 1. 원본 이미지 불러오기
+                    orig_img = cv2.imread(image_path)
+                    if orig_img is not None:
+                        orig_h, orig_w = orig_img.shape[:2]
+                        overlay = orig_img.copy()
+                        
+                        # 2. 각각의 나무 마스크마다 색상 칠하기
+                        for mask in pred_masks:
+                            # 1024x1024 크기의 모델 예측 마스크를 가져와서 numpy로 변환
+                            m_np = mask.cpu().numpy().astype(np.uint8)
+                            
+                            # 마스크를 원본 이미지 크기로 늘리기/줄이기
+                            m_resized = cv2.resize(m_np, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                            
+                            # 랜덤한 형광펜 색상 만들기 (BGR)
+                            color = np.random.randint(100, 255, (3,)).tolist()
+                            
+                            # 마스크가 있는 영역(값이 1인 곳)에 색깔 덧칠하기
+                            overlay[m_resized > 0] = color
+                        
+                        # 3. 투명도(알파 블렌딩) 50% 섞어서 예쁘게 합성하기
+                        vis_img = cv2.addWeighted(overlay, 0.5, orig_img, 0.5, 0)
+                        
+                        # 4. 파일로 저장 (예: 1번이미지.jpg)
+                        safe_id = str(data_id).split("/")[-1] # 혹시 모를 경로 오류 방지
+                        save_file = os.path.join(vis_dir, f"{safe_id}_pred.jpg")
+                        cv2.imwrite(save_file, vis_img)
+
 
         # 3. 텍스트 기반 딕셔너리 추출
         gt_list = parse_forest_info(gt_text)
@@ -336,5 +381,11 @@ def main():
     print(f"  - Recall:            {avg_recall:.4f}")
     print(f"  - AP50:              {avg_ap50:.4f}")
     print("="*50)
+
+    import json
+    save_path = os.path.join(args.output_dir, "glamm_predictions.json")
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(all_predictions, f, ensure_ascii=False, indent=4)
+    print(f"\n추론 텍스트 결과가 '{save_path}'에 저장되었습니다!")
 
 if __name__ == "__main__": main()
