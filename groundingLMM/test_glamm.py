@@ -196,6 +196,12 @@ def main():
     # 3. 가중치가 모두 완벽하게 결합된 상태에서 껍데기 벗기고 GPU로 올리기
     model = model.merge_and_unload().cuda().bfloat16()
 
+    head_nan = torch.isnan(model.lm_head.weight).any().item()
+    embed_nan = torch.isnan(model.model.embed_tokens.weight).any().item()
+    print(f"\n🩺 lm_head 오염여부: {head_nan} | embed_tokens 오염여부: {embed_nan}")
+    if head_nan or embed_nan:
+        print("치명적 오류: 학습 중 모델 가중치가 파괴(NaN)되었습니다! (학습을 다시 해야 합니다)")
+
     base_glamm = model.get_model()
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
@@ -234,7 +240,7 @@ def main():
         
         with torch.no_grad():
             # 1. 텍스트 생성
-            output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, do_sample=False, pad_token_id=tokenizer.eos_token_id, use_cache=True)
+            output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, use_cache=True)
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
             pred_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "").strip()
@@ -342,7 +348,7 @@ def main():
         pred_words = nltk.word_tokenize(pred_text)
         meteor_scores.append(meteor_score([gt_words], pred_words))
 
-        if step >= 9:
+        if step >= 4:
             break
 
     # --- 최종 지표 계산 ---
