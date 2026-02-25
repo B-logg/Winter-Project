@@ -235,12 +235,15 @@ def main():
         with torch.no_grad():
             # 1. 텍스트 생성
             output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, use_cache=True)
-            pred_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+            raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
+
+            pred_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "").strip()
 
             all_predictions.append({
                 "image_id": data_id,
                 "gt_text": gt_text,
-                "pred_text": pred_text
+                "pred_text": pred_text,
+                "prompt_used": tokenizer.decode(input_ids[0])
             })
 
             num_seg_tokens = (output_ids == seg_token_idx).sum().item()
@@ -338,6 +341,9 @@ def main():
         pred_words = nltk.word_tokenize(pred_text)
         meteor_scores.append(meteor_score([gt_words], pred_words))
 
+        if step >= 9:
+            break
+
     # --- 최종 지표 계산 ---
     # 1. Regression (탄소량: MAPE, R2, Pearson)
     if len(gt_carbon_all) > 1:
@@ -369,14 +375,14 @@ def main():
     print(f" [1. Text Generation]")
     print(f"  - CIDEr Score:       {cider_score:.4f}")
     print(f"  - METEOR Score:      {avg_meteor:.4f}")
-    print(f" [\n2. Species Classification]")
+    print(f" \n[2. Species Classification]")
     print(f"  - Accuracy:          {cls_acc:.2f} %")
     print(f"  - F1-Score (Macro):  {cls_f1:.2f} %")
-    print(f" [\n3. Carbon Regression]")
+    print(f" \n[3. Carbon Regression]")
     print(f"  - MAPE:              {mape:.2f} %")
     print(f"  - R2 Score:          {r2:.4f}")
     print(f"  - Pearson Correlation:       {correlation:.4f}")
-    print(f" [\n4. Segmentation Mask]")
+    print(f" \n[4. Segmentation Mask]")
     print(f"  - mIoU:              {avg_miou:.4f}")
     print(f"  - Recall:            {avg_recall:.4f}")
     print(f"  - AP50:              {avg_ap50:.4f}")
@@ -388,4 +394,5 @@ def main():
         json.dump(all_predictions, f, ensure_ascii=False, indent=4)
     print(f"\n추론 텍스트 결과가 '{save_path}'에 저장되었습니다!")
 
-if __name__ == "__main__": main()
+if __name__ == "__main__": 
+    main()
