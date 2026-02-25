@@ -194,7 +194,13 @@ def main():
                 clean_state_dict[k] = v
                 
         # 껍데기가 벗겨진 본체(model)에 직접 가중치를 주입합니다.
-        model.load_state_dict(clean_state_dict, strict=False)
+        load_info = model.load_state_dict(clean_state_dict, strict=False)
+        
+        # 👉 핵심: 진짜로 가중치가 모델에 장착되었는지 팩트 체크!
+        print(f"\n[Non-LoRA] 정상 로드 완료!")
+        if len(load_info.unexpected_keys) > 0:
+            print(f"[경고] 로드 실패한 잉여 가중치 개수: {len(load_info.unexpected_keys)}개")
+            print(f"예시: {list(load_info.unexpected_keys)[:3]}")
 
     base_glamm = model.get_model()
     if hasattr(base_glamm, "grounding_encoder"):
@@ -234,11 +240,12 @@ def main():
         
         with torch.no_grad():
             # 1. 텍스트 생성
-            output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, use_cache=True)
+            output_ids = model.generate(inputs=input_ids, images=images, max_new_tokens=256, do_sample=False, pad_token_id=tokenizer.eos_token_id, use_cache=True)
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
             pred_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "").strip()
             valid_input_ids = [tid for tid in input_ids[0].tolist() if tid >= 0]
+
             all_predictions.append({
                 "image_id": data_id,
                 "gt_text": gt_text,
