@@ -80,7 +80,7 @@ class ForestEvalDataset(Dataset):
 
         conv = conversation_lib.conv_templates["llava_v1"].copy()
         conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + clean_q)
-        conv.append_message(conv.roles[1], None) 
+        conv.append_message(conv.roles[1], "Based on the analysis, the results are as follows: ") 
         input_ids_gen = tokenizer_image_token(conv.get_prompt(), self.tokenizer, return_tensors='pt')
         
         # GT Masks Load
