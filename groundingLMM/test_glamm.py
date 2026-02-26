@@ -242,7 +242,7 @@ def main():
                 )
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
-            pred_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "").strip()
+            pred_text = raw_text.replace("<s>", "").replace("</s>", "eos").replace("<pad>", "").strip()
             valid_input_ids = [tid for tid in input_ids[0].tolist() if tid >= 0]
 
             all_predictions.append({
