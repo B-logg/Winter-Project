@@ -237,7 +237,8 @@ def main():
                 images=images, 
                 max_new_tokens=256, 
                 use_cache=True,
-                bad_words_ids=[[tokenizer.unk_token_id]]
+                bad_words_ids=[[tokenizer.unk_token_id]],
+                no_repeat_ngram_size=3
                 )
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
