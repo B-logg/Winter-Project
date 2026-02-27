@@ -319,7 +319,7 @@ def main():
                         save_file = os.path.join(vis_dir, f"{safe_id}_pred.jpg")
                         cv2.imwrite(save_file, vis_img)
 
-                    print(pred_masks)
+                    print(all_predictions)
 
 
         # 3. 텍스트 기반 딕셔너리 추출
