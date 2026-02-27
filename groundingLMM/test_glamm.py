@@ -319,6 +319,8 @@ def main():
                         save_file = os.path.join(vis_dir, f"{safe_id}_pred.jpg")
                         cv2.imwrite(save_file, vis_img)
 
+                    print(pred_masks)
+
 
         # 3. 텍스트 기반 딕셔너리 추출
         gt_list = parse_forest_info(gt_text)
