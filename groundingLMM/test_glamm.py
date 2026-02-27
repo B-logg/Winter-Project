@@ -174,7 +174,7 @@ def calculate_mask_metrics(pred_masks, gt_masks):
 
 def main():
     args = parse_args()
-    BASE_MODEL_PATH = "/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-FullScope"
+    BASE_MODEL_PATH = "/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG"
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
@@ -319,7 +319,7 @@ def main():
                         save_file = os.path.join(vis_dir, f"{safe_id}_pred.jpg")
                         cv2.imwrite(save_file, vis_img)
 
-                    print(all_predictions)
+
 
 
         # 3. 텍스트 기반 딕셔너리 추출
