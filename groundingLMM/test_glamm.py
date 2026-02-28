@@ -355,10 +355,6 @@ def main():
         meteor_scores.append(meteor_score([gt_words], pred_words))
 
 
-        if step >= 4: # 5개만 테스트
-            break
-
-
     # --- 최종 지표 계산 ---
     # 1. Regression (탄소량: MAPE, R2, Pearson)
     if len(gt_carbon_all) > 1:
