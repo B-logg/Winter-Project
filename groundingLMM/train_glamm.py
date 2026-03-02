@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import transformers
 from transformers import CLIPImageProcessor, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model
 import bitsandbytes as bnb
 
 from model.GLaMM import GLaMMForCausalLM 
@@ -150,14 +150,9 @@ def main():
     tokenizer.add_tokens(special_tokens, special_tokens=True)
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-        llm_int8_skip_modules=["vision_tower", "grounding_encoder", "mm_projector", "text_hidden_fcs", "lm_head"]
-    )
     
     model = GLaMMForCausalLM.from_pretrained(
-        args.version, quantization_config=bnb_config, torch_dtype=torch.bfloat16,
+        args.version, torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True, device_map={"": args.local_rank},
         train_mask_decoder=True, out_dim=256,
         ce_loss_weight=args.ce_loss_weight, dice_loss_weight=args.dice_loss_weight,
@@ -167,7 +162,6 @@ def main():
     )
     
     model.resize_token_embeddings(len(tokenizer))
-    model = prepare_model_for_kbit_training(model)
 
     # [C] LoRA 및 Unfreeze 설정
     target_modules = find_all_linear_names(model)
