@@ -9,8 +9,8 @@ BASE_DIR="$HOME/학부연구생/bosung/Winter-Project/groundingLMM"
 DATA_DIR="$BASE_DIR/dataset"
 CHK_DIR="$BASE_DIR/checkpoints"
 
-BASE_MODEL_PATH="$CHK_DIR/GLaMM-GCG"
-OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned_2"
+BASE_MODEL_PATH="$CHK_DIR/GLaMM-FullScope"
+OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned_3"
 
 deepspeed --num_gpus=3 train_glamm.py \
     --version "$BASE_MODEL_PATH" \
