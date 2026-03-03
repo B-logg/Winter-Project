@@ -19,7 +19,7 @@ deepspeed --num_gpus=3 train_glamm.py \
     --vision_pretrained "$CHK_DIR/sam_vit_h_4b8939.pth" \
     --vision_tower "openai/clip-vit-large-patch14-336" \
     --output_dir "$OUTPUT_DIR" \
-    --batch_size 2 \
+    --batch_size 1 \
     --grad_accumulation_steps 6 \
     --workers 10 \
     --lr 1e-4 \
