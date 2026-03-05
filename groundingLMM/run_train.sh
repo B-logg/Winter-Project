@@ -25,8 +25,8 @@ deepspeed --num_gpus=3 train_glamm.py \
     --lr 1e-4 \
     --epochs 5 \
     --val_ratio 0.00 \
-    --lora_r 128 \
-    --lora_alpha 256
+    --lora_r 16 \
+    --lora_alpha 32
 
 echo "Training finished successfully!"
 
