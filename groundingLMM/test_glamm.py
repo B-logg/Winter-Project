@@ -243,7 +243,8 @@ def main():
                 max_new_tokens=256, 
                 use_cache=True,
                 bad_words_ids=[[tokenizer.unk_token_id]],
-                no_repeat_ngram_size=2
+                do_sample=False,
+                num_beams=1
                 )
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
