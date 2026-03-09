@@ -80,7 +80,7 @@ class ForestEvalDataset(Dataset):
 
         conv = conversation_lib.conv_templates["llava_v1"].copy()
         conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + clean_q)
-        conv.append_message(conv.roles[1], "Based on the analysis, the results are as follows: In this area, there") 
+        conv.append_message(conv.roles[1], "Based on the analysis, the results are as follows: In this area, there ") 
         
         # 프롬프트 문자열을 뽑아낸 뒤, 끝에 몰래 붙은 종료 토큰을 완전히 뜯어냄
         prompt_str = conv.get_prompt()
@@ -244,7 +244,8 @@ def main():
                 use_cache=True,
                 bad_words_ids=[[tokenizer.unk_token_id]],
                 do_sample=False,
-                num_beams=1
+                num_beams=1,
+                repetition_penalty=1.15
                 )
             raw_text = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=False)
 
