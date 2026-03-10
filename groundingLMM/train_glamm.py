@@ -13,18 +13,17 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 import transformers
-from transformers import CLIPImageProcessor, BitsAndBytesConfig
+from transformers import CLIPImageProcessor
 from peft import LoraConfig, get_peft_model
-import bitsandbytes as bnb
+# 팁: 16비트로 전환했으므로 bitsandbytes는 지워도 됩니다.
 
 from model.GLaMM import GLaMMForCausalLM 
 from dataset.dataset import custom_collate_fn
 from tools.utils import dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-
 # 1. 인자 및 경로 설정
 def parse_args():
-    parser = argparse.ArgumentParser(description="Optimal GLaMM Forest Finetuning")
+    parser = argparse.ArgumentParser(description="Optimal GLaMM Forest Finetuning (Pure LoRA)")
     parser.add_argument("--version", default="MBZUAI/GLaMM-GranD-Pretrained")
     
     # 학습용 JSON
@@ -38,12 +37,12 @@ def parse_args():
     parser.add_argument("--epochs", default=5, type=int)
     parser.add_argument("--batch_size", default=2, type=int)
     parser.add_argument("--grad_accumulation_steps", default=2, type=int)
-    parser.add_argument("--lr", default=2e-4, type=float)
+    parser.add_argument("--lr", default=2e-5, type=float) # (참고용) 스크립트에서 제어되므로 여기서 바꿔도 무방함
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--val_ratio", default=0.05, type=float, help="학습 데이터 내 검증(Val) 데이터 비율 (기본 5%)")
     
-    parser.add_argument("--lora_r", default=128, type=int)
-    parser.add_argument("--lora_alpha", default=256, type=int)
+    parser.add_argument("--lora_r", default=16, type=int)
+    parser.add_argument("--lora_alpha", default=32, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
 
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
@@ -118,9 +117,9 @@ def find_all_linear_names(model):
     # SAM 등 시각 모듈에는 절대 LoRA가 붙지 못하게 차단
     blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder", "vision_tower", "lm_head"]
     for name, module in model.named_modules():
-        if isinstance(module, (torch.nn.Linear, bnb.nn.Linear4bit)):
+        if isinstance(module, torch.nn.Linear):
             if not any(b in name for b in blacklist):
-                target_names.append(name) # 이름 끝이 아닌 전체 경로(Full Name)를 유지
+                target_names.append(name) 
     return target_names
 
 # 3. 메인 학습 및 검증 루프
@@ -163,28 +162,26 @@ def main():
     
     model.resize_token_embeddings(len(tokenizer))
 
-    # [C] LoRA 및 Unfreeze 설정
+    # [C] LoRA 설정 (순수 LoRA만 학습하도록 수정됨!)
     target_modules = find_all_linear_names(model)
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
         lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
-        modules_to_save=["embed_tokens", "lm_head"] 
+        modules_to_save=None  # 👈 [핵심 1] 단어 사전(embed_tokens, lm_head)을 얼립니다! 
     )
     model = get_peft_model(model, lora_config)
 
-
     base_model = model.base_model.model.model
-    for mod_name in ["mm_projector", "text_hidden_fcs"]:
-        if hasattr(base_model, mod_name):
-            module = getattr(base_model, mod_name)
-            module.to(device=device, dtype=torch.bfloat16) 
-            
-            for param in module.parameters(): 
-                param.requires_grad = True
-            
-            for name, buf in module.named_buffers():
-                if buf.dtype != torch.bfloat16 and torch.is_floating_point(buf):
-                    buf.data = buf.data.to(torch.bfloat16)
+    # 시각 다리(mm_projector, text_hidden_fcs)를 얼립니다! (전체 주석 처리)
+    # for mod_name in ["mm_projector", "text_hidden_fcs"]:
+    #     if hasattr(base_model, mod_name):
+    #         module = getattr(base_model, mod_name)
+    #         module.to(device=device, dtype=torch.bfloat16) 
+    #         for param in module.parameters(): 
+    #             param.requires_grad = True
+    #         for name, buf in module.named_buffers():
+    #             if buf.dtype != torch.bfloat16 and torch.is_floating_point(buf):
+    #                 buf.data = buf.data.to(torch.bfloat16)
     
     # 몽키 패치: SAM Mask decoder 입구에서 무조건 BF16으로 변환
     if hasattr(base_model, "grounding_encoder"):
@@ -233,8 +230,6 @@ def main():
         for step, batch in enumerate(progress):
             batch = dict_to_cuda(batch)
 
-            # seg_token_mask: [SEG] 토큰 위치 마스크
-            # offset: 시퀀스 내 토큰 위치 인덱스
             if 'input_ids' in batch:
                 bsz = batch['input_ids'].shape[0]
                 batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
@@ -253,7 +248,6 @@ def main():
                 clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
                 batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
             
-            # 실수형(float 32) 텐서인 이미지, 마스크를 모두 BF16으로 변환 -> DataLoader에서 전처리하여 나온 이미지와 마스크는 기본적으로 float32
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
                     batch[k] = v.to(torch.bfloat16)
@@ -273,56 +267,16 @@ def main():
 
             global_step += 1
             
-        # # 2. Validation Loop (에포크 종료 시점)
-        # model_engine.eval() # 모델을 평가 모드로 전환 (Dropout 등 비활성화)
-        # val_loss_sum = 0
-        # val_progress = tqdm.tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [VAL]", disable=(args.local_rank != 0))
-        
-        # with torch.no_grad(): # 역전파(기울기 계산) 비활성화하여 메모리 절약 및 속도 향상
-        #     for batch in val_progress:
-        #         batch = dict_to_cuda(batch)
-
-        #         if 'input_ids' in batch:
-        #             bsz = batch['input_ids'].shape[0]
-        #             batch['offset'] = torch.arange(bsz + 1, dtype=torch.long, device=device)
-
-        #             if args.seg_token_idx is not None:
-        #                 new_seg_mask = (batch['input_ids'] == args.seg_token_idx)
-        #                 if new_seg_mask.any():
-        #                     batch['seg_token_mask'] = new_seg_mask.view(-1)
-                
-        #         if 'labels' in batch:
-        #             batch['labels'][batch['labels'] == -200] = -100
-        #             batch['labels'][(batch['labels'] >= len(tokenizer)) &(batch['labels'] != -100)] = -100
-
-        #         if 'input_ids' in batch:
-        #             is_image_token = (batch['input_ids'] == -200)
-        #             clamped_ids = batch['input_ids'].clamp(0, len(tokenizer) - 1)
-        #             batch['input_ids'] = torch.where(is_image_token, batch['input_ids'], clamped_ids)
-
-        #         for k, v in batch.items():
-        #             if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
-        #                 batch[k] = v.to(torch.bfloat16)
-
-        #         outputs = model_engine(**batch)
-        #         val_loss_sum += outputs['loss'].item()
-        
-        
-        
         # 3. 로깅 및 체크포인트 저장
         if args.local_rank == 0:
             avg_train_loss = train_loss_sum / len(train_loader)
-            # avg_val_loss = val_loss_sum / len(val_loader)
             
             print(f"\nEpoch {epoch+1} Results: Train Loss = {avg_train_loss:.4f}")
-            # writer.add_scalar("Val/Loss_Epoch", avg_val_loss, epoch)
             
             save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
             model_engine.module.save_pretrained(save_path)
             
-            non_lora_state = {n: p.cpu() for n, p in model_engine.module.named_parameters() if p.requires_grad and "lora_" not in n}
-            torch.save(non_lora_state, os.path.join(save_path, "non_lora_trainables.bin"))
             print(f"Checkpoint saved at {save_path}\n")
 
 if __name__ == "__main__":
