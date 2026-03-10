@@ -10,7 +10,7 @@ DATA_DIR="$BASE_DIR/dataset"
 CHK_DIR="$BASE_DIR/checkpoints"
 
 BASE_MODEL_PATH="$CHK_DIR/GLaMM-FullScope"
-OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned_3"
+OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned_4"
 
 deepspeed --num_gpus=3 --master_port=29501 train_glamm.py \
     --version "$BASE_MODEL_PATH" \
