@@ -15,7 +15,6 @@ from torch.utils.tensorboard import SummaryWriter
 import transformers
 from transformers import CLIPImageProcessor
 from peft import LoraConfig, get_peft_model
-# 팁: 16비트로 전환했으므로 bitsandbytes는 지워도 됩니다.
 
 from model.GLaMM import GLaMMForCausalLM 
 from dataset.dataset import custom_collate_fn
@@ -167,12 +166,12 @@ def main():
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
         lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
-        modules_to_save=None  # 👈 [핵심 1] 단어 사전(embed_tokens, lm_head)을 얼립니다! 
+        modules_to_save=None  # 단어 사전(embed_tokens, lm_head)을 얼리기(학습 X)
     )
     model = get_peft_model(model, lora_config)
 
     base_model = model.base_model.model.model
-    # 시각 다리(mm_projector, text_hidden_fcs)를 얼립니다! (전체 주석 처리)
+    # 시각 다리(mm_projector, text_hidden_fcs)를 얼리기(학습 X)
     # for mod_name in ["mm_projector", "text_hidden_fcs"]:
     #     if hasattr(base_model, mod_name):
     #         module = getattr(base_model, mod_name)
@@ -275,7 +274,13 @@ def main():
             
             save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
+            
+            # 1. LoRA 가중치 저장
             model_engine.module.save_pretrained(save_path)
+            
+            # SAM 마스크 디코더 등 LoRA가 안 붙은 '진짜 학습된 부품'들 저장
+            non_lora_state = {n: p.cpu() for n, p in model_engine.module.named_parameters() if p.requires_grad and "lora_" not in n}
+            torch.save(non_lora_state, os.path.join(save_path, "non_lora_trainables.bin"))
             
             print(f"Checkpoint saved at {save_path}\n")
 
