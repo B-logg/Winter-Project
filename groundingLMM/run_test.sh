@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CHECKPOINT_PATH="/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG_tuned_6/checkpoint-epoch-1"
+CHECKPOINT_PATH="/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG_tuned_7/checkpoint-epoch-1"
 
 if [ -z "$CHECKPOINT_PATH" ]; then
     echo "ERROR: CHECKPOINT_PATH가 비어있습니다."

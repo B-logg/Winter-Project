@@ -23,7 +23,7 @@ from tools.utils import dict_to_cuda, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOK
 # 1. 인자 및 경로 설정
 def parse_args():
     parser = argparse.ArgumentParser(description="Optimal GLaMM Forest Finetuning (Pure LoRA)")
-    parser.add_argument("--version", default="MBZUAI/GLaMM-GranD-Pretrained")
+    parser.add_argument("--version", default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints/GLaMM-FullScope"))
     
     # 학습용 JSON
     parser.add_argument("--dataset_path", type=str, default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/dataset/glamm_train.json"))
