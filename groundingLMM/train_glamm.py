@@ -144,9 +144,7 @@ def main():
     # Tokenizer 및 모델 세팅
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.version, model_max_length=args.model_max_length, padding_side="right", use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
-    special_tokens = ['[SEG]', '<p>', '</p>', DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN]
-    tokenizer.add_tokens(special_tokens, special_tokens=True)
-    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    args.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
 
     
     model = GLaMMForCausalLM.from_pretrained(
@@ -159,14 +157,13 @@ def main():
         use_mm_start_end=True, mm_vision_select_layer=-2
     )
     
-    model.resize_token_embeddings(len(tokenizer))
 
     # [C] LoRA 설정 (순수 LoRA만 학습하도록 수정됨!)
     target_modules = find_all_linear_names(model)
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
         lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
-        modules_to_save=["embed_tokens", "lm_head"]
+        modules_to_save=None
     )
     model = get_peft_model(model, lora_config)
 
