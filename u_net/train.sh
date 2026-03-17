@@ -1,0 +1,5 @@
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node 2 --master_port 1234 train.py --eval-freq 1 --pretrained --image_type forest_AP_10_25
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node 2 --master_port 1234 train.py --eval-freq 1 --pretrained --image_type forest_NIR_10
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node 2 --master_port 1234 train.py --eval-freq 1 --pretrained --image_type forest_SN_10
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node 2 --master_port 1234 train.py --eval-freq 1 --pretrained --image_type city_AP_10_25
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node 2 --master_port 1234 train.py --eval-freq 1 --pretrained --image_type city_NIR_10

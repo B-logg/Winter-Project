@@ -1,0 +1,5 @@
+termcolor
+tensorboardX
+torchsummary
+timm
+openpyxl
