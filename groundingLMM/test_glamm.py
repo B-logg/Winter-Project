@@ -187,7 +187,6 @@ def main():
     
     
     # 제로샷 시 여기부터
-    """
     # 1. PEFT 모델 껍데기 씌우기
     model = PeftModel.from_pretrained(model, args.hf_model_path)
     
@@ -202,18 +201,17 @@ def main():
         print(f"[Non-LoRA] 장착 완료! (남은 잉여 부품: {len(load_info.unexpected_keys)}개)")
 
     # 3. 가중치가 모두 완벽하게 결합된 상태에서 껍데기 벗기고 GPU로 올리기
-    model = model.merge_and_unload().cuda().bfloat16()
+    model = model.cuda().bfloat16()
 
-    base_glamm = model.get_model()
+    base_glamm = model.base_model.model
     # 여기까지 주석처리
-    """
 
-    
+    """
     # 제로샷 테스트 시 사용
     model = model.cuda().bfloat16()
 
     base_glamm = model.model
-
+    """
     
     
     if hasattr(base_glamm, "grounding_encoder"):
