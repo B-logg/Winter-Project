@@ -176,7 +176,7 @@ def calculate_mask_metrics(pred_masks, gt_masks):
 
 def main():
     args = parse_args()
-    BASE_MODEL_PATH = "/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-FullScope"
+    BASE_MODEL_PATH = "/home/sbosung1789/Winter-Project/groundingLMM/checkpoints/GLaMM-GCG"
 
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
@@ -206,7 +206,7 @@ def main():
     model = model.cuda().bfloat16()
 
     base_glamm = model.model
-    
+
     if hasattr(base_glamm, "grounding_encoder"):
         mask_decoder = base_glamm.grounding_encoder.mask_decoder
         original_forward = mask_decoder.forward
