@@ -25,6 +25,7 @@ test.py
 *.jpeg
 !groundingLMM/test_image/
 !groundingLMM/test_image/*
+!u_net/data/
 !test.png
 *.json
 !datasets/INaturalist/l1_prepare_data.json
