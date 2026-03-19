@@ -56,7 +56,7 @@ class CarbonDataset(torch.utils.data.Dataset):
 
 
     @classmethod
-    def normalize_concat(cls, i_i, i_s, l_c, l_t, cfg):
+    def normalize_concat(cls, i_i, l_c, l_t, cfg):
         
         i_i = np.array(i_i).astype(np.float32)/255.0
         
