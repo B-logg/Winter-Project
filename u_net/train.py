@@ -75,7 +75,7 @@ def main(args, world_size, rank):
     criterion = CarbonLoss()
 
 
-    logger.info(torchsummary.summary(model, (4,512,512)))
+    logger.info(torchsummary.summary(model, (3,512,512)))
 
 
     best_loss_ckpt_file_path = os.path.join(pth_dir, "best_checkpoints_loss.pth")
