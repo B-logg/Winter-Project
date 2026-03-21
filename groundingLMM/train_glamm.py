@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--val_ratio", default=0.05, type=float, help="학습 데이터 내 검증(Val) 데이터 비율 (기본 5%)")
     
     parser.add_argument("--lora_r", default=16, type=int)
-    parser.add_argument("--lora_alpha", default=32, type=int)
+    parser.add_argument("--lora_alpha", default=8, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
 
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
@@ -114,7 +114,7 @@ class ForestDataset(Dataset):
 def find_all_linear_names(model):
     target_names = []
     # SAM 등 시각 모듈에는 절대 LoRA가 붙지 못하게 차단
-    blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder", "vision_tower", "lm_head"]
+    blacklist = ["grounding_encoder", "mask_decoder", "mm_projector", "text_hidden_fcs", "region_encoder", "vision_tower", "lm_head", "embed_tokens"]
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
             if not any(b in name for b in blacklist):
@@ -162,22 +162,31 @@ def main():
     target_modules = find_all_linear_names(model)
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=target_modules,
-        lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
-        modules_to_save=None
+        lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM"
     )
     model = get_peft_model(model, lora_config)
 
     base_model = model.base_model.model.model
-    # 시각 다리(mm_projector, text_hidden_fcs)를 얼리기(학습 X)
-    # for mod_name in ["mm_projector", "text_hidden_fcs"]:
-    #     if hasattr(base_model, mod_name):
-    #         module = getattr(base_model, mod_name)
-    #         module.to(device=device, dtype=torch.bfloat16) 
-    #         for param in module.parameters(): 
-    #             param.requires_grad = True
-    #         for name, buf in module.named_buffers():
-    #             if buf.dtype != torch.bfloat16 and torch.is_floating_point(buf):
-    #                 buf.data = buf.data.to(torch.bfloat16)
+    
+    # 시각-언어 다리와 픽셀 디코더 전면 학습
+    modules_to_train = ["mm_projector", "text_hidden_fcs"]
+    
+    if hasattr(base_model, "grounding_encoder"):
+        if hasattr(base_model.grounding_encoder, "mask_decoder"):
+            modules_to_train.append("grounding_encoder.mask_decoder")
+
+    # 선택된 모듈들의 가중치 업데이트(학습)를 활성화
+    for name, param in base_model.named_parameters():
+        if any(mod in name for mod in modules_to_train):
+            param.requires_grad = True
+            
+    # 타입 캐스팅 안정화
+    for mod_name in ["mm_projector", "text_hidden_fcs"]:
+        if hasattr(base_model, mod_name):
+            module = getattr(base_model, mod_name)
+            for name, buf in module.named_buffers():
+                if buf.dtype != torch.bfloat16 and torch.is_floating_point(buf):
+                    buf.data = buf.data.to(torch.bfloat16)
     
     # 몽키 패치: SAM Mask decoder 입구에서 무조건 BF16으로 변환
     if hasattr(base_model, "grounding_encoder"):
