@@ -211,16 +211,34 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, collate_fn=collate_fn, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_fn, pin_memory=True)
 
+    # Differential Learning Rate 설정
+    lora_params = []
+    projector_decoder_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "mm_projector" in name or "text_hidden_fcs" in name or "mask_decoder" in name:
+            projector_decoder_params.append(param)
+        else:
+            lora_params.append(param)
+
+    optim_groups = [
+        {"params": projector_decoder_params, "lr": 3e-4},
+        {"params": lora_params, "lr": 2e-5}
+    ]
+
+    custom_optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.05, betas=(0.9, 0.95))
+
     # [E] DeepSpeed 초기화
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": { "type": "AdamW", "params": { "lr": args.lr, "weight_decay": 0.05, "betas": [0.9, 0.95] } },
         "scheduler": { "type": "WarmupCosineLR", "params": { "total_num_steps": args.epochs * len(train_loader), "warmup_num_steps": 100}},
         "bf16": { "enabled": True },
         "zero_optimization": { "stage": 2, "overlap_comm": True, "contiguous_gradients": True }
     }
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
+    model_engine, optimizer, _, scheduler = deepspeed.initialize(model=model, optimizer=custom_optimizer, config=ds_config)
     
     if args.local_rank == 0: writer = SummaryWriter(args.output_dir)
     global_step = 0
