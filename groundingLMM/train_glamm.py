@@ -50,12 +50,12 @@ def parse_args():
     
     parser.add_argument("--vision_pretrained", default=os.path.expanduser("~/학부연구생/bosung/Winter-Project/groundingLMM/checkpoints"), type=str)
     parser.add_argument("--vision_tower", default="openai/clip-vit-large-patch14-336", type=str)
-    
+
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--deepspeed_config", type=str, default=None)
     return parser.parse_args()
 
-# 2. 유연한 데이터셋 클래스 (List 기반)
+# 2. 유연한 데이터셋 클래스 (List 기반)x
 class ForestDataset(Dataset):
     def __init__(self, data_list, image_folder, tokenizer, image_processor):
         self.data = data_list
@@ -216,7 +216,7 @@ def main():
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
         "optimizer": { "type": "AdamW", "params": { "lr": args.lr, "weight_decay": 0.05, "betas": [0.9, 0.95] } },
-        "scheduler": { "type": "WarmupDecayLR", "params": { "total_num_steps": args.epochs * len(train_loader), "warmup_num_steps": 100, "warmup_max_lr": args.lr, "warmup_min_lr": 0.0} },
+        "scheduler": { "type": "WarmupCosineLR", "params": { "total_num_steps": args.epochs * len(train_loader), "warmup_num_steps": 100, "warmup_max_lr": args.lr, "warmup_min_lr": 0.0} },
         "bf16": { "enabled": True },
         "zero_optimization": { "stage": 2, "overlap_comm": True, "contiguous_gradients": True }
     }

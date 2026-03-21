@@ -10,7 +10,7 @@ DATA_DIR="$BASE_DIR/dataset"
 CHK_DIR="$BASE_DIR/checkpoints"
 
 BASE_MODEL_PATH="$CHK_DIR/GLaMM-GCG"
-OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned_8"
+OUTPUT_DIR="$CHK_DIR/GLaMM-GCG_tuned_9"
 
 deepspeed --num_gpus=3 --master_port=29501 train_glamm.py \
     --version "$BASE_MODEL_PATH" \
@@ -22,7 +22,7 @@ deepspeed --num_gpus=3 --master_port=29501 train_glamm.py \
     --batch_size 1 \
     --grad_accumulation_steps 6 \
     --workers 10 \
-    --lr 5e-5 \
+    --lr 3e-4 \
     --epochs 5 \
     --val_ratio 0.00 \
     --lora_r 16 \
