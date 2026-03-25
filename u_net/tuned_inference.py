@@ -6,7 +6,7 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
-from sklearn.metrics import r2_score  # 🚀 R-squared(결정계수) 추가
+from sklearn.metrics import r2_score 
 
 from config.param_parser import TrainParser
 from config_mf import CONFIGURE, BATCH_SIZE
@@ -82,7 +82,7 @@ def main():
     model = build_model(args.net, num_class=cfg.NUM_CLASSES, dropout=args.enc_dropout)
     model.cuda()
 
-    checkpoint_path = "./src/outputs/forest_AP_10_25/pths/checkpoint_000199.pth"
+    checkpoint_path = "./src/outputs/forest_AP_10_25/pths/best_checkpoints_loss.pth"
     print(f"Loading weights from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location='cuda')
     
@@ -157,7 +157,7 @@ def main():
     # 4. 최종 테스트셋 평가지표 출력
     if num_batches > 0:
         print("\n" + "="*60)
-        print("Test Dataset Evaluation Results (Epoch 199) 🎯")
+        print("Test Dataset Evaluation Results")
         print("="*60)
         print(f"Total Loss                     : {total_loss/num_batches:.4f}")
         print(f"Classification Loss (cls_loss) : {total_cls_loss/num_batches:.4f}")
