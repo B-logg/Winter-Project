@@ -79,7 +79,7 @@ def main():
     test_loader = build_data_loader("datalists/", cfg.VAL_CSV, 1, args.num_workers, args.local_rank, cfg, shuffle=False)
 
     print("Building Model...")
-    model = build_model(args.net, num_class=cfg.NUM_CLASSES, dropout=args.enc_dropout)
+    model = build_model(args.net, num_class=5, dropout=args.enc_dropout)
     model.cuda()
 
     checkpoint_path = "./src/outputs/forest_AP_10_25/pths/best_checkpoints_loss.pth"
