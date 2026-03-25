@@ -113,7 +113,7 @@ def main():
             
             losses = criterion(preds_cls, preds_reg, labels_cls, labels_reg)
             if isinstance(losses, tuple):
-                loss, cls_loss, reg_loss = losses
+                loss, cls_loss, reg_loss, _, _ = losses
             else:
                 loss = losses; cls_loss = losses; reg_loss = losses
                 
