@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import math 
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from sklearn.metrics import r2_score 
@@ -14,37 +15,15 @@ from data.build import build_data_loader
 from model.build import build_model
 from model.metrics import CarbonLoss
 
-def calculate_metrics(pred_cls, label_cls, pred_reg, label_reg):
-    """분류 정확도(Pixel Acc), 회귀 상관계수(Pearson R), 결정계수(R-squared) 계산"""
-    # 1. Classification Accuracy 
-    pred_cls_labels = torch.argmax(pred_cls, dim=1)
-    correct = (pred_cls_labels == label_cls).sum().item()
-    total = label_cls.numel()
-    acc_corr = correct / total if total > 0 else 0.0
-
-    # 2. Regression Metrics (Pearson R & R2)
-    pred_reg_flat = pred_reg.detach().cpu().numpy().flatten()
-    label_reg_flat = label_reg.detach().cpu().numpy().flatten()
-    
-    # 0으로만 이루어진 배경 마스크 등 분산이 0인 경우를 방지
-    if np.std(pred_reg_flat) == 0 or np.std(label_reg_flat) == 0:
-        acc_r = 0.0
-        r2 = 0.0
-    else:
-        acc_r, _ = pearsonr(pred_reg_flat, label_reg_flat) # 피어슨 상관계수
-        r2 = r2_score(label_reg_flat, pred_reg_flat)       # 결정계수 (R2)
-        
-    return acc_corr, acc_r, r2
 
 def get_color_palette():
+    """Forest_ap_nir 데이터셋 5개 클래스에 맞춘 완벽한 GLaMM 스타일 색상 팔레트"""
     colors = np.array([
-        [0, 0, 0],         # 인덱스 0 (레이블 0: 판독불가) -> 투명 처리
-        [255, 0, 0],       # 인덱스 1 (레이블 110: 소나무) -> Red
-        [0, 0, 255],       # 인덱스 2 (레이블 120: 낙엽송) -> Blue
-        [255, 255, 0],     # 인덱스 3 (레이블 130: 기타 침엽수) -> Yellow
-        [0, 255, 0],       # 인덱스 4 (레이블 140: 활엽수) -> Green
-        [255, 0, 255],     # 인덱스 5 (레이블 150: 침엽수) -> Magenta
-        [0, 0, 0]          # 인덱스 6 (레이블 190: 비산림) -> 투명 처리
+        [0, 0, 0],         # 인덱스 0: 비산림 (원본 190) -> 투명 처리될 예정
+        [255, 0, 0],       # 인덱스 1: 소나무 (원본 110) -> Red
+        [0, 0, 255],       # 인덱스 2: 낙엽송 (원본 120) -> Blue
+        [255, 255, 0],     # 인덱스 3: 기타 침엽수 (원본 130) -> Yellow
+        [0, 255, 0]        # 인덱스 4: 활엽수 (원본 140) -> Green
     ], dtype=np.uint8)
     return colors
 
@@ -96,7 +75,7 @@ def main():
 
     # 평가지표 누적용
     total_loss, total_cls_loss, total_reg_loss = 0.0, 0.0, 0.0
-    total_acc_corr, total_acc_r, total_r2 = 0.0, 0.0, 0.0
+    total_acc_corr, total_acc_r, total_pixel_acc = 0.0, 0.0, 0.0
     num_batches = 0
 
     print("\nStarting Inference & Visualization...")
@@ -113,19 +92,26 @@ def main():
             
             losses = criterion(preds_cls, preds_reg, labels_cls, labels_reg)
             if isinstance(losses, tuple):
-                loss, cls_loss, reg_loss, _, _ = losses
+                loss, cls_loss, reg_loss, batch_corr, batch_r2 = losses
             else:
-                loss = losses; cls_loss = losses; reg_loss = losses
+                continue # 정상적인 튜플이 아니면 패스!
                 
-            acc_corr, acc_r, r2 = calculate_metrics(preds_cls, labels_cls, preds_reg, labels_reg)
-            
-            total_loss += loss.item() if hasattr(loss, 'item') else loss
-            total_cls_loss += cls_loss.item() if hasattr(cls_loss, 'item') else cls_loss
-            total_reg_loss += reg_loss.item() if hasattr(reg_loss, 'item') else reg_loss
-            total_acc_corr += acc_corr
-            total_acc_r += acc_r
-            total_r2 += r2
-            num_batches += 1
+            if not (math.isnan(loss.item()) or math.isnan(cls_loss.item())):
+                total_loss += loss.item()
+                total_cls_loss += cls_loss.item()
+                total_reg_loss += reg_loss.item()
+                
+                # CarbonLoss가 계산한 완벽한 회귀 지표 가져오기
+                total_acc_corr += batch_corr 
+                total_acc_r += batch_r2      
+                
+                pred_cls_labels = torch.argmax(preds_cls, dim=1)
+                valid_mask = (labels_cls != 255)
+                if valid_mask.sum() > 0: 
+                    correct = (pred_cls_labels[valid_mask] == labels_cls[valid_mask]).sum().item()
+                    total_pixel_acc += correct / valid_mask.sum().item()
+                
+                num_batches += 1
 
 
             # 시각화 1: 탄소량 히트맵 (Regression)
@@ -149,8 +135,7 @@ def main():
             alpha = 0.5
             blended_img = cv2.addWeighted(orig_cv2_img, 1 - alpha, color_mask, alpha, 0)
             
-            # '판독불가(0)'와 '비산림(6)' 영역은 마스킹을 지워 원본이 100% 보이게 처리
-            bg_mask = (pred_cls_resized == 0) | (pred_cls_resized == 6)
+            bg_mask = (pred_cls_resized == 0)
             blended_img[bg_mask] = orig_cv2_img[bg_mask]
 
             mask_save_path = os.path.join(OUTPUT_MASK_DIR, f"test_img_{batch_idx:04d}_overlay.jpg")
@@ -168,7 +153,7 @@ def main():
         print("-" * 60)
         print(f"Classification Accuracy (Corr) : {(total_acc_corr/num_batches)*100:.2f}%")
         print(f"Pearson Correlation (R)        : {total_acc_r/num_batches:.4f}")
-        print(f"R-squared (R2 Score)           : {total_r2/num_batches:.4f}")
+        print(f"R-squared (R2 Score)           : {total_acc_r/num_batches:.4f}")
         print("="*60)
         print(f"Visualizations successfully saved to: {OUTPUT_DIR}/")
 
