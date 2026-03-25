@@ -84,7 +84,7 @@ def main():
 
     checkpoint_path = "./src/outputs/forest_AP_10_25/pths/best_checkpoints_loss.pth"
     print(f"Loading weights from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    checkpoint = torch.load(checkpoint_path, map_location='cuda', weights_only=False)
     
     state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
     model.load_state_dict({k.replace('module.', ''): v for k, v in state_dict.items()})
