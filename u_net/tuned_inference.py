@@ -101,9 +101,9 @@ def main():
     print("\nStarting Inference & Visualization...")
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(tqdm(test_loader)):
-            images = batch_data[0].cuda()
-            labels_cls = batch_data[1].cuda()
-            labels_reg = batch_data[2].cuda()
+            images = batch_data["image"].cuda()
+            labels_cls = batch_data["label_cls"].cuda()
+            labels_reg = batch_data["label_reg"].cuda()
             
             # [추론 및 Metric 계산]
             preds_cls, preds_reg = model(images)
